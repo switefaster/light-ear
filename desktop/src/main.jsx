@@ -51,6 +51,10 @@ function App() {
   const [logOpen, setLogOpen] = useState(false);
   const isConnected = room.backendRunning && Boolean(room.localPeerId);
 
+  if (!import.meta.env.DEV) {
+    document.addEventListener('contextmenu', (e) => e.preventDefault());
+  }
+
   useEffect(() => {
     let mounted = true;
     let cleanupEvent = () => {};
