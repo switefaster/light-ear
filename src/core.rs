@@ -191,6 +191,28 @@ pub enum WireMessage {
         #[serde(default)]
         nonce: u64,
     },
+    QueueSummary {
+        peer_id: String,
+        version: u64,
+        updated_at_micros: i64,
+        item_count: usize,
+        #[serde(default)]
+        nonce: u64,
+    },
+    QueueRequest {
+        requester: String,
+        target: String,
+        known_version: u64,
+        known_updated_at_micros: i64,
+        #[serde(default)]
+        nonce: u64,
+    },
+    QueueResponse {
+        target: String,
+        state: QueueState,
+        #[serde(default)]
+        nonce: u64,
+    },
     VoteProposal {
         proposal: VoteProposal,
         #[serde(default)]

@@ -13,8 +13,8 @@ use anyhow::{Result, anyhow};
 use chrono::Local;
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, PeerId, SwarmBuilder, dcutr, gossipsub, identify, mdns, noise, ping, relay,
-    rendezvous,
+    Multiaddr, PeerId, StreamProtocol, SwarmBuilder, dcutr, gossipsub, identify, mdns, noise, ping,
+    relay, rendezvous, request_response,
     swarm::{
         ConnectionId, NetworkBehaviour, SwarmEvent,
         behaviour::toggle::Toggle,
@@ -22,6 +22,7 @@ use libp2p::{
     },
     tcp, yamux,
 };
+use serde::{Deserialize, Serialize};
 use tokio::{
     sync::mpsc,
     time::{self, Instant, MissedTickBehavior},
@@ -41,6 +42,7 @@ use crate::{
 const HISTORY_SYNC_INTERVAL: Duration = Duration::from_secs(10);
 const HISTORY_SYNC_BURST_TICK: Duration = Duration::from_millis(200);
 const HISTORY_REQUEST_COOLDOWN: Duration = Duration::from_secs(5);
+const QUEUE_REQUEST_COOLDOWN: Duration = Duration::from_secs(5);
 const MUSIC_LOCAL_INTERVAL: Duration = Duration::from_millis(100);
 const MUSIC_STATE_INTERVAL: Duration = Duration::from_secs(1);
 const MUSIC_DRIFT_SEEK_THRESHOLD_MS: u64 = 700;
@@ -54,9 +56,12 @@ const DIRECT_PROMOTION_MEDIUM_RETRY_FAILURES: u32 = 3;
 const DIRECT_PROMOTION_SLOW_RETRY_FAILURES: u32 = 6;
 const DIRECT_PROMOTION_MAX_FAILURES: u32 = 10;
 const DIRECT_PROMOTION_FAILURE_DEDUP_WINDOW: Duration = Duration::from_secs(5);
+const GOSSIP_WARMUP_TIMEOUT: Duration = Duration::from_secs(5);
+const GOSSIP_WARMUP_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 const RENDEZVOUS_DISCOVER_INTERVAL: Duration = Duration::from_secs(30);
-const RENDEZVOUS_REGISTER_INTERVAL: Duration = Duration::from_secs(60);
-const RENDEZVOUS_TTL_SECONDS: u64 = 120;
+const RENDEZVOUS_REGISTER_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const RENDEZVOUS_TTL_SECONDS: u64 = 60 * 60 * 2;
+const DIRECT_MESSAGE_PROTOCOL: &str = "/link-ear/direct-message/0.1.0";
 static NONCE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub struct BackendConfig {
@@ -71,12 +76,24 @@ pub struct BackendConfig {
 #[derive(NetworkBehaviour)]
 struct Behaviour {
     gossipsub: gossipsub::Behaviour,
+    direct_messages: request_response::json::Behaviour<DirectMessageRequest, DirectMessageResponse>,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     relay: relay::client::Behaviour,
     dcutr: dcutr::Behaviour,
     rendezvous: rendezvous::client::Behaviour,
     mdns: Toggle<mdns::tokio::Behaviour>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DirectMessageRequest {
+    topic: String,
+    message: WireMessage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DirectMessageResponse {
+    accepted: bool,
 }
 
 #[derive(Default)]
@@ -108,6 +125,14 @@ impl PeerConnectionRoutes {
 
     fn is_relay_only(&self) -> bool {
         self.direct.is_empty() && !self.relayed.is_empty()
+    }
+
+    fn has_direct(&self) -> bool {
+        !self.direct.is_empty()
+    }
+
+    fn has_relayed(&self) -> bool {
+        !self.relayed.is_empty()
     }
 
     fn relayed_connections(&self) -> Vec<ConnectionId> {
@@ -180,6 +205,27 @@ enum DirectPromotionFailureOutcome {
     Duplicate,
 }
 
+struct GossipsubWarmup {
+    started_at: Instant,
+}
+
+impl GossipsubWarmup {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        self.started_at.elapsed() >= GOSSIP_WARMUP_TIMEOUT
+    }
+}
+
+enum ChatPublishOutcome {
+    Published,
+    NoPeersSubscribed,
+}
+
 pub async fn run_network(
     config: BackendConfig,
     mut commands: mpsc::Receiver<NetworkCommand>,
@@ -193,10 +239,13 @@ pub async fn run_network(
     let mut peer_names = HashMap::new();
     let mut local_name_conflicts = HashSet::new();
     let mut history_request_times = HashMap::new();
-    let mut pending_history_summaries = VecDeque::new();
+    let mut queue_request_times = HashMap::new();
+    let mut pending_sync_summaries = VecDeque::new();
     let mut peer_routes: HashMap<PeerId, PeerConnectionRoutes> = HashMap::new();
+    let mut chat_subscribers = HashSet::new();
     let mut peer_direct_addresses: HashMap<PeerId, HashSet<Multiaddr>> = HashMap::new();
     let mut direct_promotion_backoffs = HashMap::new();
+    let mut gossip_warmups = HashMap::new();
     let mut rendezvous_nodes = HashSet::new();
     let mut rendezvous_cookies = HashMap::new();
     let rendezvous_namespace = rendezvous::Namespace::new(config.topic.clone())
@@ -226,6 +275,8 @@ pub async fn run_network(
     music_sync.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut direct_promotion = time::interval(DIRECT_PROMOTION_RETRY_INTERVAL);
     direct_promotion.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut gossip_warmup = time::interval(GOSSIP_WARMUP_CHECK_INTERVAL);
+    gossip_warmup.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut rendezvous_discover = time::interval(RENDEZVOUS_DISCOVER_INTERVAL);
     rendezvous_discover.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut rendezvous_register = time::interval(RENDEZVOUS_REGISTER_INTERVAL);
@@ -245,6 +296,13 @@ pub async fn run_network(
             |key, relay| -> Result<Behaviour, Box<dyn std::error::Error + Send + Sync>> {
                 let peer_id = key.public().to_peer_id();
                 let gossipsub = build_gossipsub(key)?;
+                let direct_messages = request_response::json::Behaviour::new(
+                    [(
+                        StreamProtocol::new(DIRECT_MESSAGE_PROTOCOL),
+                        request_response::ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default(),
+                );
                 let identify = identify::Behaviour::new(identify::Config::new(
                     "/link-ear/0.1.0".to_string(),
                     key.public(),
@@ -260,6 +318,7 @@ pub async fn run_network(
 
                 Ok(Behaviour {
                     gossipsub,
+                    direct_messages,
                     identify,
                     ping: ping::Behaviour::default(),
                     relay,
@@ -316,19 +375,9 @@ pub async fn run_network(
             .await;
         }
 
-        match swarm.dial(relay_addr.clone()) {
-            Ok(_) => send_status(&ui, format!("dialing relay {relay_addr}")).await,
-            Err(err) => send_status(&ui, format!("relay dial failed {relay_addr}: {err}")).await,
-        }
-
         let circuit_addr = relay_addr.with(libp2p::multiaddr::Protocol::P2pCircuit);
         match swarm.listen_on(circuit_addr.clone()) {
             Ok(_) => {
-                swarm.add_external_address(
-                    circuit_addr
-                        .clone()
-                        .with(libp2p::multiaddr::Protocol::P2p(local_peer_id)),
-                );
                 send_status(
                     &ui,
                     format!("requesting relay reservation via {circuit_addr}"),
@@ -390,8 +439,31 @@ pub async fn run_network(
                         text: record.text,
                         sent_at,
                     };
-                    if let Err(err) = publish_wire(&mut swarm, &topic, &msg) {
-                        send_status(&ui, format!("publish failed: {err}")).await;
+                    match publish_chat_wire(&mut swarm, &topic, &msg) {
+                        Ok(ChatPublishOutcome::Published) => {}
+                        Ok(ChatPublishOutcome::NoPeersSubscribed) => {
+                            let direct_count = send_direct_message_to_connected_peers(
+                                &mut swarm,
+                                &peer_routes,
+                                &rendezvous_nodes,
+                                &config.topic,
+                                &msg,
+                            );
+                            if direct_count > 0 {
+                                send_status(
+                                    &ui,
+                                    format!(
+                                        "gossipsub has no chat subscribers; sent direct fallback to {direct_count} peer(s)"
+                                    ),
+                                )
+                                .await;
+                            } else {
+                                send_status(&ui, "publish failed: NoPeersSubscribedToTopic".to_string()).await;
+                            }
+                        }
+                        Err(err) => {
+                            send_status(&ui, format!("publish failed: {err}")).await;
+                        }
                     }
                 }
                 Some(NetworkCommand::EnqueueBilibili {
@@ -815,21 +887,34 @@ pub async fn run_network(
                 }
             },
             _ = history_sync.tick() => {
-                    if let Err(err) = publish_presence_and_history(&mut swarm, &topic, local_peer_id, &config.name, local_joined_at, &history) {
-                    send_status(&ui, format!("history summary failed: {err}")).await;
-                }
-            },
-            _ = history_sync_burst.tick() => {
-                if let Err(err) = publish_pending_history_summaries(
-                    &mut pending_history_summaries,
+                if let Err(err) = publish_sync_summary(
                     &mut swarm,
                     &topic,
                     local_peer_id,
                     &config.name,
                     local_joined_at,
                     &history,
+                    queue_version,
+                    queue_updated_at,
+                    &music_queue,
                 ) {
-                    send_status(&ui, format!("history summary failed: {err}")).await;
+                    send_status(&ui, format!("sync summary failed: {err}")).await;
+                }
+            },
+            _ = history_sync_burst.tick() => {
+                if let Err(err) = publish_pending_sync_summaries(
+                    &mut pending_sync_summaries,
+                    &mut swarm,
+                    &topic,
+                    local_peer_id,
+                    &config.name,
+                    local_joined_at,
+                    &history,
+                    queue_version,
+                    queue_updated_at,
+                    &music_queue,
+                ) {
+                    send_status(&ui, format!("sync summary failed: {err}")).await;
                 }
             },
             _ = music_sync.tick() => {
@@ -854,6 +939,20 @@ pub async fn run_network(
                     &peer_routes,
                     &peer_direct_addresses,
                     &mut direct_promotion_backoffs,
+                    &chat_subscribers,
+                    &mut gossip_warmups,
+                    &ui,
+                )
+                .await;
+            },
+            _ = gossip_warmup.tick() => {
+                retry_gossip_warmup_promotions(
+                    &mut swarm,
+                    &peer_routes,
+                    &peer_direct_addresses,
+                    &mut direct_promotion_backoffs,
+                    &chat_subscribers,
+                    &mut gossip_warmups,
                     &ui,
                 )
                 .await;
@@ -880,6 +979,7 @@ pub async fn run_network(
             event = swarm.select_next_some() => {
                 let ctx = HistoryContext {
                     topic: &topic,
+                    topic_name: &config.topic,
                     local_peer_id,
                     history: &mut history,
                     seen_messages: &mut seen_messages,
@@ -888,7 +988,8 @@ pub async fn run_network(
                     peer_names: &mut peer_names,
                     local_name_conflicts: &mut local_name_conflicts,
                     history_request_times: &mut history_request_times,
-                    pending_history_summaries: &mut pending_history_summaries,
+                    queue_request_times: &mut queue_request_times,
+                    pending_sync_summaries: &mut pending_sync_summaries,
                     http_client: &http_client,
                     audio_player: &mut audio_player,
                     playback_state: &mut playback_state,
@@ -905,8 +1006,10 @@ pub async fn run_network(
                     &ui,
                     &mut explicit_peers,
                     &mut peer_routes,
+                    &mut chat_subscribers,
                     &mut peer_direct_addresses,
                     &mut direct_promotion_backoffs,
+                    &mut gossip_warmups,
                     &rendezvous_nodes,
                     &rendezvous_namespace,
                     &mut rendezvous_cookies,
@@ -944,6 +1047,7 @@ fn build_gossipsub(
 
 struct HistoryContext<'a> {
     topic: &'a gossipsub::IdentTopic,
+    topic_name: &'a str,
     local_peer_id: PeerId,
     history: &'a mut Vec<ChatRecord>,
     seen_messages: &'a mut HashSet<String>,
@@ -952,7 +1056,8 @@ struct HistoryContext<'a> {
     peer_names: &'a mut HashMap<String, PeerNameClaim>,
     local_name_conflicts: &'a mut HashSet<String>,
     history_request_times: &'a mut HashMap<String, Instant>,
-    pending_history_summaries: &'a mut VecDeque<Instant>,
+    queue_request_times: &'a mut HashMap<String, Instant>,
+    pending_sync_summaries: &'a mut VecDeque<Instant>,
     http_client: &'a reqwest::Client,
     audio_player: &'a mut Option<player::AudioPlayer>,
     playback_state: &'a mut Option<PlaybackState>,
@@ -970,8 +1075,10 @@ async fn handle_swarm_event(
     ui: &mpsc::Sender<UiEvent>,
     explicit_peers: &mut HashSet<PeerId>,
     peer_routes: &mut HashMap<PeerId, PeerConnectionRoutes>,
+    chat_subscribers: &mut HashSet<PeerId>,
     peer_direct_addresses: &mut HashMap<PeerId, HashSet<Multiaddr>>,
     direct_promotion_backoffs: &mut HashMap<PeerId, DirectPromotionBackoff>,
+    gossip_warmups: &mut HashMap<PeerId, GossipsubWarmup>,
     rendezvous_nodes: &HashSet<PeerId>,
     rendezvous_namespace: &rendezvous::Namespace,
     rendezvous_cookies: &mut HashMap<PeerId, rendezvous::Cookie>,
@@ -981,42 +1088,114 @@ async fn handle_swarm_event(
         SwarmEvent::NewListenAddr { address, .. } => {
             send_status(ui, format!("listening on {address}")).await;
         }
+        SwarmEvent::ExternalAddrConfirmed { address } => {
+            send_status(ui, format!("confirmed external address {address}")).await;
+            if is_relay_address(&address) {
+                register_with_rendezvous_nodes(swarm, rendezvous_nodes, rendezvous_namespace, ui)
+                    .await;
+            }
+        }
+        SwarmEvent::ExternalAddrExpired { address } => {
+            send_status(ui, format!("expired external address {address}")).await;
+        }
         SwarmEvent::ConnectionEstablished {
             peer_id,
             connection_id,
             endpoint,
             ..
         } => {
-            let is_relayed = endpoint.is_relayed();
+            let is_relayed =
+                endpoint.is_relayed() || is_relay_address(endpoint.get_remote_address());
             peer_routes
                 .entry(peer_id)
                 .or_default()
                 .add(connection_id, is_relayed);
 
+            if !rendezvous_nodes.contains(&peer_id) && explicit_peers.insert(peer_id) {
+                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                send_status(ui, format!("tracking {peer_id} as gossip peer")).await;
+            }
+
             if is_relayed {
                 send_status(ui, format!("connected {peer_id} via relay")).await;
+                if !rendezvous_nodes.contains(&peer_id)
+                    && !chat_subscribers.contains(&peer_id)
+                    && start_gossip_warmup(gossip_warmups, peer_id)
+                {
+                    send_status(
+                        ui,
+                        format!(
+                            "waiting up to {} for {peer_id} to subscribe to chat before direct promotion",
+                            format_retry_duration(GOSSIP_WARMUP_TIMEOUT)
+                        ),
+                    )
+                    .await;
+                }
                 maybe_promote_relayed_peer(
                     swarm,
                     peer_routes,
                     peer_direct_addresses,
                     direct_promotion_backoffs,
+                    chat_subscribers,
+                    gossip_warmups,
                     peer_id,
                     ui,
                 )
                 .await;
             } else {
-                direct_promotion_backoffs.remove(&peer_id);
-                let closed_relays = close_relay_connections(swarm, peer_routes, peer_id);
-                if closed_relays > 0 {
+                let has_relayed_route = peer_routes
+                    .get(&peer_id)
+                    .is_some_and(PeerConnectionRoutes::has_relayed);
+                let promotion_allowed = if has_relayed_route && !chat_subscribers.contains(&peer_id)
+                {
+                    gossip_warmup_allows_promotion(peer_id, chat_subscribers, gossip_warmups, ui)
+                        .await
+                } else {
+                    true
+                };
+
+                if promotion_allowed {
+                    direct_promotion_backoffs.remove(&peer_id);
+                    if chat_subscribers.contains(&peer_id) {
+                        let closed_relays = close_relay_connections(swarm, peer_routes, peer_id);
+                        if closed_relays > 0 {
+                            send_status(
+                                ui,
+                                format!(
+                                    "promoted {peer_id} to direct connection; closing {closed_relays} relay link(s)"
+                                ),
+                            )
+                            .await;
+                        } else {
+                            send_status(ui, format!("connected {peer_id} directly")).await;
+                        }
+                    } else if has_relayed_route {
+                        send_status(
+                            ui,
+                            format!(
+                                "promoted {peer_id} to direct connection after gossip warmup timeout; keeping relay until chat subscription is ready"
+                            ),
+                        )
+                        .await;
+                    } else {
+                        send_status(ui, format!("connected {peer_id} directly")).await;
+                    }
+                } else if swarm.close_connection(connection_id) {
                     send_status(
                         ui,
                         format!(
-                            "promoted {peer_id} to direct connection; closing {closed_relays} relay link(s)"
+                            "closed early direct connection to {peer_id}; waiting for chat subscription or warmup timeout"
                         ),
                     )
                     .await;
                 } else {
-                    send_status(ui, format!("connected {peer_id} directly")).await;
+                    send_status(
+                        ui,
+                        format!(
+                            "early direct connection to {peer_id} is waiting for chat subscription or warmup timeout"
+                        ),
+                    )
+                    .await;
                 }
             }
 
@@ -1034,8 +1213,8 @@ async fn handle_swarm_event(
 
             let count = swarm.connected_peers().count();
             let _ = ui.send(UiEvent::PeerCount(count)).await;
-            if let Err(err) = trigger_history_sync(swarm, &mut ctx) {
-                send_status(ui, format!("history summary failed: {err}")).await;
+            if let Err(err) = trigger_sync(swarm, &mut ctx) {
+                send_status(ui, format!("sync summary failed: {err}")).await;
             }
             if let Err(err) = publish_music_snapshot(
                 swarm,
@@ -1056,7 +1235,8 @@ async fn handle_swarm_event(
             num_established,
             ..
         } => {
-            let was_relayed = endpoint.is_relayed();
+            let was_relayed =
+                endpoint.is_relayed() || is_relay_address(endpoint.get_remote_address());
             if let Some(routes) = peer_routes.get_mut(&peer_id) {
                 routes.remove(connection_id, was_relayed);
                 if routes.is_empty() {
@@ -1075,6 +1255,14 @@ async fn handle_swarm_event(
                 .await;
             } else {
                 direct_promotion_backoffs.remove(&peer_id);
+                chat_subscribers.remove(&peer_id);
+                gossip_warmups.remove(&peer_id);
+                if explicit_peers.remove(&peer_id) {
+                    swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .remove_explicit_peer(&peer_id);
+                }
                 send_status(ui, format!("disconnected {peer_id}")).await;
                 if forget_peer_name(
                     peer_id,
@@ -1112,8 +1300,9 @@ async fn handle_swarm_event(
             let mut direct_candidates = HashSet::new();
             for (peer_id, address) in list {
                 discovered = true;
-                explicit_peers.insert(peer_id);
-                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                if explicit_peers.insert(peer_id) {
+                    swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                }
                 if remember_direct_addresses(peer_direct_addresses, peer_id, [address]) > 0 {
                     direct_promotion_backoffs.remove(&peer_id);
                     direct_candidates.insert(peer_id);
@@ -1126,14 +1315,16 @@ async fn handle_swarm_event(
                     peer_routes,
                     peer_direct_addresses,
                     direct_promotion_backoffs,
+                    chat_subscribers,
+                    gossip_warmups,
                     peer_id,
                     ui,
                 )
                 .await;
             }
             if discovered {
-                if let Err(err) = trigger_history_sync(swarm, &mut ctx) {
-                    send_status(ui, format!("history summary failed: {err}")).await;
+                if let Err(err) = trigger_sync(swarm, &mut ctx) {
+                    send_status(ui, format!("sync summary failed: {err}")).await;
                 }
                 if let Err(err) = publish_music_snapshot(
                     swarm,
@@ -1150,7 +1341,6 @@ async fn handle_swarm_event(
         }
         SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
             for (peer_id, address) in list {
-                explicit_peers.remove(&peer_id);
                 forget_direct_address(peer_direct_addresses, peer_id, address);
                 if forget_peer_name(
                     peer_id,
@@ -1162,10 +1352,12 @@ async fn handle_swarm_event(
                 ) {
                     send_status(ui, format!("name '{}' is available again", ctx.local_name)).await;
                 }
-                swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .remove_explicit_peer(&peer_id);
+                if !is_peer_connected(swarm, peer_id) && explicit_peers.remove(&peer_id) {
+                    swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .remove_explicit_peer(&peer_id);
+                }
                 send_status(ui, format!("mDNS expired {peer_id}")).await;
             }
         }
@@ -1177,6 +1369,8 @@ async fn handle_swarm_event(
                     peer_routes,
                     peer_direct_addresses,
                     direct_promotion_backoffs,
+                    chat_subscribers,
+                    gossip_warmups,
                     peer_id,
                     ui,
                 )
@@ -1194,6 +1388,8 @@ async fn handle_swarm_event(
                     peer_routes,
                     peer_direct_addresses,
                     direct_promotion_backoffs,
+                    chat_subscribers,
+                    gossip_warmups,
                     peer_id,
                     ui,
                 )
@@ -1243,8 +1439,11 @@ async fn handle_swarm_event(
             rendezvous_cookies.insert(rendezvous_node, cookie);
             let count = dial_rendezvous_registrations(
                 swarm,
+                explicit_peers,
                 peer_direct_addresses,
                 direct_promotion_backoffs,
+                chat_subscribers,
+                gossip_warmups,
                 peer_routes,
                 ctx.local_peer_id,
                 registrations,
@@ -1283,11 +1482,97 @@ async fn handle_swarm_event(
             topic,
         })) => {
             if topic == ctx.topic.hash() {
+                chat_subscribers.insert(peer_id);
+                gossip_warmups.remove(&peer_id);
                 send_status(ui, format!("peer {peer_id} subscribed to chat")).await;
-                if let Err(err) = trigger_history_sync(swarm, &mut ctx) {
-                    send_status(ui, format!("history summary failed: {err}")).await;
+                if let Err(err) = trigger_sync(swarm, &mut ctx) {
+                    send_status(ui, format!("sync summary failed: {err}")).await;
+                }
+                maybe_promote_relayed_peer(
+                    swarm,
+                    peer_routes,
+                    peer_direct_addresses,
+                    direct_promotion_backoffs,
+                    chat_subscribers,
+                    gossip_warmups,
+                    peer_id,
+                    ui,
+                )
+                .await;
+                if peer_routes
+                    .get(&peer_id)
+                    .is_some_and(PeerConnectionRoutes::has_direct)
+                {
+                    let closed_relays = close_relay_connections(swarm, peer_routes, peer_id);
+                    if closed_relays > 0 {
+                        send_status(
+                            ui,
+                            format!(
+                                "chat ready with {peer_id}; closing {closed_relays} relay link(s)"
+                            ),
+                        )
+                        .await;
+                    }
                 }
             }
+        }
+        SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed {
+            peer_id,
+            topic,
+        })) => {
+            if topic == ctx.topic.hash() {
+                chat_subscribers.remove(&peer_id);
+                send_status(ui, format!("peer {peer_id} unsubscribed from chat")).await;
+            }
+        }
+        SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
+            gossipsub::Event::GossipsubNotSupported { peer_id },
+        )) => {
+            send_status(ui, format!("peer {peer_id} does not support gossipsub")).await;
+        }
+        SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::SlowPeer {
+            peer_id,
+            failed_messages,
+        })) => {
+            send_status(
+                ui,
+                format!("gossipsub slow peer {peer_id}: {failed_messages:?}"),
+            )
+            .await;
+        }
+        SwarmEvent::Behaviour(BehaviourEvent::DirectMessages(
+            request_response::Event::Message { peer, message, .. },
+        )) => match message {
+            request_response::Message::Request {
+                request, channel, ..
+            } => {
+                let accepted =
+                    apply_direct_wire_message(peer, request.topic, request.message, ui, &mut ctx)
+                        .await;
+                if swarm
+                    .behaviour_mut()
+                    .direct_messages
+                    .send_response(channel, DirectMessageResponse { accepted })
+                    .is_err()
+                {
+                    send_status(ui, format!("direct response failed {peer}: channel closed")).await;
+                }
+            }
+            request_response::Message::Response { response, .. } => {
+                if !response.accepted {
+                    send_status(ui, format!("direct message ignored by {peer}")).await;
+                }
+            }
+        },
+        SwarmEvent::Behaviour(BehaviourEvent::DirectMessages(
+            request_response::Event::OutboundFailure { peer, error, .. },
+        )) => {
+            send_status(ui, format!("direct message failed {peer}: {error}")).await;
+        }
+        SwarmEvent::Behaviour(BehaviourEvent::DirectMessages(
+            request_response::Event::InboundFailure { peer, error, .. },
+        )) => {
+            send_status(ui, format!("direct message inbound failed {peer}: {error}")).await;
         }
         SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
             propagation_source,
@@ -1303,34 +1588,19 @@ async fn handle_swarm_event(
                 sent_at,
             }) => {
                 let source_peer_id = message.source.unwrap_or(propagation_source);
-                let claimed_peer_id = parse_peer_id(&peer_id).unwrap_or(source_peer_id);
-                remember_peer_name(
-                    claimed_peer_id,
-                    &name,
-                    ctx.local_peer_id,
-                    ctx.local_name,
-                    ctx.local_joined_at,
-                    &mut *ctx.peer_names,
-                    &mut *ctx.local_name_conflicts,
+                apply_chat_message(
+                    &mut ctx,
                     ui,
-                    joined_at,
-                )
-                .await;
-
-                let id =
-                    id.unwrap_or_else(|| new_message_id(propagation_source, sent_at, 0, &text));
-                let record = ChatRecord {
                     id,
-                    peer_id: claimed_peer_id.to_string(),
+                    peer_id,
                     joined_at,
-                    author: name,
+                    name,
                     text,
                     sent_at,
-                };
-
-                if insert_record(ctx.history, ctx.seen_messages, record) {
-                    send_history_snapshot(ui, ctx.history).await;
-                }
+                    source_peer_id,
+                    propagation_source,
+                )
+                .await;
             }
             Ok(WireMessage::NameClaim {
                 peer_id,
@@ -1446,6 +1716,89 @@ async fn handle_swarm_event(
                         )
                         .await;
                     }
+                }
+            }
+            Ok(WireMessage::QueueSummary {
+                peer_id,
+                version,
+                updated_at_micros,
+                ..
+            }) => {
+                let local_peer_id = ctx.local_peer_id.to_string();
+                if peer_id != local_peer_id
+                    && is_queue_state_newer(
+                        version,
+                        updated_at_micros,
+                        *ctx.queue_version,
+                        *ctx.queue_updated_at,
+                    )
+                    && should_request_queue(ctx.queue_request_times, &peer_id)
+                {
+                    let request = WireMessage::QueueRequest {
+                        requester: local_peer_id,
+                        target: peer_id.clone(),
+                        known_version: *ctx.queue_version,
+                        known_updated_at_micros: *ctx.queue_updated_at,
+                        nonce: new_nonce(ctx.local_peer_id),
+                    };
+
+                    match publish_history_wire(swarm, ctx.topic, &request) {
+                        Ok(()) => {
+                            ctx.queue_request_times
+                                .insert(peer_id.clone(), Instant::now());
+                            send_status(ui, format!("requesting queue from {peer_id}")).await;
+                        }
+                        Err(err) => {
+                            send_status(ui, format!("queue request failed: {err}")).await;
+                        }
+                    }
+                }
+            }
+            Ok(WireMessage::QueueRequest {
+                requester,
+                target,
+                known_version,
+                known_updated_at_micros,
+                ..
+            }) => {
+                let local_peer_id = ctx.local_peer_id.to_string();
+                if target == local_peer_id
+                    && requester != local_peer_id
+                    && is_queue_state_newer(
+                        *ctx.queue_version,
+                        *ctx.queue_updated_at,
+                        known_version,
+                        known_updated_at_micros,
+                    )
+                {
+                    let response = WireMessage::QueueResponse {
+                        target: requester.clone(),
+                        state: build_queue_state(
+                            *ctx.queue_version,
+                            *ctx.queue_updated_at,
+                            ctx.local_peer_id,
+                            ctx.music_queue,
+                        ),
+                        nonce: new_nonce(ctx.local_peer_id),
+                    };
+
+                    match publish_history_wire(swarm, ctx.topic, &response) {
+                        Ok(()) => {
+                            send_status(
+                                ui,
+                                format!("sent {} queue item(s)", ctx.music_queue.len()),
+                            )
+                            .await;
+                        }
+                        Err(err) => {
+                            send_status(ui, format!("queue response failed: {err}")).await;
+                        }
+                    }
+                }
+            }
+            Ok(WireMessage::QueueResponse { target, state, .. }) => {
+                if target == ctx.local_peer_id.to_string() {
+                    apply_remote_queue_state(ui, &mut ctx, state, "synced queue").await;
                 }
             }
             Ok(WireMessage::PlaybackState { state, .. }) => {
@@ -1581,18 +1934,7 @@ async fn handle_swarm_event(
                 }
             }
             Ok(WireMessage::QueueState { state, .. }) => {
-                if should_apply_queue_state(*ctx.queue_updated_at, &state) {
-                    *ctx.music_queue = VecDeque::from(state.items.clone());
-                    *ctx.queue_version = state.version;
-                    *ctx.queue_updated_at = state.updated_at_micros;
-                    let _ = ui.send(UiEvent::Queue(state.clone())).await;
-                    send_status(
-                        ui,
-                        format!("queue updated by {}", short_peer(&state.updated_by)),
-                    )
-                    .await;
-                    send_queue_status(ui, ctx.playback_state.as_ref(), ctx.music_queue).await;
-                }
+                apply_remote_queue_state(ui, &mut ctx, state, "queue updated").await;
             }
             Ok(WireMessage::VoteProposal { proposal, .. }) => {
                 if proposal.proposer == ctx.local_peer_id.to_string() {
@@ -1746,6 +2088,8 @@ async fn retry_direct_promotions(
     peer_routes: &HashMap<PeerId, PeerConnectionRoutes>,
     peer_direct_addresses: &HashMap<PeerId, HashSet<Multiaddr>>,
     direct_promotion_backoffs: &mut HashMap<PeerId, DirectPromotionBackoff>,
+    chat_subscribers: &HashSet<PeerId>,
+    gossip_warmups: &mut HashMap<PeerId, GossipsubWarmup>,
     ui: &mpsc::Sender<UiEvent>,
 ) {
     let peers = peer_routes.keys().copied().collect::<Vec<_>>();
@@ -1755,6 +2099,37 @@ async fn retry_direct_promotions(
             peer_routes,
             peer_direct_addresses,
             direct_promotion_backoffs,
+            chat_subscribers,
+            gossip_warmups,
+            peer_id,
+            ui,
+        )
+        .await;
+    }
+}
+
+async fn retry_gossip_warmup_promotions(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    peer_routes: &HashMap<PeerId, PeerConnectionRoutes>,
+    peer_direct_addresses: &HashMap<PeerId, HashSet<Multiaddr>>,
+    direct_promotion_backoffs: &mut HashMap<PeerId, DirectPromotionBackoff>,
+    chat_subscribers: &HashSet<PeerId>,
+    gossip_warmups: &mut HashMap<PeerId, GossipsubWarmup>,
+    ui: &mpsc::Sender<UiEvent>,
+) {
+    let peers = gossip_warmups
+        .iter()
+        .filter_map(|(peer_id, warmup)| warmup.is_expired().then_some(*peer_id))
+        .collect::<Vec<_>>();
+
+    for peer_id in peers {
+        maybe_promote_relayed_peer(
+            swarm,
+            peer_routes,
+            peer_direct_addresses,
+            direct_promotion_backoffs,
+            chat_subscribers,
+            gossip_warmups,
             peer_id,
             ui,
         )
@@ -1781,6 +2156,17 @@ async fn register_with_rendezvous_node(
     namespace: &rendezvous::Namespace,
     ui: &mpsc::Sender<UiEvent>,
 ) {
+    if !has_external_addresses(swarm) {
+        send_status(
+            ui,
+            format!(
+                "rendezvous register deferred {rendezvous_node}: waiting for confirmed external address"
+            ),
+        )
+        .await;
+        return;
+    }
+
     match swarm.behaviour_mut().rendezvous.register(
         namespace.clone(),
         rendezvous_node,
@@ -1846,8 +2232,11 @@ async fn discover_rendezvous_node(
 
 async fn dial_rendezvous_registrations(
     swarm: &mut libp2p::Swarm<Behaviour>,
+    explicit_peers: &mut HashSet<PeerId>,
     peer_direct_addresses: &mut HashMap<PeerId, HashSet<Multiaddr>>,
     direct_promotion_backoffs: &mut HashMap<PeerId, DirectPromotionBackoff>,
+    chat_subscribers: &HashSet<PeerId>,
+    gossip_warmups: &mut HashMap<PeerId, GossipsubWarmup>,
     peer_routes: &HashMap<PeerId, PeerConnectionRoutes>,
     local_peer_id: PeerId,
     registrations: Vec<rendezvous::Registration>,
@@ -1871,7 +2260,10 @@ async fn dial_rendezvous_registrations(
         }
         discovered += 1;
 
-        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+        if explicit_peers.insert(peer_id) {
+            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+            send_status(ui, format!("tracking {peer_id} as rendezvous gossip peer")).await;
+        }
         if remember_direct_addresses(peer_direct_addresses, peer_id, addresses.clone()) > 0 {
             direct_promotion_backoffs.remove(&peer_id);
         }
@@ -1882,6 +2274,8 @@ async fn dial_rendezvous_registrations(
                 peer_routes,
                 peer_direct_addresses,
                 direct_promotion_backoffs,
+                chat_subscribers,
+                gossip_warmups,
                 peer_id,
                 ui,
             )
@@ -1917,11 +2311,61 @@ async fn dial_rendezvous_registrations(
     discovered
 }
 
+fn start_gossip_warmup(
+    gossip_warmups: &mut HashMap<PeerId, GossipsubWarmup>,
+    peer_id: PeerId,
+) -> bool {
+    if gossip_warmups.contains_key(&peer_id) {
+        return false;
+    }
+
+    gossip_warmups.insert(peer_id, GossipsubWarmup::new());
+    true
+}
+
+async fn gossip_warmup_allows_promotion(
+    peer_id: PeerId,
+    chat_subscribers: &HashSet<PeerId>,
+    gossip_warmups: &mut HashMap<PeerId, GossipsubWarmup>,
+    ui: &mpsc::Sender<UiEvent>,
+) -> bool {
+    if chat_subscribers.contains(&peer_id) {
+        gossip_warmups.remove(&peer_id);
+        return true;
+    }
+
+    let Some(warmup) = gossip_warmups.get(&peer_id) else {
+        gossip_warmups.insert(peer_id, GossipsubWarmup::new());
+        send_status(
+            ui,
+            format!(
+                "waiting up to {} for {peer_id} to subscribe to chat before direct promotion",
+                format_retry_duration(GOSSIP_WARMUP_TIMEOUT)
+            ),
+        )
+        .await;
+        return false;
+    };
+    if !warmup.is_expired() {
+        return false;
+    }
+
+    gossip_warmups.remove(&peer_id);
+    send_status(
+        ui,
+        format!("gossipsub warmup timed out for {peer_id}; trying direct promotion anyway"),
+    )
+    .await;
+    true
+}
+
 async fn maybe_promote_relayed_peer(
     swarm: &mut libp2p::Swarm<Behaviour>,
     peer_routes: &HashMap<PeerId, PeerConnectionRoutes>,
     peer_direct_addresses: &HashMap<PeerId, HashSet<Multiaddr>>,
     direct_promotion_backoffs: &mut HashMap<PeerId, DirectPromotionBackoff>,
+    chat_subscribers: &HashSet<PeerId>,
+    gossip_warmups: &mut HashMap<PeerId, GossipsubWarmup>,
     peer_id: PeerId,
     ui: &mpsc::Sender<UiEvent>,
 ) {
@@ -1939,6 +2383,10 @@ async fn maybe_promote_relayed_peer(
         return;
     };
     if addresses.is_empty() {
+        return;
+    }
+
+    if !gossip_warmup_allows_promotion(peer_id, chat_subscribers, gossip_warmups, ui).await {
         return;
     }
 
@@ -2059,6 +2507,10 @@ fn is_peer_connected(swarm: &libp2p::Swarm<Behaviour>, peer_id: PeerId) -> bool 
     swarm
         .connected_peers()
         .any(|connected| *connected == peer_id)
+}
+
+fn has_external_addresses(swarm: &libp2p::Swarm<Behaviour>) -> bool {
+    swarm.external_addresses().next().is_some()
 }
 
 fn close_relay_connections(
@@ -2229,23 +2681,74 @@ fn publish_presence_and_history(
     publish_history_summary(swarm, topic, local_peer_id, history)
 }
 
-fn trigger_history_sync(
+fn publish_queue_summary(
     swarm: &mut libp2p::Swarm<Behaviour>,
-    ctx: &mut HistoryContext<'_>,
+    topic: &gossipsub::IdentTopic,
+    local_peer_id: PeerId,
+    queue_version: u64,
+    queue_updated_at: i64,
+    queue: &VecDeque<QueueItem>,
+) -> Result<()> {
+    if queue_version == 0 && queue.is_empty() {
+        return Ok(());
+    }
+
+    let summary = WireMessage::QueueSummary {
+        peer_id: local_peer_id.to_string(),
+        version: queue_version,
+        updated_at_micros: queue_updated_at,
+        item_count: queue.len(),
+        nonce: new_nonce(local_peer_id),
+    };
+    publish_history_wire(swarm, topic, &summary)
+}
+
+fn publish_sync_summary(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    topic: &gossipsub::IdentTopic,
+    local_peer_id: PeerId,
+    local_name: &str,
+    local_joined_at: i64,
+    history: &[ChatRecord],
+    queue_version: u64,
+    queue_updated_at: i64,
+    queue: &VecDeque<QueueItem>,
 ) -> Result<()> {
     publish_presence_and_history(
+        swarm,
+        topic,
+        local_peer_id,
+        local_name,
+        local_joined_at,
+        history,
+    )?;
+    publish_queue_summary(
+        swarm,
+        topic,
+        local_peer_id,
+        queue_version,
+        queue_updated_at,
+        queue,
+    )
+}
+
+fn trigger_sync(swarm: &mut libp2p::Swarm<Behaviour>, ctx: &mut HistoryContext<'_>) -> Result<()> {
+    publish_sync_summary(
         swarm,
         ctx.topic,
         ctx.local_peer_id,
         ctx.local_name,
         ctx.local_joined_at,
         ctx.history,
+        *ctx.queue_version,
+        *ctx.queue_updated_at,
+        ctx.music_queue,
     )?;
-    schedule_history_sync_burst(ctx.pending_history_summaries);
+    schedule_sync_burst(ctx.pending_sync_summaries);
     Ok(())
 }
 
-fn schedule_history_sync_burst(pending: &mut VecDeque<Instant>) {
+fn schedule_sync_burst(pending: &mut VecDeque<Instant>) {
     let now = Instant::now();
     for delay in [
         Duration::from_millis(300),
@@ -2256,7 +2759,7 @@ fn schedule_history_sync_burst(pending: &mut VecDeque<Instant>) {
     }
 }
 
-fn publish_pending_history_summaries(
+fn publish_pending_sync_summaries(
     pending: &mut VecDeque<Instant>,
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
@@ -2264,20 +2767,137 @@ fn publish_pending_history_summaries(
     local_name: &str,
     local_joined_at: i64,
     history: &[ChatRecord],
+    queue_version: u64,
+    queue_updated_at: i64,
+    queue: &VecDeque<QueueItem>,
 ) -> Result<()> {
     let now = Instant::now();
     while pending.front().is_some_and(|deadline| *deadline <= now) {
         pending.pop_front();
-        publish_presence_and_history(
+        publish_sync_summary(
             swarm,
             topic,
             local_peer_id,
             local_name,
             local_joined_at,
             history,
+            queue_version,
+            queue_updated_at,
+            queue,
         )?;
     }
     Ok(())
+}
+
+async fn apply_direct_wire_message(
+    source_peer_id: PeerId,
+    topic_name: String,
+    message: WireMessage,
+    ui: &mpsc::Sender<UiEvent>,
+    ctx: &mut HistoryContext<'_>,
+) -> bool {
+    if topic_name != ctx.topic_name {
+        send_status(
+            ui,
+            format!("ignored direct message from {source_peer_id}: topic mismatch"),
+        )
+        .await;
+        return false;
+    }
+
+    match message {
+        WireMessage::Chat {
+            id,
+            peer_id,
+            joined_at,
+            name,
+            text,
+            sent_at,
+        } => {
+            apply_chat_message(
+                ctx,
+                ui,
+                id,
+                peer_id,
+                joined_at,
+                name,
+                text,
+                sent_at,
+                source_peer_id,
+                source_peer_id,
+            )
+            .await;
+            true
+        }
+        WireMessage::NameClaim {
+            peer_id,
+            name,
+            joined_at,
+            ..
+        } => {
+            if let Some(peer_id) = parse_peer_id(&peer_id) {
+                remember_peer_name(
+                    peer_id,
+                    &name,
+                    ctx.local_peer_id,
+                    ctx.local_name,
+                    ctx.local_joined_at,
+                    &mut *ctx.peer_names,
+                    &mut *ctx.local_name_conflicts,
+                    ui,
+                    joined_at,
+                )
+                .await;
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+async fn apply_chat_message(
+    ctx: &mut HistoryContext<'_>,
+    ui: &mpsc::Sender<UiEvent>,
+    id: Option<String>,
+    peer_id: String,
+    joined_at: Option<i64>,
+    name: String,
+    text: String,
+    sent_at: i64,
+    source_peer_id: PeerId,
+    id_peer_id: PeerId,
+) -> bool {
+    let claimed_peer_id = parse_peer_id(&peer_id).unwrap_or(source_peer_id);
+    remember_peer_name(
+        claimed_peer_id,
+        &name,
+        ctx.local_peer_id,
+        ctx.local_name,
+        ctx.local_joined_at,
+        &mut *ctx.peer_names,
+        &mut *ctx.local_name_conflicts,
+        ui,
+        joined_at,
+    )
+    .await;
+
+    let id = id.unwrap_or_else(|| new_message_id(id_peer_id, sent_at, 0, &text));
+    let record = ChatRecord {
+        id,
+        peer_id: claimed_peer_id.to_string(),
+        joined_at,
+        author: name,
+        text,
+        sent_at,
+    };
+
+    let inserted = insert_record(ctx.history, ctx.seen_messages, record);
+    if inserted {
+        send_history_snapshot(ui, ctx.history).await;
+    }
+    inserted
 }
 
 fn insert_record(
@@ -2308,6 +2928,29 @@ fn insert_record(
 
 async fn send_history_snapshot(ui: &mpsc::Sender<UiEvent>, history: &[ChatRecord]) {
     let _ = ui.send(UiEvent::History(history.to_vec())).await;
+}
+
+async fn apply_remote_queue_state(
+    ui: &mpsc::Sender<UiEvent>,
+    ctx: &mut HistoryContext<'_>,
+    state: QueueState,
+    status_prefix: &str,
+) -> bool {
+    if !should_apply_queue_state(*ctx.queue_version, *ctx.queue_updated_at, &state) {
+        return false;
+    }
+
+    *ctx.music_queue = VecDeque::from(state.items.clone());
+    *ctx.queue_version = state.version;
+    *ctx.queue_updated_at = state.updated_at_micros;
+    let _ = ui.send(UiEvent::Queue(state.clone())).await;
+    send_status(
+        ui,
+        format!("{status_prefix} by {}", short_peer(&state.updated_by)),
+    )
+    .await;
+    send_queue_status(ui, ctx.playback_state.as_ref(), ctx.music_queue).await;
+    true
 }
 
 async fn send_queue_view(
@@ -2476,14 +3119,55 @@ fn should_request_history(history_request_times: &HashMap<String, Instant>, peer
         .is_none_or(|last_request| last_request.elapsed() >= HISTORY_REQUEST_COOLDOWN)
 }
 
-fn publish_wire(
+fn should_request_queue(queue_request_times: &HashMap<String, Instant>, peer_id: &str) -> bool {
+    queue_request_times
+        .get(peer_id)
+        .is_none_or(|last_request| last_request.elapsed() >= QUEUE_REQUEST_COOLDOWN)
+}
+
+fn send_direct_message_to_connected_peers(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    peer_routes: &HashMap<PeerId, PeerConnectionRoutes>,
+    rendezvous_nodes: &HashSet<PeerId>,
+    topic_name: &str,
+    message: &WireMessage,
+) -> usize {
+    let local_peer_id = *swarm.local_peer_id();
+    let peer_ids = peer_routes
+        .iter()
+        .filter(|(peer_id, routes)| {
+            **peer_id != local_peer_id
+                && !rendezvous_nodes.contains(peer_id)
+                && (routes.has_direct() || routes.has_relayed())
+        })
+        .map(|(peer_id, _)| *peer_id)
+        .collect::<Vec<_>>();
+
+    let count = peer_ids.len();
+    for peer_id in peer_ids {
+        swarm.behaviour_mut().direct_messages.send_request(
+            &peer_id,
+            DirectMessageRequest {
+                topic: topic_name.to_string(),
+                message: message.clone(),
+            },
+        );
+    }
+
+    count
+}
+
+fn publish_chat_wire(
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
     message: &WireMessage,
-) -> Result<()> {
+) -> Result<ChatPublishOutcome> {
     let data = serde_json::to_vec(message)?;
     match swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
-        Ok(_) | Err(gossipsub::PublishError::Duplicate) => Ok(()),
+        Ok(_) | Err(gossipsub::PublishError::Duplicate) => Ok(ChatPublishOutcome::Published),
+        Err(gossipsub::PublishError::NoPeersSubscribedToTopic) => {
+            Ok(ChatPublishOutcome::NoPeersSubscribed)
+        }
         Err(err) => Err(anyhow!(err)),
     }
 }
@@ -2534,12 +3218,7 @@ fn publish_queue_snapshot(
         return Ok(());
     }
 
-    let state = QueueState {
-        version: queue_version,
-        updated_at_micros: queue_updated_at,
-        updated_by: local_peer_id.to_string(),
-        items: queue.iter().cloned().collect(),
-    };
+    let state = build_queue_state(queue_version, queue_updated_at, local_peer_id, queue);
 
     publish_history_wire(
         swarm,
@@ -2578,8 +3257,37 @@ fn publish_music_snapshot(
     Ok(())
 }
 
-fn should_apply_queue_state(local_updated_at: i64, state: &QueueState) -> bool {
-    state.updated_at_micros > local_updated_at
+fn build_queue_state(
+    queue_version: u64,
+    queue_updated_at: i64,
+    local_peer_id: PeerId,
+    queue: &VecDeque<QueueItem>,
+) -> QueueState {
+    QueueState {
+        version: queue_version,
+        updated_at_micros: queue_updated_at,
+        updated_by: local_peer_id.to_string(),
+        items: queue.iter().cloned().collect(),
+    }
+}
+
+fn should_apply_queue_state(local_version: u64, local_updated_at: i64, state: &QueueState) -> bool {
+    is_queue_state_newer(
+        state.version,
+        state.updated_at_micros,
+        local_version,
+        local_updated_at,
+    )
+}
+
+fn is_queue_state_newer(
+    candidate_version: u64,
+    candidate_updated_at: i64,
+    local_version: u64,
+    local_updated_at: i64,
+) -> bool {
+    candidate_updated_at > local_updated_at
+        || (candidate_updated_at == local_updated_at && candidate_version > local_version)
 }
 
 async fn start_next_if_idle(
