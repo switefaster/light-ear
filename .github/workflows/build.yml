@@ -27,12 +27,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
 
       - name: Setup Rust
@@ -79,14 +79,14 @@ jobs:
         run: npx --yes @tauri-apps/cli@^2 build
 
       - name: Upload relay binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: link-ear-${{ matrix.artifact_os }}-relay
           if-no-files-found: error
           path: target/release/${{ matrix.relay_binary }}
 
       - name: Upload desktop bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: link-ear-${{ matrix.artifact_os }}-desktop
           if-no-files-found: error
