@@ -313,7 +313,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             RelayBehaviour {
                 relay: relay::Behaviour::new(local_peer_id, relay::Config::default()),
                 rendezvous: rendezvous::server::Behaviour::new(
-                    rendezvous::server::Config::default(),
+                    rendezvous::server::Config::default().with_min_ttl(120), //TODO: Burden the relay traffic? Gracefully unregister when quitting?
                 ),
                 identify: identify::Behaviour::new(identify::Config::new(
                     "/link-ear-relay/0.1.0".to_string(),
