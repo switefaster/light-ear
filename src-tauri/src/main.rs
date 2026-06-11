@@ -182,20 +182,6 @@ fn parse_multiaddrs(values: Vec<String>) -> Result<Vec<Multiaddr>, String> {
 }
 
 fn main() {
-    #[cfg(target_os = "linux")]
-    {
-        let im_module = env::var("GTK_IM_MODULE")
-            .or_else(|_| env::var("XMODIFIERS").map(|x| x.replace("@im=", "")))
-            .unwrap_or_else(|_| "fcitx".to_string());
-
-        env::set_var("GTK_IM_MODULE", &im_module);
-        env::set_var("XMODIFIERS", format!("@im={}", im_module));
-
-        if env::var("XDG_SESSION_TYPE").unwrap_or_default() == "wayland" {
-            env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
-        }
-    }
-
     tauri::Builder::default()
         .manage(BackendState::default())
         .invoke_handler(tauri::generate_handler![
