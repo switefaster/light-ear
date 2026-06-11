@@ -70,6 +70,11 @@ guardrail:
   they reach majority or when remaining pending peers can no longer make the
   vote pass. UI vote views should expose approvals, rejections, pending count,
   and the local peer's ballot without changing the P2P wire schema.
+- Playback votes should apply deterministically on every peer from the proposal
+  timestamp and proposer identity. Only the peer whose id matches the resulting
+  playback state's `leader_peer_id` should publish that playback state, because
+  inbound wire source validation requires playback leaders to match the message
+  source peer.
 - Vote thresholds and playback ready expected peers count real room peers only:
   include the local peer, exclude relay/rendezvous infrastructure peers.
 - Gossipsub publish paths for chat, history sync, queue sync, playback, and

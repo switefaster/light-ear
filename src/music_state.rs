@@ -423,36 +423,59 @@ impl MusicState {
         state
     }
 
-    pub(crate) fn pause_playback(
+    pub(crate) fn stop_current_playback_for_vote(
         &mut self,
-        local_peer_id: PeerId,
-        now_micros: i64,
+        actor_peer_id: PeerId,
+        vote_micros: i64,
+    ) -> PlaybackState {
+        let version = self.vote_playback_version(vote_micros);
+        let state = PlaybackState {
+            session_id: format!("{actor_peer_id}:{vote_micros}:idle"),
+            leader_peer_id: actor_peer_id.to_string(),
+            track: None,
+            track_requested_by: None,
+            state_version: version,
+            issued_at_micros: vote_micros,
+            playing: false,
+            position_ms: 0,
+            anchor_time_micros: vote_micros,
+            rate: 1.0,
+        };
+        self.playback_phase = PlaybackPhase::Idle {
+            state: Some(state.clone()),
+        };
+        state
+    }
+
+    pub(crate) fn pause_playback_for_vote(
+        &mut self,
+        actor_peer_id: PeerId,
+        vote_micros: i64,
     ) -> Option<PlaybackState> {
-        self.update_playback_state(now_micros, |state, version| {
-            let position_ms = playback_position_ms(state, now_micros);
+        let version = self.vote_playback_version(vote_micros);
+        self.update_playback_state_with_version(vote_micros, version, |state, version| {
+            let position_ms = playback_position_ms(state, vote_micros);
             state.state_version = version;
-            state.issued_at_micros = now_micros;
+            state.issued_at_micros = vote_micros;
             state.playing = false;
             state.position_ms = position_ms;
-            state.anchor_time_micros = now_micros;
-            state.leader_peer_id = local_peer_id.to_string();
+            state.anchor_time_micros = vote_micros;
+            state.leader_peer_id = actor_peer_id.to_string();
         })
     }
 
-    pub(crate) fn resume_playback(
+    pub(crate) fn resume_playback_for_vote(
         &mut self,
-        local_peer_id: PeerId,
-        now_micros: i64,
+        actor_peer_id: PeerId,
+        vote_micros: i64,
     ) -> Option<PlaybackState> {
-        self.update_playback_state(now_micros, |state, version| {
-            let position_ms = playback_position_ms(state, now_micros);
-            let playing = can_play_at_position(state, position_ms);
+        let version = self.vote_playback_version(vote_micros);
+        self.update_playback_state_with_version(vote_micros, version, |state, version| {
             state.state_version = version;
-            state.issued_at_micros = now_micros;
-            state.playing = playing;
-            state.position_ms = position_ms;
-            state.anchor_time_micros = now_micros;
-            state.leader_peer_id = local_peer_id.to_string();
+            state.issued_at_micros = vote_micros;
+            state.playing = true;
+            state.anchor_time_micros = vote_micros;
+            state.leader_peer_id = actor_peer_id.to_string();
         })
     }
 
@@ -474,6 +497,23 @@ impl MusicState {
         })
     }
 
+    pub(crate) fn seek_playback_for_vote(
+        &mut self,
+        actor_peer_id: PeerId,
+        position_ms: u64,
+        vote_micros: i64,
+    ) -> Option<PlaybackState> {
+        let version = self.vote_playback_version(vote_micros);
+        self.update_playback_state_with_version(vote_micros, version, |state, version| {
+            let position_ms = clamp_playback_position_ms(state, position_ms);
+            state.state_version = version;
+            state.issued_at_micros = vote_micros;
+            state.position_ms = position_ms;
+            state.anchor_time_micros = vote_micros;
+            state.leader_peer_id = actor_peer_id.to_string();
+        })
+    }
+
     pub(crate) fn mark_queue_vote_applied(&mut self, updated_at_micros: i64) {
         self.mark_queue_changed(updated_at_micros);
     }
@@ -486,9 +526,25 @@ impl MusicState {
         self.playback_state()?;
         self.playback_version = self.playback_version.saturating_add(1);
         let version = self.playback_version;
+        self.update_playback_state_with_version(_now_micros, version, update)
+    }
+
+    fn update_playback_state_with_version(
+        &mut self,
+        _now_micros: i64,
+        version: u64,
+        update: impl FnOnce(&mut PlaybackState, u64),
+    ) -> Option<PlaybackState> {
+        self.playback_state()?;
         let state = self.playback_state_mut()?;
         update(state, version);
         Some(state.clone())
+    }
+
+    fn vote_playback_version(&mut self, vote_micros: i64) -> u64 {
+        let version = u64::try_from(vote_micros).unwrap_or(0);
+        self.playback_version = self.playback_version.max(version);
+        version
     }
 
     pub(crate) fn start_vote(&mut self, proposal: VoteProposal, deadline: Instant) {
@@ -1449,6 +1505,75 @@ mod tests {
             panic!("expected preparing playback");
         };
         assert_eq!(preparing.ready_count(), 1);
+    }
+
+    #[test]
+    fn skip_vote_during_prepare_clears_pending_with_deterministic_idle_state() {
+        let leader = peer_id();
+        let proposer = peer_id();
+        let item = queue_item("track");
+        let expected = HashSet::from([leader.to_string(), proposer.to_string()]);
+        let mut music = MusicState::new();
+        let prepare = music.begin_playback_prepare(
+            item,
+            expected,
+            Instant::now() + Duration::from_secs(60),
+            leader,
+            1_000_000,
+        );
+
+        assert!(music.has_pending_playback());
+        let state = music.stop_current_playback_for_vote(proposer, 2_000_000);
+
+        assert!(!music.has_pending_playback());
+        assert!(!music.has_track());
+        assert_ne!(state.session_id, prepare.state.session_id);
+        assert_eq!(state.session_id, format!("{proposer}:2000000:idle"));
+        assert_eq!(state.leader_peer_id, proposer.to_string());
+        assert!(state.track.is_none());
+        assert_eq!(state.track_requested_by, None);
+        assert_eq!(state.state_version, 2_000_000);
+        assert_eq!(state.issued_at_micros, 2_000_000);
+        assert!(!state.playing);
+        assert_eq!(state.position_ms, 0);
+        assert_eq!(state.anchor_time_micros, 2_000_000);
+    }
+
+    #[test]
+    fn playback_vote_application_uses_vote_timestamp_and_actor() {
+        let leader = peer_id();
+        let proposer = peer_id();
+        let requester = peer_id();
+        let mut first = MusicState::new();
+        let mut second = MusicState::new();
+        first.playback_version = 7;
+        second.playback_version = 42;
+        first.playback_phase = PlaybackPhase::Active(playback_state(
+            leader, requester, "session", true, 1_000, 1_000_000, 10_000,
+        ));
+        second.playback_phase = PlaybackPhase::Active(playback_state(
+            leader, requester, "session", true, 1_000, 1_000_000, 10_000,
+        ));
+
+        let first_state = first
+            .seek_playback_for_vote(proposer, 4_000, 2_000_000)
+            .unwrap();
+        let second_state = second
+            .seek_playback_for_vote(proposer, 4_000, 2_000_000)
+            .unwrap();
+
+        assert_eq!(first_state.session_id, second_state.session_id);
+        assert_eq!(first_state.leader_peer_id, proposer.to_string());
+        assert_eq!(second_state.leader_peer_id, proposer.to_string());
+        assert_eq!(first_state.state_version, 2_000_000);
+        assert_eq!(second_state.state_version, 2_000_000);
+        assert_eq!(first_state.issued_at_micros, 2_000_000);
+        assert_eq!(second_state.issued_at_micros, 2_000_000);
+        assert_eq!(first_state.position_ms, 4_000);
+        assert_eq!(second_state.position_ms, 4_000);
+        assert_eq!(first_state.anchor_time_micros, 2_000_000);
+        assert_eq!(second_state.anchor_time_micros, 2_000_000);
+        assert_eq!(first_state.playing, second_state.playing);
     }
 
     #[test]

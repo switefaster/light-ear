@@ -3680,37 +3680,46 @@ async fn execute_vote_action(
     let actor_peer_id = parse_peer_id(&proposal.proposer).unwrap_or(local_peer_id);
     match proposal.action {
         VoteAction::Pause => {
-            let now = current_timestamp_micros();
-            if let Some(state) = music.pause_playback(actor_peer_id, now) {
+            let now = proposal.created_at_micros;
+            if let Some(state) = music.pause_playback_for_vote(actor_peer_id, now) {
                 if let Some(player) = audio_player.as_mut() {
                     player.set_playing(false, now)?;
                 }
-                publish_playback_state(swarm, topic, targets, &state)?;
+                publish_playback_state_if_local_source(
+                    swarm,
+                    topic,
+                    targets,
+                    &state,
+                    local_peer_id,
+                )?;
                 send_playback_view(ui, &state).await;
             }
         }
         VoteAction::Resume => {
-            let now = current_timestamp_micros();
-            if let Some(state) = music.resume_playback(actor_peer_id, now) {
+            let now = proposal.created_at_micros;
+            if let Some(state) = music.resume_playback_for_vote(actor_peer_id, now) {
                 if let Some(player) = audio_player.as_mut() {
                     player.set_playing(state.playing, now)?;
                 }
-                publish_playback_state(swarm, topic, targets, &state)?;
+                publish_playback_state_if_local_source(
+                    swarm,
+                    topic,
+                    targets,
+                    &state,
+                    local_peer_id,
+                )?;
                 send_playback_view(ui, &state).await;
             }
         }
         VoteAction::Skip => {
-            stop_current_playback(
-                music,
-                audio_player,
-                swarm,
-                topic,
-                targets,
-                actor_peer_id,
-                "skipped",
-                ui,
-            )
-            .await?;
+            if let Some(player) = audio_player.as_mut() {
+                player.stop();
+            }
+            let state =
+                music.stop_current_playback_for_vote(actor_peer_id, proposal.created_at_micros);
+            publish_playback_state_if_local_source(swarm, topic, targets, &state, local_peer_id)?;
+            send_playback_view(ui, &state).await;
+            send_status(ui, "skipped".to_string()).await;
             if proposal.proposer == local_peer_id.to_string() {
                 start_next_if_idle(
                     music,
@@ -3728,12 +3737,18 @@ async fn execute_vote_action(
             }
         }
         VoteAction::Seek { position_ms } => {
-            let now = current_timestamp_micros();
-            if let Some(state) = music.seek_playback(actor_peer_id, position_ms, now) {
+            let now = proposal.created_at_micros;
+            if let Some(state) = music.seek_playback_for_vote(actor_peer_id, position_ms, now) {
                 if let Some(player) = audio_player.as_mut() {
                     player.seek(state.position_ms, state.playing, now)?;
                 }
-                publish_playback_state(swarm, topic, targets, &state)?;
+                publish_playback_state_if_local_source(
+                    swarm,
+                    topic,
+                    targets,
+                    &state,
+                    local_peer_id,
+                )?;
                 send_playback_view(ui, &state).await;
             }
         }
@@ -3873,6 +3888,19 @@ fn publish_playback_state(
             ),
         },
     )
+}
+
+fn publish_playback_state_if_local_source(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    topic: &gossipsub::IdentTopic,
+    targets: &PublishTargets<'_>,
+    state: &PlaybackState,
+    local_peer_id: PeerId,
+) -> Result<()> {
+    if state.leader_peer_id == local_peer_id.to_string() {
+        publish_playback_state(swarm, topic, targets, state)?;
+    }
+    Ok(())
 }
 
 fn publish_playback_prepare(

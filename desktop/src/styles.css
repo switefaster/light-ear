@@ -1543,6 +1543,11 @@ h2 {
   overflow: auto;
 }
 
+.peer-group .empty-state {
+  min-height: 66px;
+  padding: 10px;
+}
+
 .peer-row {
   display: grid;
   grid-template-columns: minmax(150px, 1fr) auto minmax(260px, 1.35fr);
@@ -1945,6 +1950,10 @@ h2 {
   .peer-row {
     grid-template-columns: minmax(0, 1fr);
     align-items: stretch;
+  }
+
+  .peer-group .empty-state {
+    min-height: 82px;
   }
 
   .route-pill {
