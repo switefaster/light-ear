@@ -1,0 +1,94 @@
+name: Build
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.artifact_os }} artifacts
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_os: windows
+            relay_binary: link-ear-relay.exe
+          - os: ubuntu-22.04
+            artifact_os: linux
+            relay_binary: link-ear-relay
+          - os: macos-latest
+            artifact_os: macos
+            relay_binary: link-ear-relay
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install Linux Tauri dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            wget
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Run Rust library tests
+        run: cargo test --lib --locked
+
+      - name: Check Rust crates
+        run: |
+          cargo check --locked
+          cargo check --locked --bin link-ear-relay
+          cargo check --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: Build relay binary
+        run: cargo build --locked --release --bin link-ear-relay
+
+      - name: Build Tauri desktop bundle
+        run: npx --yes @tauri-apps/cli@^2 build
+
+      - name: Upload relay binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: link-ear-${{ matrix.artifact_os }}-relay
+          if-no-files-found: error
+          path: target/release/${{ matrix.relay_binary }}
+
+      - name: Upload desktop bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: link-ear-${{ matrix.artifact_os }}-desktop
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release/link-ear-desktop*
+            src-tauri/target/release/bundle/**

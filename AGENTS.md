@@ -23,6 +23,9 @@ connections when direct addresses become usable so relay traffic stays bounded.
 - `desktop/src/main.jsx`: React/Vite desktop UI.
 - `ARCHITECTURE.md`: current architecture boundaries, state-machine rules,
   timing assumptions, and change guidance.
+- `.github/workflows/build.yml`: push-triggered matrix CI build for Windows,
+  Linux, and macOS artifacts. It uploads relay binaries and Tauri desktop
+  bundles, but does not build or upload the legacy TUI binary.
 
 ## Useful checks
 
