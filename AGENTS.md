@@ -72,6 +72,12 @@ guardrail:
 - Bilibili/audio downloads for playback prepare run off the main swarm event
   loop. Skip/cancel may arrive while a download is in flight; stale download
   results must be ignored by session id and track id.
+- Music download, decode, device, or playback-sync failures must converge
+  explicitly instead of leaving a peer in fake playback. A leader failure should
+  publish cancel/idle for the affected session and then try the next queued
+  item; a follower failure should stop local playback, clear the local playback
+  view, and suppress re-applying the failed session until a new session or idle
+  state arrives.
 - Each peer may cast only one ballot per vote. Votes should resolve early when
   they reach majority or when remaining pending peers can no longer make the
   vote pass. UI vote views should expose approvals, rejections, pending count,

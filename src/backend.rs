@@ -231,6 +231,7 @@ pub async fn run_network(
     let http_client = bilibili::client()?;
     let (audio_download_tx, mut audio_download_rx) = mpsc::channel(16);
     let mut pending_audio_downloads = HashSet::new();
+    let mut failed_audio_sessions = HashSet::new();
     let mut audio_player = match player::AudioPlayer::new() {
         Ok(player) => Some(player),
         Err(err) => {
@@ -804,20 +805,59 @@ pub async fn run_network(
                 }
 
                 let mut finished_current = None;
-                if let Some(state) = music.playback_state() {
+                if let Some(state) = music.playback_state().cloned() {
                     let now = current_timestamp_micros();
-                    if let Err(err) = sync_loaded_player_to_state(&mut audio_player, state, now) {
-                        send_status(&ui, format!("playback sync failed: {err:#}")).await;
+                    if let Err(err) = sync_loaded_player_to_state(&mut audio_player, &state, now) {
+                        failed_audio_sessions.insert(state.session_id.clone());
+                        if state.leader_peer_id == local_peer_id.to_string() {
+                            send_status(&ui, format!("local playback failed: {err:#}")).await;
+                            stop_current_playback(
+                                &mut music,
+                                &mut audio_player,
+                                &mut swarm,
+                                &topic,
+                                &targets,
+                                local_peer_id,
+                                "local audio playback failed",
+                                &ui,
+                            )
+                            .await?;
+                            start_next_if_idle(
+                                &mut music,
+                                &mut audio_player,
+                                &http_client,
+                                &audio_download_tx,
+                                &mut pending_audio_downloads,
+                                &mut swarm,
+                                &topic,
+                                &targets,
+                                local_peer_id,
+                                &ui,
+                            )
+                            .await?;
+                            continue;
+                        }
+
+                        mark_local_audio_session_failed(
+                            &mut audio_player,
+                            &mut music,
+                            &mut failed_audio_sessions,
+                            &state,
+                            format!("playback sync failed: {err:#}"),
+                            &ui,
+                        )
+                        .await;
+                        continue;
                     }
 
                     let local_audio_finished = audio_player
                         .as_ref()
                         .is_some_and(|player| player.is_finished(now));
                     finished_current =
-                        finished_playback_role(state, local_peer_id, now, local_audio_finished);
+                        finished_playback_role(&state, local_peer_id, now, local_audio_finished);
 
                     if finished_current.is_none() {
-                        send_playback_view(&ui, state).await;
+                        send_playback_view(&ui, &state).await;
                     }
                 }
 
@@ -994,8 +1034,12 @@ pub async fn run_network(
                 };
                 if let Err(err) = handle_audio_download_result(
                     download,
+                    &http_client,
                     &mut music,
                     &mut audio_player,
+                    &audio_download_tx,
+                    &mut pending_audio_downloads,
+                    &mut failed_audio_sessions,
                     &mut swarm,
                     &topic,
                     &targets,
@@ -1024,6 +1068,7 @@ pub async fn run_network(
                     http_client: &http_client,
                     audio_download_tx: &audio_download_tx,
                     pending_audio_downloads: &mut pending_audio_downloads,
+                    failed_audio_sessions: &mut failed_audio_sessions,
                     audio_player: &mut audio_player,
                     music: &mut music,
                 };
@@ -1085,6 +1130,7 @@ struct HistoryContext<'a> {
     http_client: &'a reqwest::Client,
     audio_download_tx: &'a mpsc::Sender<AudioDownloadResult>,
     pending_audio_downloads: &'a mut HashSet<String>,
+    failed_audio_sessions: &'a mut HashSet<String>,
     audio_player: &'a mut Option<player::AudioPlayer>,
     music: &'a mut MusicState,
 }
@@ -2472,6 +2518,13 @@ async fn apply_wire_message(
         }
         WireMessage::PlaybackState { state, .. } => {
             let state = normalize_remote_playback_state(&state, current_timestamp_micros());
+            if state.track.is_none() {
+                ctx.failed_audio_sessions.clear();
+            }
+            if playback_state_uses_failed_audio_session(ctx.failed_audio_sessions, &state) {
+                return true;
+            }
+
             if state.leader_peer_id != ctx.local_peer_id.to_string()
                 && should_apply_playback_state(ctx.music.playback_state(), &state)
             {
@@ -2495,6 +2548,15 @@ async fn apply_wire_message(
                     Ok(()) => {}
                     Err(err) => {
                         send_status(ui, format!("playback sync failed: {err:#}")).await;
+                        mark_local_audio_session_failed(
+                            &mut *ctx.audio_player,
+                            ctx.music,
+                            ctx.failed_audio_sessions,
+                            &state,
+                            format!("playback sync failed: {err:#}"),
+                            ui,
+                        )
+                        .await;
                     }
                 }
             }
@@ -2508,6 +2570,10 @@ async fn apply_wire_message(
             let state = normalize_remote_playback_state(&state, current_timestamp_micros());
             let is_expected = expected_peers.is_empty()
                 || expected_peers.contains(&ctx.local_peer_id.to_string());
+            if playback_state_uses_failed_audio_session(ctx.failed_audio_sessions, &state) {
+                return true;
+            }
+
             if state.leader_peer_id != ctx.local_peer_id.to_string()
                 && is_expected
                 && should_apply_playback_state(ctx.music.playback_state(), &state)
@@ -3401,8 +3467,12 @@ fn schedule_audio_download(
 
 async fn handle_audio_download_result(
     download: AudioDownloadResult,
+    client: &reqwest::Client,
     music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
+    audio_download_tx: &mpsc::Sender<AudioDownloadResult>,
+    pending_audio_downloads: &mut HashSet<String>,
+    failed_audio_sessions: &mut HashSet<String>,
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
@@ -3431,7 +3501,10 @@ async fn handle_audio_download_result(
     let was_pending = music.has_pending_playback();
     let is_leader = state.leader_peer_id == local_peer_id.to_string();
     let audio = match download.audio {
-        Ok(audio) => audio,
+        Ok(audio) => {
+            failed_audio_sessions.remove(&download.session_id);
+            audio
+        }
         Err(err) => {
             send_status(
                 ui,
@@ -3439,18 +3512,42 @@ async fn handle_audio_download_result(
             )
             .await;
             if is_leader {
-                if let Some(cancel) =
-                    music.take_local_pending_cancel(local_peer_id, "local audio download failed")
-                {
-                    publish_playback_cancel(
-                        swarm,
-                        topic,
-                        targets,
-                        &cancel.session_id,
-                        local_peer_id,
-                        &cancel.reason,
-                    )?;
-                }
+                handle_local_leader_audio_failure(
+                    music,
+                    audio_player,
+                    failed_audio_sessions,
+                    swarm,
+                    topic,
+                    targets,
+                    local_peer_id,
+                    &state,
+                    "local audio download failed",
+                    ui,
+                )
+                .await?;
+                start_next_if_idle(
+                    music,
+                    audio_player,
+                    client,
+                    audio_download_tx,
+                    pending_audio_downloads,
+                    swarm,
+                    topic,
+                    targets,
+                    local_peer_id,
+                    ui,
+                )
+                .await?;
+            } else {
+                mark_local_audio_session_failed(
+                    audio_player,
+                    music,
+                    failed_audio_sessions,
+                    &state,
+                    format!("audio download failed: {err}"),
+                    ui,
+                )
+                .await;
             }
             return Ok(());
         }
@@ -3477,18 +3574,42 @@ async fn handle_audio_download_result(
             )
             .await;
             if is_leader {
-                if let Some(cancel) =
-                    music.take_local_pending_cancel(local_peer_id, "local audio failed to load")
-                {
-                    publish_playback_cancel(
-                        swarm,
-                        topic,
-                        targets,
-                        &cancel.session_id,
-                        local_peer_id,
-                        &cancel.reason,
-                    )?;
-                }
+                handle_local_leader_audio_failure(
+                    music,
+                    audio_player,
+                    failed_audio_sessions,
+                    swarm,
+                    topic,
+                    targets,
+                    local_peer_id,
+                    &state,
+                    "local audio failed to load",
+                    ui,
+                )
+                .await?;
+                start_next_if_idle(
+                    music,
+                    audio_player,
+                    client,
+                    audio_download_tx,
+                    pending_audio_downloads,
+                    swarm,
+                    topic,
+                    targets,
+                    local_peer_id,
+                    ui,
+                )
+                .await?;
+            } else {
+                mark_local_audio_session_failed(
+                    audio_player,
+                    music,
+                    failed_audio_sessions,
+                    &state,
+                    format!("audio load failed: {err:#}"),
+                    ui,
+                )
+                .await;
             }
             return Ok(());
         }
@@ -3511,6 +3632,99 @@ async fn handle_audio_download_result(
     }
 
     Ok(())
+}
+
+async fn handle_local_leader_audio_failure(
+    music: &mut MusicState,
+    audio_player: &mut Option<player::AudioPlayer>,
+    failed_audio_sessions: &mut HashSet<String>,
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    topic: &gossipsub::IdentTopic,
+    targets: &PublishTargets<'_>,
+    local_peer_id: PeerId,
+    state: &PlaybackState,
+    reason: &str,
+    ui: &mpsc::Sender<UiEvent>,
+) -> Result<()> {
+    failed_audio_sessions.insert(state.session_id.clone());
+    if let Some(player) = audio_player.as_mut() {
+        player.stop();
+    }
+
+    if let Some(cancel) = music.take_local_pending_cancel(local_peer_id, reason) {
+        publish_playback_cancel(
+            swarm,
+            topic,
+            targets,
+            &cancel.session_id,
+            local_peer_id,
+            &cancel.reason,
+        )?;
+        let _ = ui.send(UiEvent::Playback(None)).await;
+        send_status(ui, format!("playback canceled: {reason}")).await;
+        return Ok(());
+    }
+
+    if music
+        .playback_state()
+        .is_some_and(|current| current.session_id == state.session_id)
+    {
+        let idle = music.stop_current_playback(local_peer_id, current_timestamp_micros());
+        publish_playback_state(swarm, topic, targets, &idle)?;
+        send_playback_view(ui, &idle).await;
+    }
+
+    send_status(ui, reason.to_string()).await;
+    Ok(())
+}
+
+async fn mark_local_audio_session_failed(
+    audio_player: &mut Option<player::AudioPlayer>,
+    music: &mut MusicState,
+    failed_audio_sessions: &mut HashSet<String>,
+    state: &PlaybackState,
+    reason: String,
+    ui: &mpsc::Sender<UiEvent>,
+) {
+    failed_audio_sessions.insert(state.session_id.clone());
+    if let Some(player) = audio_player.as_mut() {
+        player.stop();
+    }
+
+    let matches_session = music
+        .playback_state()
+        .is_some_and(|current| current.session_id == state.session_id);
+    if matches_session {
+        let invalidated_vote = music.cancel_playback(&state.session_id);
+        let _ = ui.send(UiEvent::Playback(None)).await;
+        if let Some(invalidated_vote) = invalidated_vote {
+            let _ = ui.send(UiEvent::Vote(None)).await;
+            send_status(ui, invalidated_vote.reason.to_string()).await;
+        }
+    }
+
+    send_status(
+        ui,
+        format!(
+            "local audio unavailable for {}: {reason}",
+            playback_state_title(state)
+        ),
+    )
+    .await;
+}
+
+fn playback_state_uses_failed_audio_session(
+    failed_audio_sessions: &HashSet<String>,
+    state: &PlaybackState,
+) -> bool {
+    state.track.is_some() && failed_audio_sessions.contains(&state.session_id)
+}
+
+fn playback_state_title(state: &PlaybackState) -> &str {
+    state
+        .track
+        .as_ref()
+        .map_or("playback", |track| track.title.as_str())
 }
 
 async fn start_next_if_idle(
@@ -4981,6 +5195,61 @@ mod tests {
         assert_eq!(
             finished_playback_role(&not_done, leader, 1_500_000, true),
             Some(FinishedPlaybackRole::Leader)
+        );
+    }
+
+    #[test]
+    fn failed_audio_session_blocks_track_state_but_not_idle_state() {
+        let leader = peer_id();
+        let mut failed_audio_sessions = HashSet::new();
+        failed_audio_sessions.insert("session".to_string());
+
+        let active = playback_state(leader, true, 0, 1_000_000, 1_000);
+        assert!(playback_state_uses_failed_audio_session(
+            &failed_audio_sessions,
+            &active
+        ));
+
+        let mut idle = active.clone();
+        idle.track = None;
+        idle.track_requested_by = None;
+        assert!(!playback_state_uses_failed_audio_session(
+            &failed_audio_sessions,
+            &idle
+        ));
+
+        let mut other_session = active;
+        other_session.session_id = "other-session".to_string();
+        assert!(!playback_state_uses_failed_audio_session(
+            &failed_audio_sessions,
+            &other_session
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_audio_failure_clears_matching_follower_session() {
+        let leader = peer_id();
+        let state = playback_state(leader, false, 0, 1_000_000, 1_000);
+        let mut music = MusicState::default();
+        music.set_remote_playback_prepare(state.clone());
+        let mut failed_audio_sessions = HashSet::new();
+        let (ui_tx, mut ui_rx) = mpsc::channel(4);
+
+        mark_local_audio_session_failed(
+            &mut None,
+            &mut music,
+            &mut failed_audio_sessions,
+            &state,
+            "decode failed".to_string(),
+            &ui_tx,
+        )
+        .await;
+
+        assert!(failed_audio_sessions.contains(&state.session_id));
+        assert!(music.playback_state().is_none());
+        assert!(matches!(ui_rx.recv().await, Some(UiEvent::Playback(None))));
+        assert!(
+            matches!(ui_rx.recv().await, Some(UiEvent::Status(status)) if status.contains("decode failed"))
         );
     }
 
