@@ -287,6 +287,19 @@ h2 {
   cursor: pointer;
 }
 
+.peer-nav-button.peer-solo {
+  color: #f3d9a6;
+  border-color: rgba(211, 154, 32, 0.38);
+  background: rgba(211, 154, 32, 0.14);
+}
+
+.peer-nav-button.peer-alert {
+  color: #ffe2dc;
+  border-color: rgba(189, 77, 61, 0.72);
+  background: rgba(189, 77, 61, 0.2);
+  box-shadow: inset 0 0 0 1px rgba(189, 77, 61, 0.22);
+}
+
 .peer-nav-button:hover,
 .peer-nav-button:focus-visible {
   color: var(--paper);
@@ -297,6 +310,17 @@ h2 {
 .peer-nav-button:focus-visible {
   outline: 3px solid rgba(47, 159, 120, 0.28);
   outline-offset: 2px;
+}
+
+.peer-nav-button.peer-alert:hover,
+.peer-nav-button.peer-alert:focus-visible {
+  color: #fff4f1;
+  border-color: rgba(224, 101, 81, 0.8);
+  background: rgba(189, 77, 61, 0.28);
+}
+
+.peer-nav-button.peer-alert:focus-visible {
+  outline-color: rgba(189, 77, 61, 0.28);
 }
 
 .topic-chip {
@@ -923,6 +947,70 @@ h2 {
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+}
+
+.chat-stage.has-connection-alert {
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 8px;
+}
+
+.connection-alert {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 9px;
+  align-items: center;
+  min-width: 0;
+  padding: 9px 12px;
+  border: 1px solid rgba(189, 77, 61, 0.52);
+  border-radius: 8px;
+  color: #6f3027;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.78), rgba(255, 240, 234, 0.94)),
+    #fff1ea;
+  cursor: pointer;
+  text-align: left;
+  box-shadow: 0 10px 24px rgba(107, 48, 39, 0.14);
+}
+
+.connection-alert svg {
+  color: var(--red);
+}
+
+.connection-alert span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.connection-alert strong,
+.connection-alert small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connection-alert strong {
+  color: #5f281f;
+  font-size: 13px;
+}
+
+.connection-alert small {
+  color: #87554d;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.connection-alert:hover,
+.connection-alert:focus-visible {
+  border-color: rgba(189, 77, 61, 0.72);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.86), rgba(255, 236, 230, 0.98)),
+    #fff1ea;
+}
+
+.connection-alert:focus-visible {
+  outline: 3px solid rgba(189, 77, 61, 0.2);
+  outline-offset: 2px;
 }
 
 .chat-panel {

@@ -20,6 +20,7 @@ use tracing_subscriber::EnvFilter;
 
 const EVENT_LOG_LIMIT: usize = 80;
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(2);
+const SWARM_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Public link-ear relay and rendezvous node")]
@@ -321,6 +322,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 ping: ping::Behaviour::default(),
             }
         })?
+        .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(SWARM_IDLE_CONNECTION_TIMEOUT))
         .build();
 
     let local_peer_id = *swarm.local_peer_id();

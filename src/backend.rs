@@ -60,8 +60,17 @@ const MUSIC_PREPARE_TIMEOUT: Duration = Duration::from_secs(12);
 const MUSIC_START_DELAY: Duration = Duration::from_millis(1500);
 const VOTE_TIMEOUT: Duration = Duration::from_secs(20);
 const RENDEZVOUS_DISCOVER_INTERVAL: Duration = Duration::from_secs(30);
-const RENDEZVOUS_REGISTER_INTERVAL: Duration = Duration::from_secs(30 * 60);
-const RENDEZVOUS_TTL_SECONDS: u64 = 60 * 60 * 2;
+const RENDEZVOUS_REGISTER_INTERVAL: Duration = Duration::from_secs(60);
+const RENDEZVOUS_TTL_SECONDS: u64 = 180;
+const ZERO_PEER_RECOVERY_TICK: Duration = Duration::from_secs(1);
+const ZERO_PEER_RECOVERY_DISCOVER_DELAYS: [Duration; 5] = [
+    Duration::from_secs(0),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(20),
+    Duration::from_secs(30),
+];
+const SWARM_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const DIRECT_MESSAGE_PROTOCOL: &str = "/link-ear/direct-message/0.1.0";
 static NONCE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -137,6 +146,66 @@ enum PendingDirectSyncRequest {
     Queue { peer_id: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RendezvousDiscoverMode {
+    Incremental,
+    Full,
+}
+
+#[derive(Debug, Default)]
+struct ZeroPeerRecovery {
+    active: bool,
+    discover_deadlines: VecDeque<Instant>,
+}
+
+impl ZeroPeerRecovery {
+    fn start(&mut self, now: Instant) -> bool {
+        if self.active {
+            return false;
+        }
+
+        self.active = true;
+        self.discover_deadlines.clear();
+        for delay in ZERO_PEER_RECOVERY_DISCOVER_DELAYS {
+            self.discover_deadlines.push_back(now + delay);
+        }
+        true
+    }
+
+    fn finish(&mut self) -> bool {
+        if !self.active {
+            return false;
+        }
+
+        self.active = false;
+        self.discover_deadlines.clear();
+        true
+    }
+
+    fn pop_due_discovery(&mut self, now: Instant) -> bool {
+        if !self.active {
+            return false;
+        }
+
+        let mut due = false;
+        while self
+            .discover_deadlines
+            .front()
+            .is_some_and(|deadline| *deadline <= now)
+        {
+            self.discover_deadlines.pop_front();
+            due = true;
+        }
+
+        if due && self.active && self.discover_deadlines.is_empty() {
+            self.discover_deadlines
+                .push_back(now + RENDEZVOUS_DISCOVER_INTERVAL);
+        }
+
+        due
+    }
+}
+
 pub async fn run_network(
     config: BackendConfig,
     mut commands: mpsc::Receiver<NetworkCommand>,
@@ -153,6 +222,8 @@ pub async fn run_network(
     let mut pending_sync_summaries = VecDeque::new();
     let mut rendezvous_nodes = HashSet::new();
     let mut rendezvous_cookies = HashMap::new();
+    let relay_addrs = prioritize_multiaddrs(config.relay.clone());
+    let mut zero_peer_recovery = ZeroPeerRecovery::default();
     let rendezvous_namespace = rendezvous::Namespace::new(config.topic.clone())
         .map_err(|err| anyhow!("invalid rendezvous namespace '{}': {err}", config.topic))?;
     let mut music = MusicState::new();
@@ -182,6 +253,8 @@ pub async fn run_network(
     rendezvous_discover.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut rendezvous_register = time::interval(RENDEZVOUS_REGISTER_INTERVAL);
     rendezvous_register.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut zero_peer_recovery_tick = time::interval(ZERO_PEER_RECOVERY_TICK);
+    zero_peer_recovery_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     let mut swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
@@ -229,6 +302,7 @@ pub async fn run_network(
                 })
             },
         )?
+        .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(SWARM_IDLE_CONNECTION_TIMEOUT))
         .build();
 
     let local_peer_id = *swarm.local_peer_id();
@@ -258,7 +332,7 @@ pub async fn run_network(
         }
     }
 
-    for relay_addr in prioritize_multiaddrs(config.relay) {
+    for relay_addr in relay_addrs.iter().cloned() {
         let rendezvous_peer = peer_id_from_multiaddr(&relay_addr);
         if let Some(peer_id) = rendezvous_peer {
             rendezvous_nodes.insert(peer_id);
@@ -872,9 +946,24 @@ pub async fn run_network(
                     &rendezvous_nodes,
                     &rendezvous_namespace,
                     &rendezvous_cookies,
+                    RendezvousDiscoverMode::Incremental,
                     &ui,
                 )
                 .await;
+            },
+            _ = zero_peer_recovery_tick.tick() => {
+                if zero_peer_recovery.pop_due_discovery(Instant::now()) {
+                    run_zero_peer_recovery(
+                        &mut swarm,
+                        &relay_addrs,
+                        &rendezvous_nodes,
+                        &rendezvous_namespace,
+                        &rendezvous_cookies,
+                        &mut pending_sync_summaries,
+                        &ui,
+                    )
+                    .await;
+                }
             },
             Some(download) = audio_download_rx.recv() => {
                 pending_audio_downloads.remove(&download.session_id);
@@ -926,6 +1015,7 @@ pub async fn run_network(
                     &rendezvous_nodes,
                     &rendezvous_namespace,
                     &mut rendezvous_cookies,
+                    &mut zero_peer_recovery,
                     ctx,
                 )
                 .await;
@@ -1071,6 +1161,7 @@ async fn handle_swarm_event(
     rendezvous_nodes: &HashSet<PeerId>,
     rendezvous_namespace: &rendezvous::Namespace,
     rendezvous_cookies: &mut HashMap<PeerId, rendezvous::Cookie>,
+    zero_peer_recovery: &mut ZeroPeerRecovery,
     mut ctx: HistoryContext<'_>,
 ) {
     match event {
@@ -1123,6 +1214,14 @@ async fn handle_swarm_event(
             };
             let count = connected_room_peer_count(swarm, rendezvous_nodes);
             let _ = ui.send(UiEvent::PeerCount(count)).await;
+            if count > 0 && !rendezvous_nodes.contains(&peer_id) && zero_peer_recovery.finish() {
+                schedule_sync_burst(ctx.pending_sync_summaries);
+                send_status(
+                    ui,
+                    format!("room peer {peer_id} reconnected; refreshing sync"),
+                )
+                .await;
+            }
             if let Err(err) = trigger_sync(swarm, &targets, &mut ctx) {
                 send_status(ui, format!("sync summary failed: {err}")).await;
             }
@@ -1151,6 +1250,16 @@ async fn handle_swarm_event(
                 }
                 let count = connected_room_peer_count(swarm, rendezvous_nodes);
                 let _ = ui.send(UiEvent::PeerCount(count)).await;
+                if count == 0
+                    && !rendezvous_nodes.contains(&peer_id)
+                    && zero_peer_recovery.start(Instant::now())
+                {
+                    send_status(
+                        ui,
+                        "all room peers disconnected; starting rendezvous recovery".to_string(),
+                    )
+                    .await;
+                }
                 let peer_id = peer_id.to_string();
                 ctx.music.remove_pending_peer(&peer_id);
                 let targets = PublishTargets {
@@ -1507,6 +1616,62 @@ async fn retry_gossip_warmup_promotions(
     apply_connection_effects(swarm, connections, ui, rendezvous_nodes, effects).await;
 }
 
+async fn run_zero_peer_recovery(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    relay_addrs: &[Multiaddr],
+    rendezvous_nodes: &HashSet<PeerId>,
+    namespace: &rendezvous::Namespace,
+    rendezvous_cookies: &HashMap<PeerId, rendezvous::Cookie>,
+    pending_sync_summaries: &mut VecDeque<Instant>,
+    ui: &mpsc::Sender<UiEvent>,
+) {
+    ensure_rendezvous_connections(swarm, relay_addrs, rendezvous_nodes, ui).await;
+    register_with_rendezvous_nodes(swarm, rendezvous_nodes, namespace, ui).await;
+    discover_rendezvous_peers(
+        swarm,
+        rendezvous_nodes,
+        namespace,
+        rendezvous_cookies,
+        RendezvousDiscoverMode::Full,
+        ui,
+    )
+    .await;
+    schedule_sync_burst(pending_sync_summaries);
+}
+
+async fn ensure_rendezvous_connections(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    relay_addrs: &[Multiaddr],
+    rendezvous_nodes: &HashSet<PeerId>,
+    ui: &mpsc::Sender<UiEvent>,
+) {
+    for relay_addr in relay_addrs {
+        let Some(peer_id) = peer_id_from_multiaddr(relay_addr) else {
+            continue;
+        };
+        if !rendezvous_nodes.contains(&peer_id) || is_peer_connected(swarm, peer_id) {
+            continue;
+        }
+
+        let dial_opts = DialOpts::peer_id(peer_id)
+            .addresses(vec![relay_addr.clone()])
+            .condition(PeerCondition::Disconnected)
+            .build();
+        match swarm.dial(dial_opts) {
+            Ok(()) => {
+                send_status(ui, format!("reconnecting rendezvous {peer_id}")).await;
+            }
+            Err(err) => {
+                send_status(
+                    ui,
+                    format!("rendezvous reconnect dial failed {peer_id}: {err}"),
+                )
+                .await;
+            }
+        }
+    }
+}
+
 async fn register_with_rendezvous_nodes(
     swarm: &mut libp2p::Swarm<Behaviour>,
     rendezvous_nodes: &HashSet<PeerId>,
@@ -1564,6 +1729,7 @@ async fn discover_rendezvous_peers(
     rendezvous_nodes: &HashSet<PeerId>,
     namespace: &rendezvous::Namespace,
     rendezvous_cookies: &HashMap<PeerId, rendezvous::Cookie>,
+    mode: RendezvousDiscoverMode,
     ui: &mpsc::Sender<UiEvent>,
 ) {
     for rendezvous_node in rendezvous_nodes {
@@ -1572,11 +1738,22 @@ async fn discover_rendezvous_peers(
                 swarm,
                 *rendezvous_node,
                 namespace,
-                rendezvous_cookies.get(rendezvous_node),
+                rendezvous_cookie_for_mode(mode, rendezvous_cookies, rendezvous_node),
                 ui,
             )
             .await;
         }
+    }
+}
+
+fn rendezvous_cookie_for_mode<'a>(
+    mode: RendezvousDiscoverMode,
+    cookies: &'a HashMap<PeerId, rendezvous::Cookie>,
+    rendezvous_node: &PeerId,
+) -> Option<&'a rendezvous::Cookie> {
+    match mode {
+        RendezvousDiscoverMode::Incremental => cookies.get(rendezvous_node),
+        RendezvousDiscoverMode::Full => None,
     }
 }
 
@@ -1626,18 +1803,13 @@ async fn dial_rendezvous_registrations(
         }
         discovered += 1;
 
-        let mut effects = connections.track_gossip_peer(
-            peer_id,
-            Some(format!("tracking {peer_id} as rendezvous gossip peer")),
-        );
-        effects.extend(connections.learn_direct_addresses(
-            peer_id,
-            addresses.clone(),
-            Instant::now(),
-        ));
-        apply_connection_effects(swarm, connections, ui, rendezvous_nodes, effects).await;
-
         if is_peer_connected(swarm, peer_id) {
+            let mut effects = connections.track_gossip_peer(
+                peer_id,
+                Some(format!("tracking {peer_id} as rendezvous gossip peer")),
+            );
+            effects.extend(connections.learn_direct_addresses(peer_id, addresses, Instant::now()));
+            apply_connection_effects(swarm, connections, ui, rendezvous_nodes, effects).await;
             continue;
         }
 
@@ -4296,6 +4468,49 @@ mod tests {
 
     fn peer_id() -> PeerId {
         identity::Keypair::generate_ed25519().public().to_peer_id()
+    }
+
+    #[test]
+    fn zero_peer_recovery_schedules_full_discovery_burst_and_repeats() {
+        let now = Instant::now();
+        let mut recovery = ZeroPeerRecovery::default();
+
+        assert!(recovery.start(now));
+        assert!(!recovery.start(now));
+        assert!(recovery.active);
+        assert_eq!(recovery.discover_deadlines.len(), 5);
+
+        assert!(recovery.pop_due_discovery(now));
+        assert!(!recovery.pop_due_discovery(now + Duration::from_secs(4)));
+        assert!(recovery.pop_due_discovery(now + Duration::from_secs(5)));
+        assert!(recovery.pop_due_discovery(now + Duration::from_secs(10)));
+        assert!(recovery.pop_due_discovery(now + Duration::from_secs(20)));
+        assert!(recovery.pop_due_discovery(now + Duration::from_secs(30)));
+
+        assert_eq!(
+            recovery.discover_deadlines.front().copied(),
+            Some(now + Duration::from_secs(60))
+        );
+        assert!(!recovery.pop_due_discovery(now + Duration::from_secs(59)));
+        assert!(recovery.pop_due_discovery(now + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn zero_peer_recovery_clears_when_a_room_peer_returns() {
+        let now = Instant::now();
+        let mut recovery = ZeroPeerRecovery::default();
+
+        assert!(recovery.start(now));
+        assert!(recovery.finish());
+
+        assert!(!recovery.active);
+        assert!(recovery.discover_deadlines.is_empty());
+        assert!(!recovery.pop_due_discovery(now + Duration::from_secs(60)));
+        assert!(!recovery.finish());
+
+        let later = now + Duration::from_secs(90);
+        assert!(recovery.start(later));
+        assert_eq!(recovery.discover_deadlines.front().copied(), Some(later));
     }
 
     fn record(id: impl Into<String>, sent_at: i64) -> ChatRecord {

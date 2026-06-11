@@ -21,6 +21,8 @@ connections when direct addresses become usable so relay traffic stays bounded.
   dashboard.
 - `src-tauri/src/main.rs`: Tauri command bridge into the Rust backend.
 - `desktop/src/main.jsx`: React/Vite desktop UI.
+- `ARCHITECTURE.md`: current architecture boundaries, state-machine rules,
+  timing assumptions, and change guidance.
 
 ## Useful checks
 
@@ -87,6 +89,10 @@ guardrail:
 - Direct promotion should not close relay links immediately on the same tick as
   a new direct connection. Keep relay during the short handoff grace period; if
   direct drops during that window, relay remains the reliability path.
+- The client and relay node should keep `Swarm` idle connection timeout explicit
+  and much longer than libp2p's 10s default. Relay-only room peers may be idle
+  while gossipsub is warming up or direct promotion is failing; the default idle
+  timeout can otherwise close the relay route without any local handoff effect.
 - The peer overview UI is a diagnostic snapshot of local connection state. Keep
   it UI-facing only: route type, direct/relay link counts, known direct address
   count, chat subscription readiness, and direct promotion counters must not be
@@ -94,6 +100,17 @@ guardrail:
 - Direct fallback for targeted history/queue sync requests should send only to
   the target peer. Track request-response failures for those fallback requests
   and clear the matching request cooldown so slow peers can retry sync.
+- Rendezvous registration TTL should stay short and be refreshed periodically,
+  because clients often exit without unregistering. Do not cache rendezvous
+  direct addresses for peers that are not currently connected; use those
+  addresses for the immediate disconnected dial only, and let successful
+  connections/identify repopulate local peer state.
+- When connected room peers drop to zero after previously being connected,
+  enter zero-peer recovery: keep relay/rendezvous infrastructure connected,
+  periodically run full rendezvous discovery without the previous cookie, and
+  schedule history/queue sync bursts when peers return. Offline local chat
+  records must still merge by message id and normalized timestamp after
+  reconnection.
 - History summary handling should consider both message count and newest
   timestamp; equal counts do not prove histories have converged.
 - Desktop chat history must remain scrollable for old messages. New messages

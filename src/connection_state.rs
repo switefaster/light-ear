@@ -400,6 +400,7 @@ impl ConnectionState {
         } else {
             self.backoffs.remove(&peer_id);
             self.chat_subscribers.remove(&peer_id);
+            self.direct_addresses.remove(&peer_id);
             self.warmups.remove(&peer_id);
             self.warmup_completed.remove(&peer_id);
             self.relay_handoffs.remove(&peer_id);
@@ -916,6 +917,12 @@ mod tests {
         })
     }
 
+    fn has_close_relay(effects: &[ConnectionEffect], peer_id: PeerId) -> bool {
+        effects.iter().any(|effect| {
+            matches!(effect, ConnectionEffect::CloseRelayConnections { peer_id: effect_peer, .. } if *effect_peer == peer_id)
+        })
+    }
+
     #[test]
     fn direct_and_relay_routes_clear_after_last_connection_closes() {
         let local = peer_id();
@@ -946,6 +953,22 @@ mod tests {
                 ConnectionEffect::UntrackGossipPeer(_)
             ]
         ));
+    }
+
+    #[test]
+    fn disconnect_clears_cached_direct_addresses_from_peer_view() {
+        let local = peer_id();
+        let peer = peer_id();
+        let now = Instant::now();
+        let mut state = ConnectionState::new(local);
+
+        state.connection_established(peer, cid(1), true, false, now);
+        state.learn_direct_addresses(peer, [addr(peer, 4001)], now);
+        assert_eq!(state.peer_views(&HashSet::new()).len(), 1);
+
+        state.connection_closed(peer, cid(1), true, 0);
+
+        assert!(state.peer_views(&HashSet::new()).is_empty());
     }
 
     #[test]
@@ -1186,6 +1209,49 @@ mod tests {
             now + Duration::from_secs(1),
         );
 
+        assert!(state.has_relayed(peer));
+        assert!(state.is_relay_only(peer));
+    }
+
+    #[test]
+    fn direct_promotion_failures_and_ticks_never_close_relay() {
+        let local = peer_id();
+        let peer = peer_id();
+        let now = Instant::now();
+        let mut state = ConnectionState::new(local);
+
+        state.connection_established(peer, cid(1), true, false, now);
+        state.chat_subscribed(peer, now);
+        assert!(has_dial_for(
+            &state.learn_direct_addresses(peer, [addr(peer, 4001)], now),
+            peer
+        ));
+
+        let first_failure = state.outgoing_connection_error(
+            peer,
+            "outgoing direct dial failed".to_string(),
+            now + Duration::from_secs(1),
+        );
+        assert!(!has_close_relay(&first_failure, peer));
+
+        let retry =
+            state.promotion_tick(now + DIRECT_PROMOTION_RETRY_INTERVAL + Duration::from_secs(1));
+        assert!(has_dial_for(&retry, peer));
+        assert!(!has_close_relay(&retry, peer));
+
+        let second_failure = state.outgoing_connection_error(
+            peer,
+            "outgoing direct dial failed".to_string(),
+            now + DIRECT_PROMOTION_RETRY_INTERVAL + Duration::from_secs(2),
+        );
+        assert!(!has_close_relay(&second_failure, peer));
+
+        let timer_effects = state.warmup_tick(
+            now + DIRECT_PROMOTION_RETRY_INTERVAL
+                + DIRECT_RELAY_HANDOFF_GRACE
+                + Duration::from_secs(2),
+        );
+        assert!(!has_close_relay(&timer_effects, peer));
         assert!(state.has_relayed(peer));
         assert!(state.is_relay_only(peer));
     }

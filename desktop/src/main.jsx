@@ -19,6 +19,7 @@ import {
   Trash2,
   Vote,
   Volume2,
+  WifiOff,
   X,
 } from "lucide-react";
 import "./styles.css";
@@ -50,6 +51,8 @@ const initialRoom = {
   vote: null,
   peers: [],
   peerNames: [],
+  hadPeers: false,
+  peerDropAlert: false,
 };
 
 function App() {
@@ -135,6 +138,8 @@ function App() {
         ...appendStatus(current, "backend command channel ready"),
         backendRunning: true,
         backendStarting: false,
+        hadPeers: false,
+        peerDropAlert: false,
       }));
     } else {
       setRoom((current) => ({
@@ -338,6 +343,8 @@ function RoomConsole({ config, room, setRoom, callCommand, onOpenLog }) {
     await callCommand("set_volume", { percent });
   }
 
+  const peersDisconnected = room.peerDropAlert && room.peerCount === 0;
+
   return (
     <main className="console-page" data-backend="running">
       <RoomNavBar
@@ -351,7 +358,13 @@ function RoomConsole({ config, room, setRoom, callCommand, onOpenLog }) {
         displayName={displayName}
       />
 
-      <section className="chat-stage" aria-label="link-ear room chat">
+      <section
+        className={`chat-stage${peersDisconnected ? " has-connection-alert" : ""}`}
+        aria-label="link-ear room chat"
+      >
+        {peersDisconnected && (
+          <ConnectionAlert onOpenPeers={() => setPeerOverviewOpen(true)} />
+        )}
         <section className="panel chat-panel room-chat-panel">
           <div className="chat-head">
             <div>
@@ -446,6 +459,23 @@ function RoomConsole({ config, room, setRoom, callCommand, onOpenLog }) {
   );
 }
 
+function ConnectionAlert({ onOpenPeers }) {
+  return (
+    <button
+      className="connection-alert"
+      type="button"
+      onClick={onOpenPeers}
+      aria-live="polite"
+    >
+      <WifiOff size={17} aria-hidden="true" />
+      <span>
+        <strong>Room peers disconnected</strong>
+        <small>chat, votes, and sync are waiting for a peer to reconnect</small>
+      </span>
+    </button>
+  );
+}
+
 function RoomNavBar({
   config,
   room,
@@ -458,6 +488,15 @@ function RoomNavBar({
 }) {
   const latestStatus = room.statuses.at(-1) ?? "quiet";
   const localName = displayName(room.localPeerId);
+  const hasRoomPeers = room.peerCount > 0;
+  const peerDropAlert = room.peerDropAlert && !hasRoomPeers;
+  const peerStateClass = peerDropAlert ? "peer-alert" : hasRoomPeers ? "peer-online" : "peer-solo";
+  const peerCountLabel = `${room.peerCount} peer${room.peerCount === 1 ? "" : "s"}`;
+  const peerLabel = peerDropAlert ? "disconnected" : hasRoomPeers ? peerCountLabel : "solo";
+  const peerAriaLabel = peerDropAlert
+    ? "Open peer overview: room peers disconnected"
+    : `Open peer overview: ${peerCountLabel}`;
+  const PeerIcon = peerDropAlert ? WifiOff : Signal;
 
   return (
     <nav className="room-navbar" aria-label="Room session">
@@ -478,13 +517,13 @@ function RoomNavBar({
           {localName}
         </span>
         <button
-          className="nav-chip peer-nav-button"
+          className={`nav-chip peer-nav-button ${peerStateClass}`}
           type="button"
           onClick={onOpenPeers}
-          aria-label={`Open peer overview: ${room.peerCount} peers`}
+          aria-label={peerAriaLabel}
         >
-          <Signal size={14} aria-hidden="true" />
-          {room.peerCount} peers
+          <PeerIcon size={14} aria-hidden="true" />
+          {peerLabel}
         </button>
         <span className="nav-chip topic-chip" title={config.topic}>{config.topic}</span>
       </div>
@@ -1332,8 +1371,25 @@ function applyBackendEvent(current, event) {
   switch (event.type) {
     case "status":
       return appendStatus(current, event.payload);
-    case "peer_count":
-      return { ...current, peerCount: event.payload };
+    case "peer_count": {
+      const peerCount = Math.max(0, Number(event.payload) || 0);
+      const previousPeerCount = Math.max(0, Number(current.peerCount) || 0);
+      const lostSomePeers = current.hadPeers && peerCount < previousPeerCount;
+      const lostAllPeers = lostSomePeers && peerCount === 0;
+      const next = {
+        ...current,
+        peerCount,
+        hadPeers: current.hadPeers || peerCount > 0,
+        peerDropAlert: lostAllPeers ? true : peerCount > 0 ? false : current.peerDropAlert,
+      };
+      if (lostAllPeers) {
+        return appendStatus(next, "all room peers disconnected");
+      }
+      if (lostSomePeers) {
+        return appendStatus(next, `room peer count dropped to ${peerCount}`);
+      }
+      return next;
+    }
     case "local_peer_id":
       return {
         ...current,
