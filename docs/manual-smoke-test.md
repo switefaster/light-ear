@@ -113,7 +113,7 @@ Capture on failure:
 4. Disconnect Peer C before it reports ready.
 5. Keep Peer A and Peer B connected.
 6. Start another track and request skip while at least one peer is still
-   downloading/preparing audio.
+   streaming/preparing audio.
 
 Pass signals:
 
@@ -122,8 +122,8 @@ Pass signals:
 - No peer remains forever at `starting playback ... ready wait timed out`.
 - When a track finishes, followers move to idle locally and the leader starts
   the next queued item.
-- Skip can be voted on while download/prepare is still in flight; old download
-  completion does not restart the skipped session.
+- Skip can be voted on while stream prepare is still in flight; stale stream
+  events do not restart the skipped session.
 
 Capture on failure:
 

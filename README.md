@@ -118,7 +118,7 @@ subscription is ready, relay links may close for that peer.
 
 ## Music sync
 
-Music sync uses a shared queue and playback state instead of P2P audio streaming. The peer that starts the next queue item resolves the Bilibili BV through the web API, announces a prepare phase, and every expected peer downloads the audio URL locally before playback starts. Prepare downloads run outside the main libp2p event loop, so skip/cancel/vote messages can still be processed while audio is downloading. Stale download results are ignored if the playback session or track changed.
+Music sync uses a shared queue and playback state instead of P2P audio streaming. The peer that starts the next queue item resolves the Bilibili BV through the web API, announces a buffer prepare phase, and every expected peer streams the audio URL locally with HTTP Range requests before playback starts. Range fetch and decode run outside the main libp2p event loop, so skip/cancel/vote messages can still be processed while media is preparing. Stale stream events are ignored if the playback session, buffer operation, or track changed.
 
 The resolver first prefers DASH audio and falls back to single-file `durl` media when needed. If WBI playurl returns HTTP 412, or a successful playurl response has no usable media URL, the backend tries the legacy playurl endpoint before reporting failure.
 

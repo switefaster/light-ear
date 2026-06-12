@@ -66,9 +66,9 @@ guardrail:
   It should still map to the existing `pause` and `resume` backend commands.
 - Volume is a local playback setting. It should not enter room votes or shared
   playback wire state, and changing it should not rebuild the audio sink.
-- Bilibili/audio downloads for playback prepare run off the main swarm event
-  loop. Skip/cancel may arrive while a download is in flight; stale download
-  results must be ignored by session id and track id.
+- Bilibili/audio streaming prepare runs off the main swarm event loop. Range
+  download and Symphonia decode events must be checked by session id, operation
+  id, and track id before they affect playback or buffer quorum.
 - Long-video playback uses short-lived buffer coordination around the existing
   authoritative `PlaybackState`. `PlaybackBufferPrepare`,
   `PlaybackBufferStatus`, and `PlaybackBufferCancel` are temporary quorum and
@@ -80,10 +80,16 @@ guardrail:
   excluding relay/rendezvous infrastructure. Leader-side media failure must
   cancel or converge the operation; follower failure should stay local except
   for its buffer status report.
-- The first long-video foundation keeps `PlaybackState` compatible and adds a
-  tested range-cache module, but the current audio output path still loads a
-  decoded track into the existing player. Treat the range-backed decoder as the
-  next implementation step, not as fully wired streaming playback.
+- Long-video playback uses HTTP Range cache plus background decode. The player
+  may start once the requested position has a ready playback window; seek to a
+  far future position may wait while the sequential decoder catches up.
+- Active playback buffer health is temporary coordination, not room truth.
+  `PlaybackBufferHealth` lets the leader pause when a strict majority of real
+  room peers falls below the low watermark for the grace window, then resume
+  through the normal buffer quorum path.
+- Cache progress is local UI state. `PlaybackCache` is sent to the desktop to
+  render local cached/decoded progress and must not be mirrored into
+  `PlaybackState`.
 - Music download, decode, device, or playback-sync failures must converge
   explicitly instead of leaving a peer in fake playback. A leader failure should
   publish cancel/idle for the affected session and then try the next queued

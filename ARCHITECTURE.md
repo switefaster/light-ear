@@ -16,8 +16,8 @@ flowchart LR
     Backend -->|gossipsub topic| Room["Room peers"]
     Backend -->|rendezvous register/discover| Relay["Relay/rendezvous node"]
     Room -->|relay circuit when needed| Relay
-    Backend -->|HTTP resolve/download| Bili["Bilibili"]
-    Backend -->|decoded local audio| Player["AudioPlayer"]
+    Backend -->|HTTP resolve/range fetch| Bili["Bilibili"]
+    Backend -->|streaming local audio| Player["AudioPlayer"]
 ```
 
 The desktop path is the primary product path. The legacy terminal UI has been removed; the root crate now builds the backend library plus the relay/rendezvous binary.
@@ -25,7 +25,7 @@ The desktop path is the primary product path. The legacy terminal UI has been re
 ## Runtime Processes
 
 - Client backend: `src/backend.rs`
-  - Owns the libp2p `Swarm`, command receiver, UI event sender, history cache, music state, connection state, audio downloads, and periodic timers.
+  - Owns the libp2p `Swarm`, command receiver, UI event sender, history cache, music state, connection state, streaming audio events, and periodic timers.
 - Desktop bridge: `src-tauri/src/main.rs`
   - Translates Tauri commands into `NetworkCommand`.
   - Emits backend `FrontendEvent` values to the webview as `backend-event`.
@@ -51,8 +51,8 @@ The desktop path is the primary product path. The legacy terminal UI has been re
   - Internal buffer quorum coordinator for start, seek, and resume operations.
   - It tracks short-lived operation ids, expected real room peers, local/remote buffer status, quorum readiness, timeout, and impossible quorum.
 - `src/media_cache.rs`
-  - Range-cache foundation for long media: byte-range mapping, HTTP Range probing, deterministic cache paths, and cache eviction helpers.
-  - The current player still loads audio into the existing `AudioPlayer`; wiring a streaming decoder onto this cache is a separate follow-up.
+  - Range-cache support for long media: byte-range mapping, merge/gap tracking, HTTP Range probing, deterministic cache paths, and cache eviction helpers.
+  - Streaming playback uses this module for local Bilibili media cache; unsupported Range is a recoverable media failure.
 - `src/connection_state.rs`
   - Internal connection strategy layer for routes, direct addresses, gossipsub warmup, chat subscription readiness, direct promotion backoff, and relay handoff.
   - This module returns effects; `backend.rs` performs the libp2p calls.
@@ -60,8 +60,10 @@ The desktop path is the primary product path. The legacy terminal UI has been re
   - Bilibili resolve and signing helpers.
   - Prefer deterministic helper tests for URL/signature/media selection changes.
 - `src/player.rs`
-  - Local audio output and volume/position control.
+  - Local audio output, volume/position control, HTTP Range streaming prepare, background decode, and local cache progress events.
   - Volume is local-only and must not enter shared playback wire state.
+- `src/playback_health.rs`
+  - Internal active-playback buffer-health quorum state for majority-loss pause decisions.
 
 ## Backend Event Loop
 
@@ -74,9 +76,9 @@ The desktop path is the primary product path. The legacy terminal UI has been re
 - direct promotion retry tick.
 - gossipsub warmup / relay handoff tick.
 - rendezvous register/discover ticks.
-- completed background audio downloads.
+- streaming audio prepare/cache/health events.
 
-The event loop should stay responsive. Long Bilibili audio downloads are scheduled outside the main swarm loop, and stale download results are ignored by playback session id and track id.
+The event loop should stay responsive. Bilibili Range fetch and Symphonia decode work run outside the main swarm loop, and stale stream events are ignored by playback session id, buffer operation id, and track id.
 
 ## Wire Messages And Source Validation
 
@@ -92,6 +94,7 @@ Inbound gossipsub messages use source validation against the authenticated sourc
 - playback ready peer must match the source;
 - playback buffer prepare/cancel leader must match the source;
 - playback buffer status peer must match the source;
+- playback buffer health peer must match the source;
 - vote proposer/ballot peer must match the source.
 
 This validation is why deterministic vote application is local-only on most peers: for playback votes, every peer applies the same state locally from the proposal timestamp and proposer identity, but only the peer whose id matches the resulting `leader_peer_id` publishes the playback state.
@@ -175,9 +178,12 @@ Current rules:
 - New start, seek, and resume paths use `PlaybackBufferPrepare`,
   `PlaybackBufferStatus`, and `PlaybackBufferCancel` as temporary coordination
   messages before publishing a playable `PlaybackState`.
+- During active playback, peers publish `PlaybackBufferHealth` with local buffer
+  health. If the leader sees healthy peers below strict majority for 3 seconds,
+  it publishes a paused state and starts a resume buffer operation.
 - `PlaybackState` remains the only authoritative room playback state. Buffer
-  operations are short-lived and should be cleared on ready, cancel, timeout, or
-  impossible quorum.
+  operations and health messages are short-lived and should be cleared or
+  superseded by ready, cancel, timeout, impossible quorum, or session changes.
 - Buffer quorum is a strict majority of real room peers. Start removes the queue
   item only after quorum succeeds; seek/resume publish their target playback
   state only after quorum succeeds.
@@ -204,18 +210,18 @@ Current rules:
 
 ## Bilibili And Audio
 
-Playback does not stream audio from peer to peer. Each client resolves and downloads audio locally.
+Playback does not stream audio from peer to peer. Each client resolves and streams audio locally from Bilibili using HTTP Range requests.
 
 The resolver prefers DASH audio and can fall back to single-file `durl` media. WBI signing and media selection helpers have deterministic unit tests. If a playurl response is HTTP 412 or contains no usable media URL, the backend tries the legacy playurl path before surfacing failure.
 
-Downloads run outside the main swarm event loop. Skip/cancel/vote messages can arrive while a download is in flight. Download results must be checked against the current session id and track id before loading audio.
+Range fetch and decode run outside the main swarm event loop. Skip/cancel/vote messages can arrive while media work is in flight. Player events must be checked against the current session id, operation id, and track id before changing quorum or playback state.
 
-For long media, the first implemented guardrail is room-level buffer quorum plus
-a tested range-cache foundation. The cache defaults are a 12-second ready
-window, 5-second low watermark, 15-second high watermark, and 2 GiB maximum
-cache size. HTTP Range unsupported, expired, or forbidden media should fail the
-local buffer operation instead of silently falling back to a full in-memory
-download in the future streaming path.
+For long media, the player downloads sequential HTTP ranges into a local cache
+and decodes into a PCM stream while playback waits only for the requested ready
+window. The cache defaults are a 12-second ready window, 5-second low watermark,
+15-second high watermark, and 2 GiB maximum cache size. HTTP Range unsupported,
+expired, or forbidden media should fail the local buffer operation instead of
+silently falling back to a full in-memory download.
 
 ## Frontend Contract
 
@@ -234,7 +240,7 @@ The frontend talks to Rust through stable Tauri commands:
 - `move_queue_item`
 - `vote`
 
-The backend sends `FrontendEvent` values. The event shape is intentionally UI-facing and not the same as the P2P wire schema. Peer overview and status logs are diagnostic UI state; do not add P2P wire fields solely to support presentation.
+The backend sends `FrontendEvent` values. The event shape is intentionally UI-facing and not the same as the P2P wire schema. Peer overview, local cache progress, and status logs are diagnostic UI state; do not add P2P wire fields solely to support presentation.
 
 The desktop UI should keep these behaviours:
 
@@ -243,6 +249,7 @@ The desktop UI should keep these behaviours:
 - chat composer handles IME composition before Enter submit;
 - chat history remains scrollable and only auto-follows when already near the latest message;
 - peer display names are aliases, not identities;
+- scrubber cache progress shows local decoded/cache progress behind playback progress;
 - volume is local-only.
 
 ## Relay/Rendezvous Server

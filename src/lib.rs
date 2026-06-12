@@ -5,4 +5,5 @@ mod connection_state;
 pub mod core;
 mod media_cache;
 mod music_state;
+mod playback_health;
 pub mod player;

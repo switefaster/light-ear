@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow, bail};
-use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, HeaderMap, RANGE};
+use reqwest::header::{ACCEPT, ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, HeaderMap, RANGE};
 
 use crate::core::PlaybackTrack;
 
@@ -14,6 +14,8 @@ pub(crate) const READY_WINDOW_MS: u64 = 12_000;
 pub(crate) const LOW_WATERMARK_MS: u64 = 5_000;
 pub(crate) const HIGH_WATERMARK_MS: u64 = 15_000;
 pub(crate) const MAX_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub(crate) const STREAM_CHUNK_BYTES: u64 = 512 * 1024;
+const BILIBILI_MEDIA_ACCEPT: &str = "*/*";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ByteRange {
@@ -39,6 +41,11 @@ pub(crate) struct CachedRange {
     pub(crate) path: PathBuf,
     pub(crate) range: ByteRange,
     pub(crate) total_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RangeIndex {
+    ranges: Vec<ByteRange>,
 }
 
 impl ByteRange {
@@ -73,6 +80,56 @@ pub(crate) fn cache_key(track: &PlaybackTrack) -> String {
 pub(crate) fn cache_file_path(root: &Path, track: &PlaybackTrack, range: ByteRange) -> PathBuf {
     root.join(cache_key(track))
         .join(format!("{}-{}.part", range.start, range.end_inclusive))
+}
+
+pub(crate) fn media_file_path(root: &Path, track: &PlaybackTrack) -> PathBuf {
+    root.join(cache_key(track)).join("media.bin")
+}
+
+impl RangeIndex {
+    pub(crate) fn insert(&mut self, range: ByteRange) {
+        self.ranges.push(range);
+        self.ranges.sort_by_key(|range| range.start);
+
+        let mut merged: Vec<ByteRange> = Vec::new();
+        for range in self.ranges.drain(..) {
+            if let Some(last) = merged.last_mut() {
+                if range.start <= last.end_inclusive.saturating_add(1) {
+                    last.end_inclusive = last.end_inclusive.max(range.end_inclusive);
+                    continue;
+                }
+            }
+            merged.push(range);
+        }
+
+        self.ranges = merged;
+    }
+
+    pub(crate) fn covers(&self, range: ByteRange) -> bool {
+        self.ranges.iter().any(|cached| {
+            cached.start <= range.start && cached.end_inclusive >= range.end_inclusive
+        })
+    }
+
+    pub(crate) fn contiguous_until(&self, start: u64) -> Option<u64> {
+        let mut cursor = start;
+        let mut end = None;
+        for range in &self.ranges {
+            if range.end_inclusive < cursor {
+                continue;
+            }
+            if range.start > cursor {
+                break;
+            }
+            cursor = range.end_inclusive.saturating_add(1);
+            end = Some(range.end_inclusive);
+        }
+        end
+    }
+
+    pub(crate) fn ranges(&self) -> &[ByteRange] {
+        &self.ranges
+    }
 }
 
 pub(crate) fn range_for_window(position_ms: u64, duration_ms: u64, total_bytes: u64) -> ByteRange {
@@ -195,6 +252,59 @@ pub(crate) async fn fetch_range(
         range,
         total_bytes: probe.total_bytes,
     })
+}
+
+pub(crate) async fn probe_range_support(
+    client: &reqwest::Client,
+    track: &PlaybackTrack,
+) -> Result<RangeProbe> {
+    let response = client
+        .get(&track.audio_url)
+        .header(ACCEPT, BILIBILI_MEDIA_ACCEPT)
+        .header(RANGE, "bytes=0-0")
+        .header("referer", track.referer.as_str())
+        .send()
+        .await
+        .context("failed to probe media range support")?
+        .error_for_status()
+        .context("media range probe failed")?;
+
+    let probe = parse_range_probe(response.headers());
+    range_probe_error(&probe)?;
+    Ok(probe)
+}
+
+pub(crate) async fn fetch_range_bytes(
+    client: &reqwest::Client,
+    track: &PlaybackTrack,
+    range: ByteRange,
+) -> Result<(Vec<u8>, RangeProbe)> {
+    let response = client
+        .get(&track.audio_url)
+        .header(ACCEPT, BILIBILI_MEDIA_ACCEPT)
+        .header(RANGE, range.header_value())
+        .header("referer", track.referer.as_str())
+        .send()
+        .await
+        .with_context(|| format!("failed to fetch media range {}", range.header_value()))?
+        .error_for_status()
+        .context("media range request failed")?;
+
+    let probe = parse_range_probe(response.headers());
+    range_probe_error(&probe)?;
+    let bytes = response
+        .bytes()
+        .await
+        .context("failed to read media range")?;
+    if bytes.len() as u64 != range.len() {
+        bail!(
+            "media range returned {} bytes, expected {}",
+            bytes.len(),
+            range.len()
+        );
+    }
+
+    Ok((bytes.to_vec(), probe))
 }
 
 pub(crate) fn evict_cache(root: &Path, max_bytes: u64) -> Result<u64> {
@@ -334,6 +444,43 @@ mod tests {
         assert_eq!(range.start, 600_000);
         assert!(range.end_inclusive > 750_000);
         assert!(range.end_inclusive < 1_200_000);
+    }
+
+    #[test]
+    fn range_index_merges_and_detects_gaps() {
+        let mut index = RangeIndex::default();
+        index.insert(ByteRange::new(20, 29).unwrap());
+        index.insert(ByteRange::new(0, 9).unwrap());
+        index.insert(ByteRange::new(10, 19).unwrap());
+        index.insert(ByteRange::new(40, 49).unwrap());
+
+        assert_eq!(
+            index.ranges(),
+            &[
+                ByteRange {
+                    start: 0,
+                    end_inclusive: 29
+                },
+                ByteRange {
+                    start: 40,
+                    end_inclusive: 49
+                }
+            ]
+        );
+        assert!(index.covers(ByteRange::new(5, 25).unwrap()));
+        assert!(!index.covers(ByteRange::new(5, 35).unwrap()));
+        assert_eq!(index.contiguous_until(0), Some(29));
+        assert_eq!(index.contiguous_until(30), None);
+        assert_eq!(index.contiguous_until(40), Some(49));
+    }
+
+    #[test]
+    fn media_file_path_uses_track_cache_directory() {
+        let root = PathBuf::from("cache");
+        let path = media_file_path(&root, &track());
+        let text = path.to_string_lossy();
+        assert!(text.contains("bilibili_BV1_test"));
+        assert!(text.ends_with("media.bin"));
     }
 
     #[test]

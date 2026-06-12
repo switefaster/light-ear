@@ -254,7 +254,7 @@ impl BufferCoordinator {
         if self
             .active
             .as_ref()
-            .is_some_and(|operation| operation.state.session_id == state.session_id)
+            .is_some_and(|operation| operation.is_resolved_by_playback_state(state))
         {
             self.active.take()
         } else {
@@ -264,6 +264,23 @@ impl BufferCoordinator {
 }
 
 impl BufferOperation {
+    fn is_resolved_by_playback_state(&self, state: &PlaybackState) -> bool {
+        if self.state.session_id != state.session_id {
+            return false;
+        }
+        let Some(track) = state.track.as_ref() else {
+            return true;
+        };
+        if !state.playing {
+            return false;
+        }
+
+        self.state
+            .track
+            .as_ref()
+            .is_some_and(|operation_track| operation_track.track_id == track.track_id)
+    }
+
     pub(crate) fn quorum(&self, now: Instant) -> BufferQuorum {
         let ready = self.count(PlaybackBufferStatusKind::Ready);
         let buffering = self.count(PlaybackBufferStatusKind::Buffering);
@@ -353,6 +370,23 @@ mod tests {
             position_ms: 42,
             anchor_time_micros: 1,
             rate: 1.0,
+        }
+    }
+
+    fn track_state(session_id: &str, playing: bool) -> PlaybackState {
+        PlaybackState {
+            track: Some(crate::core::PlaybackTrack {
+                track_id: "track".to_string(),
+                title: "Track".to_string(),
+                source_kind: "bilibili".to_string(),
+                bvid: "BV1234567890".to_string(),
+                part: 1,
+                duration_ms: 120_000,
+                audio_url: "https://example.test/audio.m4a".to_string(),
+                referer: "https://www.bilibili.com/video/BV1234567890".to_string(),
+            }),
+            playing,
+            ..state(session_id)
         }
     }
 
@@ -577,7 +611,7 @@ mod tests {
         let mut coordinator = BufferCoordinator::new();
         coordinator.start_leader_operation(
             "op".to_string(),
-            state("session"),
+            track_state("session", false),
             PlaybackBufferOperationKind::Start,
             None,
             peers(["local", "remote"]),
@@ -590,13 +624,40 @@ mod tests {
                 .is_none()
         );
         assert!(coordinator.active().is_some());
+        assert!(
+            coordinator
+                .clear_matching_playback_state(&track_state("session", false))
+                .is_none()
+        );
+        assert!(coordinator.active().is_some());
+        assert_eq!(
+            coordinator
+                .clear_matching_playback_state(&track_state("session", true))
+                .map(|operation| operation.operation_id),
+            Some("op".to_string())
+        );
+        assert!(coordinator.active().is_none());
+    }
+
+    #[test]
+    fn idle_playback_state_clears_matching_operation() {
+        let now = Instant::now();
+        let mut coordinator = BufferCoordinator::new();
+        coordinator.start_leader_operation(
+            "op".to_string(),
+            track_state("session", false),
+            PlaybackBufferOperationKind::Seek,
+            None,
+            peers(["local", "remote"]),
+            now + Duration::from_secs(10),
+        );
+
         assert_eq!(
             coordinator
                 .clear_matching_playback_state(&state("session"))
                 .map(|operation| operation.operation_id),
             Some("op".to_string())
         );
-        assert!(coordinator.active().is_none());
     }
 
     #[test]

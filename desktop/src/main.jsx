@@ -44,6 +44,7 @@ const initialRoom = {
   statuses: [],
   logs: [],
   playback: null,
+  playbackCache: null,
   playbackBuffer: null,
   peerCount: 0,
   localPeerId: "",
@@ -292,6 +293,12 @@ function RoomConsole({ config, room, setRoom, callCommand, onOpenLog }) {
   const progress = playback
     ? Math.min(100, Math.max(0, (playback.position_ms / Math.max(playback.duration_ms || 0, 1)) * 100))
     : 0;
+  const cacheProgress = playback && room.playbackCache?.track_id
+    ? Math.min(
+      100,
+      Math.max(0, (room.playbackCache.buffered_until_ms / Math.max(playback.duration_ms || 0, 1)) * 100),
+    )
+    : 0;
   const peerNames = useMemo(
     () => buildPeerNames(room.messages, room.localPeerId, config.name, room.peerNames),
     [room.messages, room.localPeerId, config.name, room.peerNames],
@@ -408,8 +415,10 @@ function RoomConsole({ config, room, setRoom, callCommand, onOpenLog }) {
 
       <PlayerDock
         playback={playback}
+        cache={room.playbackCache}
         buffer={room.playbackBuffer}
         progress={progress}
+        cacheProgress={cacheProgress}
         volume={volume}
         onCommand={callCommand}
         onSeekRequest={setPendingSeek}
@@ -553,8 +562,10 @@ function RoomNavBar({
 
 function PlayerDock({
   playback,
+  cache,
   buffer,
   progress,
+  cacheProgress,
   volume,
   onCommand,
   onSeekRequest,
@@ -566,6 +577,9 @@ function PlayerDock({
   const playPauseLabel = playback ? (playback.playing ? "Pause" : "Resume") : "Play/Pause";
   const bufferLabel = buffer
     ? `${formatBufferKind(buffer.kind)} ${buffer.ready}/${buffer.threshold}`
+    : null;
+  const cacheLabel = cache && cache.status !== "ready"
+    ? `${formatCacheStatus(cache.status)} ${formatMs(cache.buffered_until_ms)}`
     : null;
 
   return (
@@ -580,12 +594,18 @@ function PlayerDock({
             {playback ? (playback.playing ? "playing" : "paused") : "standing by"}
           </span>
           {bufferLabel && <span className="pill buffering">{bufferLabel}</span>}
+          {!bufferLabel && cacheLabel && <span className="pill buffering">{cacheLabel}</span>}
           <span>{playback ? `leader ${leaderName}` : "no track selected"}</span>
         </div>
       </div>
 
       <div className="player-scrub-area">
-        <SeekBar playback={playback} progress={progress} onSeekRequest={onSeekRequest} />
+        <SeekBar
+          playback={playback}
+          progress={progress}
+          cacheProgress={cacheProgress}
+          onSeekRequest={onSeekRequest}
+        />
         <div className="time-row">
           <span>{formatMs(playback?.position_ms)}</span>
           <span>{formatMs(playback?.duration_ms)}</span>
@@ -625,7 +645,7 @@ function PlayerDock({
   );
 }
 
-function SeekBar({ playback, progress, onSeekRequest }) {
+function SeekBar({ playback, progress, cacheProgress, onSeekRequest }) {
   const [draftPercent, setDraftPercent] = useState(null);
   const canSeek = Boolean(playback?.duration_ms);
   const displayedProgress = draftPercent ?? progress;
@@ -700,6 +720,7 @@ function SeekBar({ playback, progress, onSeekRequest }) {
       }}
       onPointerCancel={() => setDraftPercent(null)}
     >
+      <span className="scrubber-cache" style={{ width: `${cacheProgress}%` }}></span>
       <span className="scrubber-fill" style={{ width: `${displayedProgress}%` }}></span>
       <span className="scrubber-thumb" style={{ left: `${displayedProgress}%` }}></span>
     </div>
@@ -1448,7 +1469,9 @@ function applyBackendEvent(current, event) {
     case "history":
       return { ...current, messages: event.payload };
     case "playback":
-      return { ...current, playback: event.payload };
+      return { ...current, playback: event.payload, playbackCache: event.payload ? current.playbackCache : null };
+    case "playback_cache":
+      return { ...current, playbackCache: event.payload };
     case "playback_buffer":
       return { ...current, playbackBuffer: event.payload };
     case "queue":
@@ -1535,6 +1558,12 @@ function formatBufferKind(value) {
   if (value === "seek") return "seek";
   if (value === "resume") return "resume";
   return "start";
+}
+
+function formatCacheStatus(value) {
+  if (value === "failed") return "cache failed";
+  if (value === "buffering") return "buffering";
+  return "preparing";
 }
 
 function normalizeMicros(value) {

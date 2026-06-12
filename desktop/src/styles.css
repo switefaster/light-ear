@@ -859,6 +859,17 @@ h2 {
   transition: width 120ms ease;
 }
 
+.scrubber-cache {
+  position: absolute;
+  top: 8px;
+  left: 1px;
+  width: 0%;
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(44, 119, 174, 0.22);
+  transition: width 180ms ease;
+}
+
 .scrubber-thumb {
   position: absolute;
   top: 3px;

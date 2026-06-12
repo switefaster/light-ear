@@ -107,6 +107,25 @@ pub struct PlaybackView {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum PlaybackCacheStatus {
+    Preparing,
+    Ready,
+    Buffering,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaybackCacheView {
+    pub session_id: String,
+    pub track_id: String,
+    pub status: PlaybackCacheStatus,
+    pub buffered_until_ms: u64,
+    pub duration_ms: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum PlaybackBufferOperationKind {
     Start,
     Seek,
@@ -174,6 +193,7 @@ pub enum FrontendEvent {
     LocalPeerId(String),
     History(Vec<ChatRecord>),
     Playback(Option<PlaybackView>),
+    PlaybackCache(Option<PlaybackCacheView>),
     PlaybackBuffer(Option<PlaybackBufferView>),
     Queue(QueueState),
     Vote(Option<VoteView>),
@@ -265,6 +285,14 @@ pub enum WireMessage {
         status: PlaybackBufferStatusKind,
         buffered_until_ms: Option<u64>,
         error: Option<String>,
+        #[serde(default)]
+        nonce: u64,
+    },
+    PlaybackBufferHealth {
+        session_id: String,
+        peer_id: String,
+        status: PlaybackBufferStatusKind,
+        buffered_until_ms: Option<u64>,
         #[serde(default)]
         nonce: u64,
     },
