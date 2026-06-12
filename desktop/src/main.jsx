@@ -68,6 +68,21 @@ function App() {
     document.addEventListener('contextmenu', (e) => e.preventDefault());
   }
 
+  async function exportLogs(entries) {
+    try {
+      const path = await exportStatusLogs(entries);
+      if (!path) {
+        return null;
+      }
+      setRoom((current) => appendStatus(current, `exported log to ${path}`));
+      return path;
+    } catch (error) {
+      const message = formatError(error);
+      setRoom((current) => appendStatus(current, `log export failed: ${message}`));
+      throw error;
+    }
+  }
+
   useEffect(() => {
     let mounted = true;
     let cleanupEvent = () => {};
@@ -176,6 +191,7 @@ function App() {
         <StatusLogModal
           statuses={room.statuses}
           logs={room.logs}
+          onExportLog={exportLogs}
           onClose={() => setLogOpen(false)}
         />
       )}
@@ -1060,10 +1076,11 @@ function VoteModal({ vote, onVote, displayName }) {
   );
 }
 
-function StatusLogModal({ statuses, logs, onClose }) {
+function StatusLogModal({ statuses, logs, onExportLog, onClose }) {
   const listRef = useRef(null);
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("all");
+  const [exportState, setExportState] = useState({ busy: false, message: "" });
   const entries = logs?.length ? logs : statuses.map((line, index) => createLogEntry(line, index));
   const summary = summarizeLogs(entries);
   const normalizedQuery = query.trim().toLowerCase();
@@ -1095,6 +1112,20 @@ function StatusLogModal({ statuses, logs, onClose }) {
       list.scrollTop = list.scrollHeight;
     }
   }, [visibleEntries.length]);
+
+  async function exportLogs() {
+    if (!entries.length || exportState.busy) return;
+    setExportState({ busy: true, message: "" });
+    try {
+      const path = await onExportLog(entries);
+      setExportState({
+        busy: false,
+        message: path ? `saved to ${path}` : "export canceled",
+      });
+    } catch (error) {
+      setExportState({ busy: false, message: formatError(error) });
+    }
+  }
 
   return (
     <div
@@ -1150,13 +1181,17 @@ function StatusLogModal({ statuses, logs, onClose }) {
           <button
             className="btn subtle log-export-button"
             type="button"
-            onClick={() => exportStatusLogs(entries)}
-            disabled={entries.length === 0}
+            onClick={exportLogs}
+            disabled={entries.length === 0 || exportState.busy}
           >
             <Download size={16} aria-hidden="true" />
-            Export
+            {exportState.busy ? "Exporting" : "Export"}
           </button>
         </div>
+
+        {exportState.message && (
+          <p className="modal-meta log-export-status">{exportState.message}</p>
+        )}
 
         <div className="log-summary" aria-label="Log summary">
           <span className="log-chip error">{summary.error}</span>
@@ -1585,9 +1620,9 @@ function createLogEntry(status, index) {
   };
 }
 
-function exportStatusLogs(entries) {
-  if (!entries.length) return;
-
+async function exportStatusLogs(entries) {
+  if (!entries.length) return "";
+  const filename = `link-ear-log-${formatFileTimestamp(new Date())}.jsonl`;
   const body = entries
     .map((entry) => JSON.stringify({
       at: new Date(entry.at).toISOString(),
@@ -1597,15 +1632,8 @@ function exportStatusLogs(entries) {
       text: entry.text,
     }))
     .join("\n");
-  const blob = new Blob([`${body}\n`], { type: "application/x-ndjson;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `link-ear-log-${formatFileTimestamp(new Date())}.jsonl`;
-  document.body.append(link);
-  link.click();
-  link.remove();
-  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  const content = `${body}\n`;
+  return invoke("export_status_logs", { filename, content });
 }
 
 function formatFileTimestamp(date) {
@@ -1805,6 +1833,8 @@ async function previewInvoke(command, args = {}) {
     case "set_volume":
       emitPreview("backend-event", { type: "status", payload: `local volume set to ${args.percent}%` });
       return;
+    case "export_status_logs":
+      return `preview-downloads/${args.filename || "link-ear-log.jsonl"}`;
     default:
       return;
   }

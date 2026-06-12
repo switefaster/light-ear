@@ -19,9 +19,10 @@ use symphonia::{
             audio::{AudioDecoderOptions, CODEC_ID_NULL_AUDIO},
         },
         errors::Error as SymphoniaError,
-        formats::{FormatOptions, probe::Hint},
+        formats::{FormatOptions, SeekMode, SeekTo, probe::Hint},
         io::{MediaSource, MediaSourceStream},
         meta::MetadataOptions,
+        units::Time,
     },
     default::{get_codecs, get_probe},
 };
@@ -65,6 +66,7 @@ struct StreamingPcmSource {
     pos: usize,
     channels: NonZeroU16,
     sample_rate: NonZeroU32,
+    base_position_ms: u64,
     volume: Arc<AtomicU32>,
     position_ms: Arc<AtomicU64>,
     event_tx: mpsc::UnboundedSender<AudioPlayerEvent>,
@@ -90,12 +92,19 @@ struct SharedBytes {
 }
 
 struct StreamingBytesState {
-    bytes: Vec<u8>,
+    chunks: Vec<StreamingByteChunk>,
     total_bytes: Option<u64>,
     complete: bool,
     canceled: bool,
     error: Option<String>,
     ranges: media_cache::RangeIndex,
+    requested_offset: Option<u64>,
+}
+
+#[derive(Clone)]
+struct StreamingByteChunk {
+    range: media_cache::ByteRange,
+    bytes: Arc<[u8]>,
 }
 
 #[derive(Clone)]
@@ -107,6 +116,7 @@ struct StreamingPcmState {
     samples: Vec<f32>,
     channels: Option<NonZeroU16>,
     sample_rate: Option<NonZeroU32>,
+    base_position_ms: u64,
     complete: bool,
     canceled: bool,
     error: Option<String>,
@@ -142,6 +152,9 @@ pub enum AudioPlayerEvent {
         title: String,
         error: String,
     },
+    OutputDeviceError {
+        error: String,
+    },
     Ended {
         session_id: String,
         track_id: String,
@@ -150,8 +163,8 @@ pub enum AudioPlayerEvent {
 
 impl AudioPlayer {
     pub fn new() -> Result<Self> {
-        let stream = open_default_output()?;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let stream = open_default_output(event_tx.clone())?;
         Ok(Self {
             stream,
             sink: None,
@@ -287,7 +300,7 @@ impl AudioPlayer {
             self.playing = false;
             session.position_ms.store(position_ms, Ordering::Relaxed);
 
-            let buffered_until_ms = session.pcm.duration_ms().min(track.duration_ms);
+            let buffered_until_ms = session.pcm.buffered_until_ms().min(track.duration_ms);
             if stream_ready_for_position(
                 position_ms,
                 track.duration_ms,
@@ -313,17 +326,19 @@ impl AudioPlayer {
                 return Ok(());
             }
 
-            let _ = self
-                .event_tx
-                .send(AudioPlayerEvent::Cache(PlaybackCacheView {
-                    session_id,
-                    track_id: track.track_id,
-                    status: PlaybackCacheStatus::Buffering,
-                    buffered_until_ms,
-                    duration_ms: track.duration_ms,
-                    error: None,
-                }));
-            return Ok(());
+            if position_ms <= buffered_until_ms {
+                let _ = self
+                    .event_tx
+                    .send(AudioPlayerEvent::Cache(PlaybackCacheView {
+                        session_id,
+                        track_id: track.track_id,
+                        status: PlaybackCacheStatus::Buffering,
+                        buffered_until_ms,
+                        duration_ms: track.duration_ms,
+                        error: None,
+                    }));
+                return Ok(());
+            }
         }
 
         if let Some(sink) = self.sink.take() {
@@ -360,10 +375,15 @@ impl AudioPlayer {
         let download_fail_bytes = bytes.clone();
         let download_operation_id = operation_id.clone();
         let download_session_id = session_id.clone();
+        let download_position_ms = position_ms;
         tokio::spawn(async move {
-            if let Err(err) =
-                download_streaming_bytes(download_client, download_track.clone(), download_bytes)
-                    .await
+            if let Err(err) = download_streaming_bytes(
+                download_client,
+                download_track.clone(),
+                download_position_ms,
+                download_bytes,
+            )
+            .await
             {
                 let message = format!("{err:#}");
                 download_fail_bytes.fail(message.clone());
@@ -456,6 +476,40 @@ impl AudioPlayer {
         Ok(())
     }
 
+    pub fn recover_output_device(&mut self, now_micros: i64) -> Result<bool> {
+        let position_ms = self.position_ms(now_micros);
+        let playing = self.playing;
+
+        if let Some(sink) = self.sink.take() {
+            sink.stop();
+        }
+
+        self.reopen_output_device()?;
+
+        if self.streaming.is_some() {
+            if self
+                .streaming
+                .as_ref()
+                .and_then(|session| session.pcm.spec())
+                .is_some()
+            {
+                self.restart_streaming(position_ms, playing)?;
+                return Ok(true);
+            }
+            self.position_ms = position_ms;
+            self.playing = false;
+            return Ok(false);
+        }
+
+        if self.audio.is_some() {
+            self.restart(position_ms, playing, now_micros)?;
+            return Ok(true);
+        }
+
+        self.playing = false;
+        Ok(false)
+    }
+
     fn restart_streaming(&mut self, position_ms: u64, playing: bool) -> Result<()> {
         let Some(streaming) = &self.streaming else {
             return Err(anyhow!("no streaming audio loaded"));
@@ -476,6 +530,7 @@ impl AudioPlayer {
             position_ms,
             channels,
             sample_rate,
+            streaming.pcm.base_position_ms(),
             Arc::clone(&self.volume),
             Arc::clone(&streaming.position_ms),
             self.event_tx.clone(),
@@ -543,14 +598,24 @@ impl AudioPlayer {
     }
 
     fn reopen_output_device(&mut self) -> Result<()> {
-        let stream = open_default_output()?;
+        let stream = open_default_output(self.event_tx.clone())?;
         self.stream = stream;
         Ok(())
     }
 }
 
-fn open_default_output() -> Result<MixerDeviceSink> {
-    DeviceSinkBuilder::open_default_sink().context("failed to open default audio output")
+fn open_default_output(
+    event_tx: mpsc::UnboundedSender<AudioPlayerEvent>,
+) -> Result<MixerDeviceSink> {
+    DeviceSinkBuilder::from_default_device()
+        .context("failed to configure default audio output")?
+        .with_error_callback(move |err| {
+            let _ = event_tx.send(AudioPlayerEvent::OutputDeviceError {
+                error: err.to_string(),
+            });
+        })
+        .open_sink_or_fallback()
+        .context("failed to open default audio output")
 }
 
 pub fn volume_percent_to_gain(percent: u8) -> f32 {
@@ -606,6 +671,7 @@ impl StreamingPcmSource {
         position_ms: u64,
         channels: NonZeroU16,
         sample_rate: NonZeroU32,
+        base_position_ms: u64,
         volume: Arc<AtomicU32>,
         position: Arc<AtomicU64>,
         event_tx: mpsc::UnboundedSender<AudioPlayerEvent>,
@@ -614,6 +680,7 @@ impl StreamingPcmSource {
         duration_ms: u64,
     ) -> Self {
         let frames = (position_ms as u128)
+            .saturating_sub(base_position_ms as u128)
             .saturating_mul(sample_rate.get() as u128)
             .saturating_div(1000);
         let pos = frames
@@ -624,6 +691,7 @@ impl StreamingPcmSource {
             pos: pos - pos % channels.get() as usize,
             channels,
             sample_rate,
+            base_position_ms,
             volume,
             position_ms: position,
             event_tx,
@@ -639,8 +707,12 @@ impl StreamingPcmSource {
         let position_ms = (frame as u128)
             .saturating_mul(1000)
             .saturating_div(self.sample_rate.get() as u128) as u64;
-        self.position_ms
-            .store(position_ms.min(self.duration_ms), Ordering::Relaxed);
+        self.position_ms.store(
+            self.base_position_ms
+                .saturating_add(position_ms)
+                .min(self.duration_ms),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -680,7 +752,8 @@ impl Iterator for StreamingPcmSource {
                         now.saturating_duration_since(last) >= Duration::from_secs(1)
                     }) {
                         self.last_underrun_at = Some(now);
-                        let buffered_until_ms = self.shared.duration_ms().min(self.duration_ms);
+                        let buffered_until_ms =
+                            self.shared.buffered_until_ms().min(self.duration_ms);
                         let _ = self.event_tx.send(AudioPlayerEvent::Buffering {
                             session_id: self.session_id.clone(),
                             track_id: self.track_id.clone(),
@@ -831,12 +904,13 @@ impl SharedBytes {
         Self {
             inner: Arc::new((
                 Mutex::new(StreamingBytesState {
-                    bytes: Vec::new(),
+                    chunks: Vec::new(),
                     total_bytes: None,
                     complete: false,
                     canceled: false,
                     error: None,
                     ranges: media_cache::RangeIndex::default(),
+                    requested_offset: None,
                 }),
                 Condvar::new(),
             )),
@@ -853,9 +927,22 @@ impl SharedBytes {
     fn append(&self, bytes: &[u8], range: media_cache::ByteRange) {
         let (lock, condvar) = &*self.inner;
         let mut state = lock.lock().expect("streaming bytes lock poisoned");
-        if state.bytes.len() as u64 == range.start {
-            state.bytes.extend_from_slice(bytes);
+        if !bytes.is_empty() && !state.ranges.covers(range) {
+            state.chunks.push(StreamingByteChunk {
+                range,
+                bytes: Arc::from(bytes),
+            });
+            state.chunks.sort_by_key(|chunk| chunk.range.start);
             state.ranges.insert(range);
+        }
+        if state.requested_offset.is_some_and(|offset| {
+            state
+                .ranges
+                .ranges()
+                .iter()
+                .any(|range| range.contains(offset))
+        }) {
+            state.requested_offset = None;
         }
         condvar.notify_all();
     }
@@ -893,6 +980,52 @@ impl SharedBytes {
             .total_bytes
     }
 
+    fn covers(&self, range: media_cache::ByteRange) -> bool {
+        let (lock, _) = &*self.inner;
+        lock.lock()
+            .expect("streaming bytes lock poisoned")
+            .ranges
+            .covers(range)
+    }
+
+    fn request_offset(&self, offset: u64) {
+        let (lock, condvar) = &*self.inner;
+        let mut state = lock.lock().expect("streaming bytes lock poisoned");
+        if !state
+            .ranges
+            .ranges()
+            .iter()
+            .any(|range| range.contains(offset))
+        {
+            state.requested_offset = Some(offset);
+        }
+        condvar.notify_all();
+    }
+
+    fn take_requested_offset(&self, total: u64) -> Option<u64> {
+        let (lock, _) = &*self.inner;
+        let mut state = lock.lock().expect("streaming bytes lock poisoned");
+        let offset = state.requested_offset.take()?.min(total.saturating_sub(1));
+        if state
+            .ranges
+            .ranges()
+            .iter()
+            .any(|range| range.contains(offset))
+        {
+            None
+        } else {
+            Some(offset)
+        }
+    }
+
+    fn contiguous_prefix_end(&self) -> Option<u64> {
+        let (lock, _) = &*self.inner;
+        lock.lock()
+            .expect("streaming bytes lock poisoned")
+            .ranges
+            .contiguous_until(0)
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -913,16 +1046,24 @@ impl SharedBytes {
                     error.clone(),
                 ));
             }
-            if offset < state.bytes.len() as u64 {
-                let start = offset as usize;
-                let available = state.bytes.len().saturating_sub(start);
-                let len = available.min(buf.len());
-                buf[..len].copy_from_slice(&state.bytes[start..start + len]);
+            if state.total_bytes.is_some_and(|total| offset >= total) {
+                return Ok(0);
+            }
+            if let Some(chunk) = state
+                .chunks
+                .iter()
+                .find(|chunk| chunk.range.contains(offset))
+            {
+                let start = offset.saturating_sub(chunk.range.start) as usize;
+                let len = chunk.bytes.len().saturating_sub(start).min(buf.len());
+                buf[..len].copy_from_slice(&chunk.bytes[start..start + len]);
                 return Ok(len);
             }
             if state.complete {
                 return Ok(0);
             }
+            state.requested_offset = Some(offset);
+            condvar.notify_all();
             state = condvar
                 .wait(state)
                 .expect("streaming bytes lock poisoned while waiting");
@@ -946,6 +1087,7 @@ impl SharedPcm {
                     samples: Vec::new(),
                     channels: None,
                     sample_rate: None,
+                    base_position_ms: 0,
                     complete: false,
                     canceled: false,
                     error: None,
@@ -953,6 +1095,15 @@ impl SharedPcm {
                 Condvar::new(),
             )),
         }
+    }
+
+    fn set_base_position(&self, position_ms: u64) {
+        let (lock, condvar) = &*self.inner;
+        let mut state = lock.lock().expect("streaming pcm lock poisoned");
+        if state.samples.is_empty() {
+            state.base_position_ms = position_ms;
+        }
+        condvar.notify_all();
     }
 
     fn set_spec(&self, channels: NonZeroU16, sample_rate: NonZeroU32) -> Result<()> {
@@ -1007,6 +1158,13 @@ impl SharedPcm {
         Some((state.channels?, state.sample_rate?))
     }
 
+    fn base_position_ms(&self) -> u64 {
+        let (lock, _) = &*self.inner;
+        lock.lock()
+            .expect("streaming pcm lock poisoned")
+            .base_position_ms
+    }
+
     fn duration_ms(&self) -> u64 {
         let (lock, _) = &*self.inner;
         let state = lock.lock().expect("streaming pcm lock poisoned");
@@ -1017,6 +1175,10 @@ impl SharedPcm {
             .saturating_mul(1000)
             .saturating_div(sample_rate.get() as u64)
             .saturating_div(channels.get() as u64)
+    }
+
+    fn buffered_until_ms(&self) -> u64 {
+        self.base_position_ms().saturating_add(self.duration_ms())
     }
 
     fn is_complete(&self) -> bool {
@@ -1180,6 +1342,7 @@ fn decode_audio(audio: Arc<[u8]>) -> Result<DecodedAudio> {
 async fn download_streaming_bytes(
     client: reqwest::Client,
     track: PlaybackTrack,
+    position_ms: u64,
     shared: SharedBytes,
 ) -> Result<()> {
     let root = media_cache::cache_root();
@@ -1193,32 +1356,43 @@ async fn download_streaming_bytes(
         .ok_or_else(|| anyhow!("media range probe did not report total length"))?;
     shared.set_total(Some(total));
 
-    let mut start = 0;
-    if media_path.exists() {
-        let existing = fs::read(&media_path).unwrap_or_default();
-        let len = (existing.len() as u64).min(total);
-        if len > 0 {
-            shared.append(
-                &existing[..len as usize],
-                media_cache::ByteRange::new(0, len.saturating_sub(1))?,
-            );
-            start = len;
-        }
+    let mut next_sequential = shared
+        .contiguous_prefix_end()
+        .map_or(0, |end| end.saturating_add(1));
+    if position_ms > 0 {
+        let seek_window = media_cache::range_for_window(position_ms, track.duration_ms, total);
+        shared.request_offset(seek_window.start);
     }
 
-    while start < total {
+    while shared.contiguous_prefix_end() != Some(total.saturating_sub(1)) {
         if shared.is_canceled() {
             return Ok(());
         }
+
+        let start = shared
+            .take_requested_offset(total)
+            .unwrap_or(next_sequential)
+            .min(total.saturating_sub(1));
         let end = start
             .saturating_add(media_cache::STREAM_CHUNK_BYTES)
             .saturating_sub(1)
             .min(total.saturating_sub(1));
         let range = media_cache::ByteRange::new(start, end)?;
+        if shared.covers(range) {
+            next_sequential = shared
+                .contiguous_prefix_end()
+                .map_or(next_sequential, |end| end.saturating_add(1));
+            if next_sequential >= total {
+                break;
+            }
+            continue;
+        }
         let (bytes, _) = media_cache::fetch_range_bytes(&client, &track, range).await?;
         write_cache_chunk(&media_path, start, &bytes)?;
         shared.append(&bytes, range);
-        start = end.saturating_add(1);
+        next_sequential = shared
+            .contiguous_prefix_end()
+            .map_or(next_sequential, |end| end.saturating_add(1));
         let _ = media_cache::evict_cache(&root, media_cache::MAX_CACHE_BYTES);
     }
 
@@ -1230,12 +1404,8 @@ fn write_cache_chunk(path: &PathBuf, start: u64, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(start == 0)
-        .append(start != 0)
-        .open(path)?;
+    let mut file = OpenOptions::new().create(true).write(true).open(path)?;
+    file.seek(SeekFrom::Start(start))?;
     file.write_all(bytes)?;
     Ok(())
 }
@@ -1312,6 +1482,9 @@ fn decode_streaming_audio_inner(
     let mut decoder = get_codecs()
         .make_audio_decoder(&codec_params, &decoder_opts)
         .context("failed to create streaming audio decoder")?;
+    let decode_base_position_ms =
+        seek_streaming_format(&mut *format, track_id, position_ms).unwrap_or(0);
+    pcm.set_base_position(decode_base_position_ms);
 
     let ready_until = position_ms
         .saturating_add(media_cache::READY_WINDOW_MS)
@@ -1359,7 +1532,7 @@ fn decode_streaming_audio_inner(
                 pcm.push_samples(&packet_samples);
                 decode_errors = 0;
 
-                let buffered_until_ms = pcm.duration_ms().min(track.duration_ms);
+                let buffered_until_ms = pcm.buffered_until_ms().min(track.duration_ms);
                 if buffered_until_ms >= last_cache_event_ms.saturating_add(1000)
                     || buffered_until_ms >= ready_until
                 {
@@ -1421,7 +1594,7 @@ fn decode_streaming_audio_inner(
     }
 
     pcm.complete();
-    let buffered_until_ms = pcm.duration_ms().min(track.duration_ms);
+    let buffered_until_ms = pcm.buffered_until_ms().min(track.duration_ms);
     if !ready_sent && buffered_until_ms >= position_ms.min(track.duration_ms) {
         let _ = event_tx.send(AudioPlayerEvent::Prepared {
             operation_id,
@@ -1439,6 +1612,28 @@ fn decode_streaming_audio_inner(
         error: None,
     }));
     Ok(())
+}
+
+fn seek_streaming_format(
+    format: &mut dyn symphonia::core::formats::FormatReader,
+    track_id: u32,
+    position_ms: u64,
+) -> Option<u64> {
+    if position_ms == 0 {
+        return Some(0);
+    }
+
+    let time = Time::try_from_secs_f64(position_ms as f64 / 1000.0)?;
+    format
+        .seek(
+            SeekMode::Accurate,
+            SeekTo::Time {
+                time,
+                track_id: Some(track_id),
+            },
+        )
+        .ok()
+        .map(|_| position_ms)
 }
 
 #[cfg(test)]
@@ -1502,6 +1697,7 @@ mod tests {
             0,
             channels,
             sample_rate,
+            0,
             Arc::new(AtomicU32::new(1.0_f32.to_bits())),
             Arc::clone(&position),
             event_tx,
@@ -1518,6 +1714,37 @@ mod tests {
     }
 
     #[test]
+    fn streaming_source_position_includes_pcm_base_position() {
+        let pcm = SharedPcm::new();
+        pcm.set_base_position(60_000);
+        let channels = NonZeroU16::new(1).unwrap();
+        let sample_rate = NonZeroU32::new(10).unwrap();
+        pcm.set_spec(channels, sample_rate).unwrap();
+        pcm.push_samples(&[1.0; 20]);
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let position = Arc::new(AtomicU64::new(60_000));
+        let mut source = StreamingPcmSource::new(
+            pcm,
+            60_000,
+            channels,
+            sample_rate,
+            60_000,
+            Arc::new(AtomicU32::new(1.0_f32.to_bits())),
+            Arc::clone(&position),
+            event_tx,
+            "session".to_string(),
+            "track".to_string(),
+            120_000,
+        );
+
+        for _ in 0..10 {
+            assert_eq!(source.next(), Some(1.0));
+        }
+
+        assert_eq!(position.load(Ordering::Relaxed), 61_000);
+    }
+
+    #[test]
     fn shared_bytes_wakes_readers_on_cancel() {
         let bytes = SharedBytes::new();
         bytes.cancel();
@@ -1526,5 +1753,32 @@ mod tests {
 
         let err = source.read(&mut buf).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn shared_bytes_reads_sparse_seek_range() {
+        let bytes = SharedBytes::new();
+        bytes.set_total(Some(1_000));
+        bytes.append(
+            &[10, 11, 12, 13],
+            media_cache::ByteRange::new(500, 503).unwrap(),
+        );
+        let mut buf = [0_u8; 2];
+
+        assert_eq!(bytes.read_at(501, &mut buf).unwrap(), 2);
+        assert_eq!(buf, [11, 12]);
+    }
+
+    #[test]
+    fn shared_bytes_returns_eof_at_total_even_with_sparse_gaps() {
+        let bytes = SharedBytes::new();
+        bytes.set_total(Some(1_000));
+        bytes.append(
+            &[10, 11, 12, 13],
+            media_cache::ByteRange::new(996, 999).unwrap(),
+        );
+        let mut buf = [0_u8; 2];
+
+        assert_eq!(bytes.read_at(1_000, &mut buf).unwrap(), 0);
     }
 }

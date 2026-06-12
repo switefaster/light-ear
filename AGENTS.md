@@ -80,9 +80,16 @@ guardrail:
   excluding relay/rendezvous infrastructure. Leader-side media failure must
   cancel or converge the operation; follower failure should stay local except
   for its buffer status report.
+- Current buffer operations should shrink their expected peer set when a peer
+  disconnects or libp2p reports it as a gossipsub slow peer. Temporary
+  `PlaybackBufferPrepare` / `PlaybackBufferStatus` publish failures should be
+  reported as status, but must not abort local prepare, local ready, or quorum
+  resolution.
 - Long-video playback uses HTTP Range cache plus background decode. The player
-  may start once the requested position has a ready playback window; seek to a
-  far future position may wait while the sequential decoder catches up.
+  may start once the requested position has a ready playback window. Seek beyond
+  the decoded window should restart streaming prepare at the target position and
+  prioritize the requested byte range instead of waiting for earlier sequential
+  download progress to catch up.
 - Active playback buffer health is temporary coordination, not room truth.
   `PlaybackBufferHealth` lets the leader pause when a strict majority of real
   room peers falls below the low watermark for the grace window, then resume
@@ -96,6 +103,10 @@ guardrail:
   item; a follower failure should stop local playback, clear the local playback
   view, and suppress re-applying the failed session until a new session or idle
   state arrives.
+- Local audio output device errors, such as headphone hotplug or default-device
+  changes, should reopen the default output and reattach the current sink when
+  possible. This is local recovery and must not publish room playback changes or
+  mark the media session failed by itself.
 - Each peer may cast only one ballot per vote. Votes should resolve early when
   they reach majority or when remaining pending peers can no longer make the
   vote pass. UI vote views should expose approvals, rejections, pending count,
@@ -155,7 +166,10 @@ guardrail:
   when available, but peer id remains the unique identity.
 - Desktop status logs are structured on the frontend from existing status
   events. Keep backend status text low-noise and actionable; do not add P2P wire
-  fields solely to support log filtering or presentation.
+  fields solely to support log filtering or presentation. Log export should use
+  the Tauri dialog plugin from a Rust command to ask for a save path, then write
+  JSONL from Rust; do not rely on WebView Blob/download behavior for desktop
+  exports.
 
 ## Manual smoke test
 

@@ -63,6 +63,10 @@ impl ByteRange {
         self.end_inclusive.saturating_sub(self.start) + 1
     }
 
+    pub(crate) fn contains(&self, offset: u64) -> bool {
+        self.start <= offset && offset <= self.end_inclusive
+    }
+
     pub(crate) fn header_value(&self) -> String {
         format!("bytes={}-{}", self.start, self.end_inclusive)
     }

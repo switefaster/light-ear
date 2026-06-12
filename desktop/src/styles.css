@@ -1485,7 +1485,7 @@ h2 {
 }
 
 .log-modal {
-  grid-template-rows: auto auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto auto minmax(0, 1fr);
   width: min(720px, 100%);
   max-height: min(680px, calc(100vh - 36px));
   overflow: hidden;
@@ -1542,6 +1542,11 @@ h2 {
 .log-export-button {
   height: 40px;
   white-space: nowrap;
+}
+
+.log-export-status {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .log-summary {

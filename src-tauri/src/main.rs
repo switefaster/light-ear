@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{
+    fs,
+    path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     thread,
     time::Duration,
@@ -14,6 +16,7 @@ use link_ear::{
 };
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri_plugin_dialog::DialogExt;
 use tokio::sync::{Mutex, mpsc};
 
 #[derive(Default)]
@@ -167,6 +170,50 @@ async fn vote(state: State<'_, BackendState>, approve: bool) -> Result<(), Strin
 }
 
 #[tauri::command]
+async fn export_status_logs(
+    app: AppHandle,
+    filename: String,
+    content: String,
+) -> Result<Option<String>, String> {
+    if content.trim().is_empty() {
+        return Err("log export is empty".to_string());
+    }
+    if content.len() > 8 * 1024 * 1024 {
+        return Err("log export is too large".to_string());
+    }
+
+    let filename = sanitize_log_filename(&filename);
+    let mut dialog = app
+        .dialog()
+        .file()
+        .set_title("Export link-ear log")
+        .add_filter("JSON Lines", &["jsonl"])
+        .set_file_name(filename);
+    if let Ok(directory) = app
+        .path()
+        .download_dir()
+        .or_else(|_| app.path().app_data_dir())
+    {
+        dialog = dialog.set_directory(directory);
+    }
+
+    let Some(path) = dialog.blocking_save_file() else {
+        return Ok(None);
+    };
+    let path = path
+        .into_path()
+        .map_err(|err| format!("unsupported log export path: {err}"))?;
+    let path = normalize_log_export_path(path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create log export directory: {err}"))?;
+    }
+    fs::write(&path, content).map_err(|err| format!("failed to write log export: {err}"))?;
+
+    Ok(Some(path.display().to_string()))
+}
+
+#[tauri::command]
 async fn shutdown_backend(state: State<'_, BackendState>) -> Result<(), String> {
     shutdown_backend_state(state.inner()).await;
     Ok(())
@@ -208,9 +255,73 @@ fn parse_multiaddrs(values: Vec<String>) -> Result<Vec<Multiaddr>, String> {
         .collect()
 }
 
+fn sanitize_log_filename(value: &str) -> String {
+    let mut filename = value
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => ch,
+            _ => '-',
+        })
+        .collect::<String>();
+    while filename.contains("..") {
+        filename = filename.replace("..", ".");
+    }
+    filename = filename.trim_matches(['-', '.', '_']).to_string();
+    if filename.is_empty() {
+        filename = "link-ear-log.jsonl".to_string();
+    }
+    if !filename.ends_with(".jsonl") {
+        filename.push_str(".jsonl");
+    }
+    filename
+}
+
+fn normalize_log_export_path(mut path: PathBuf) -> PathBuf {
+    if path.extension().is_none() {
+        path.set_extension("jsonl");
+    }
+    path
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{normalize_log_export_path, sanitize_log_filename};
+
+    #[test]
+    fn sanitize_log_filename_keeps_safe_jsonl_name() {
+        assert_eq!(
+            sanitize_log_filename("link-ear-log-20260613-120000.jsonl"),
+            "link-ear-log-20260613-120000.jsonl"
+        );
+    }
+
+    #[test]
+    fn sanitize_log_filename_rejects_path_segments() {
+        assert_eq!(
+            sanitize_log_filename("../some/path/link-ear-log"),
+            "some-path-link-ear-log.jsonl"
+        );
+    }
+
+    #[test]
+    fn normalize_log_export_path_adds_missing_extension() {
+        assert_eq!(
+            normalize_log_export_path(PathBuf::from("link-ear-log")),
+            PathBuf::from("link-ear-log.jsonl")
+        );
+        assert_eq!(
+            normalize_log_export_path(PathBuf::from("link-ear-log.txt")),
+            PathBuf::from("link-ear-log.txt")
+        );
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(BackendState::default())
+        .plugin(tauri_plugin_dialog::init())
         .on_window_event(|window, event| {
             if !matches!(event, WindowEvent::CloseRequested { .. }) {
                 return;
@@ -248,6 +359,7 @@ fn main() {
             remove_queue_item,
             move_queue_item,
             vote,
+            export_status_logs,
             shutdown_backend
         ])
         .setup(|app| {

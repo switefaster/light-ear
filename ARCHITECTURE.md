@@ -187,6 +187,10 @@ Current rules:
 - Buffer quorum is a strict majority of real room peers. Start removes the queue
   item only after quorum succeeds; seek/resume publish their target playback
   state only after quorum succeeds.
+- During a current buffer operation, peer disconnects and libp2p gossipsub
+  `SlowPeer` reports remove that peer from the expected set and recompute quorum.
+  Temporary prepare/status publish failures are visible status events, not
+  reasons to abort local prepare, local ready, or leader-side quorum resolution.
 - Direct seek by the current track requester still avoids a vote, but it pauses
   first and waits for buffer quorum before publishing the target anchor.
 - `PlaybackReady` counts only when the local peer is leader, session matches, and the ready peer is expected.
@@ -223,6 +227,17 @@ window. The cache defaults are a 12-second ready window, 5-second low watermark,
 expired, or forbidden media should fail the local buffer operation instead of
 silently falling back to a full in-memory download.
 
+Audio output device errors are local recoverable events. When the rodio/cpal
+stream reports an error, the backend reopens the current default output device
+and reattaches the current sink at the local playback position when possible.
+This recovery must not publish a room playback change or mark the media session
+failed by itself.
+
+When seek targets a position outside the decoded window, the player restarts the
+streaming prepare at that target and prioritizes the byte ranges requested by
+the demuxer/decoder. It must not wait for earlier sequential download progress
+to naturally reach the new position.
+
 ## Frontend Contract
 
 The frontend talks to Rust through stable Tauri commands:
@@ -241,6 +256,12 @@ The frontend talks to Rust through stable Tauri commands:
 - `vote`
 
 The backend sends `FrontendEvent` values. The event shape is intentionally UI-facing and not the same as the P2P wire schema. Peer overview, local cache progress, and status logs are diagnostic UI state; do not add P2P wire fields solely to support presentation.
+
+Status log export is a desktop file-system operation. The frontend serializes
+the current UI log entries as JSONL and calls a Tauri command; Rust uses the
+Tauri dialog plugin to show a save dialog, writes to the selected path, and
+returns the saved path. The desktop app should not rely on WebView Blob download
+behavior for this export.
 
 The desktop UI should keep these behaviours:
 

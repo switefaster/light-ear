@@ -1308,6 +1308,28 @@ async fn handle_swarm_event(
                 let peer_id = peer_id.to_string();
                 ctx.music.remove_pending_peer(&peer_id);
                 let targets = PublishTargets { rendezvous_nodes };
+                if ctx
+                    .buffer_coordinator
+                    .remove_expected_peer(&peer_id, Instant::now())
+                    .is_some()
+                {
+                    if let Err(err) = resolve_buffer_operation(
+                        ctx.buffer_coordinator,
+                        ctx.music,
+                        &mut *ctx.audio_player,
+                        ctx.failed_audio_sessions,
+                        swarm,
+                        ctx.topic,
+                        &targets,
+                        ctx.local_peer_id,
+                        ui,
+                    )
+                    .await
+                    {
+                        send_status(ui, format!("buffer operation failed: {err:#}")).await;
+                    }
+                    send_buffer_view(ui, ctx.buffer_coordinator, ctx.local_peer_id).await;
+                }
                 if let Err(err) = maybe_start_pending_playback(
                     ctx.music,
                     swarm,
@@ -1492,6 +1514,34 @@ async fn handle_swarm_event(
                 format!("gossipsub slow peer {peer_id}: {failed_messages:?}"),
             )
             .await;
+            let targets = PublishTargets { rendezvous_nodes };
+            if ctx
+                .buffer_coordinator
+                .remove_expected_peer(&peer_id.to_string(), Instant::now())
+                .is_some()
+            {
+                send_status(
+                    ui,
+                    format!("removed slow peer {peer_id} from current buffer quorum"),
+                )
+                .await;
+                if let Err(err) = resolve_buffer_operation(
+                    ctx.buffer_coordinator,
+                    ctx.music,
+                    &mut *ctx.audio_player,
+                    ctx.failed_audio_sessions,
+                    swarm,
+                    ctx.topic,
+                    &targets,
+                    ctx.local_peer_id,
+                    ui,
+                )
+                .await
+                {
+                    send_status(ui, format!("buffer operation failed: {err:#}")).await;
+                }
+                send_buffer_view(ui, ctx.buffer_coordinator, ctx.local_peer_id).await;
+            }
         }
         SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
             propagation_source,
@@ -3414,17 +3464,22 @@ async fn handle_audio_player_events(
                             None,
                             Instant::now(),
                         );
-                        publish_playback_buffer_status(
-                            swarm,
-                            topic,
-                            targets,
-                            &operation_id,
-                            &session_id,
-                            local_peer_id,
-                            PlaybackBufferStatusKind::Ready,
-                            Some(buffered_until_ms),
-                            None,
-                        )?;
+                        if let Some(status) = describe_buffer_publish_result(
+                            "buffer ready status",
+                            publish_playback_buffer_status(
+                                swarm,
+                                topic,
+                                targets,
+                                &operation_id,
+                                &session_id,
+                                local_peer_id,
+                                PlaybackBufferStatusKind::Ready,
+                                Some(buffered_until_ms),
+                                None,
+                            ),
+                        ) {
+                            send_status(ui, status).await;
+                        }
                         resolve_buffer_operation(
                             buffer,
                             music,
@@ -3603,6 +3658,34 @@ async fn handle_audio_player_events(
                             ui,
                         )
                         .await;
+                    }
+                }
+            }
+            player::AudioPlayerEvent::OutputDeviceError { error } => {
+                send_status(
+                    ui,
+                    format!("audio output error: {error}; reopening default output"),
+                )
+                .await;
+                match audio_player
+                    .as_mut()
+                    .map(|player| player.recover_output_device(current_timestamp_micros()))
+                {
+                    Some(Ok(true)) => {
+                        send_status(
+                            ui,
+                            "audio output reopened and playback reattached".to_string(),
+                        )
+                        .await;
+                    }
+                    Some(Ok(false)) => {
+                        send_status(ui, "audio output reopened".to_string()).await;
+                    }
+                    Some(Err(err)) => {
+                        send_status(ui, format!("audio output recovery failed: {err:#}")).await;
+                    }
+                    None => {
+                        send_status(ui, "audio output unavailable".to_string()).await;
                     }
                 }
             }
@@ -3809,17 +3892,22 @@ async fn handle_buffer_prepare_failure(
             Some(reason.clone()),
             Instant::now(),
         );
-        publish_playback_buffer_status(
-            swarm,
-            topic,
-            targets,
-            &operation_id,
-            &state.session_id,
-            local_peer_id,
-            PlaybackBufferStatusKind::Failed,
-            None,
-            Some(reason.clone()),
-        )?;
+        if let Some(status) = describe_buffer_publish_result(
+            "buffer failure status",
+            publish_playback_buffer_status(
+                swarm,
+                topic,
+                targets,
+                &operation_id,
+                &state.session_id,
+                local_peer_id,
+                PlaybackBufferStatusKind::Failed,
+                None,
+                Some(reason.clone()),
+            ),
+        ) {
+            send_status(ui, status).await;
+        }
         mark_local_audio_session_failed(
             audio_player,
             music,
@@ -3935,26 +4023,36 @@ async fn resolve_buffer_operation(
                 if let Some(operation) =
                     buffer.extend_active_deadline(now + BUFFER_OPERATION_TIMEOUT)
                 {
-                    publish_playback_buffer_prepare(
-                        swarm,
-                        topic,
-                        targets,
-                        &operation,
-                        local_peer_id,
-                    )?;
-                    let _ = buffer.mark_prepare_published(&operation.operation_id, now);
-                    if let Some(status) = local_status {
-                        publish_playback_buffer_status(
+                    if let Some(status) = describe_buffer_publish_result(
+                        "buffer prepare republish",
+                        publish_playback_buffer_prepare(
                             swarm,
                             topic,
                             targets,
-                            &operation.operation_id,
-                            &operation.state.session_id,
+                            &operation,
                             local_peer_id,
-                            status.status,
-                            status.buffered_until_ms,
-                            status.error,
-                        )?;
+                        ),
+                    ) {
+                        send_status(ui, status).await;
+                    }
+                    let _ = buffer.mark_prepare_published(&operation.operation_id, now);
+                    if let Some(status) = local_status {
+                        if let Some(status_message) = describe_buffer_publish_result(
+                            "buffer local status republish",
+                            publish_playback_buffer_status(
+                                swarm,
+                                topic,
+                                targets,
+                                &operation.operation_id,
+                                &operation.state.session_id,
+                                local_peer_id,
+                                status.status,
+                                status.buffered_until_ms,
+                                status.error,
+                            ),
+                        ) {
+                            send_status(ui, status_message).await;
+                        }
                     }
                     send_buffer_view(ui, buffer, local_peer_id).await;
                     send_status(
@@ -3997,7 +4095,18 @@ async fn resolve_buffer_operation(
             if let Some(operation) =
                 buffer.prepare_republish_due(now, BUFFER_PREPARE_REPUBLISH_INTERVAL)
             {
-                publish_playback_buffer_prepare(swarm, topic, targets, &operation, local_peer_id)?;
+                if let Some(status) = describe_buffer_publish_result(
+                    "buffer prepare republish",
+                    publish_playback_buffer_prepare(
+                        swarm,
+                        topic,
+                        targets,
+                        &operation,
+                        local_peer_id,
+                    ),
+                ) {
+                    send_status(ui, status).await;
+                }
             }
             send_buffer_view(ui, buffer, local_peer_id).await;
         }
@@ -4243,19 +4352,13 @@ async fn begin_buffer_operation(
     if let Some(player) = audio_player.as_mut() {
         player.set_playing(false, now)?;
     }
-    publish_playback_buffer_prepare(swarm, topic, targets, &operation, local_peer_id)?;
+    if let Some(status) = describe_buffer_publish_result(
+        "buffer prepare",
+        publish_playback_buffer_prepare(swarm, topic, targets, &operation, local_peer_id),
+    ) {
+        send_status(ui, status).await;
+    }
     let _ = buffer.mark_prepare_published(&operation.operation_id, Instant::now());
-    publish_playback_buffer_status(
-        swarm,
-        topic,
-        targets,
-        &operation.operation_id,
-        &operation.state.session_id,
-        local_peer_id,
-        PlaybackBufferStatusKind::Buffering,
-        Some(position_ms),
-        None,
-    )?;
     let _ = buffer.mark_status(
         &operation.operation_id,
         &operation.state.session_id,
@@ -4265,6 +4368,22 @@ async fn begin_buffer_operation(
         None,
         Instant::now(),
     );
+    if let Some(status) = describe_buffer_publish_result(
+        "buffer local status",
+        publish_playback_buffer_status(
+            swarm,
+            topic,
+            targets,
+            &operation.operation_id,
+            &operation.state.session_id,
+            local_peer_id,
+            PlaybackBufferStatusKind::Buffering,
+            Some(position_ms),
+            None,
+        ),
+    ) {
+        send_status(ui, status).await;
+    }
     send_buffer_view(ui, buffer, local_peer_id).await;
     send_status(ui, format!("buffering {title}")).await;
 
@@ -4899,19 +5018,18 @@ fn publish_playback_cancel(
 fn publish_playback_buffer_prepare(
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
-    targets: &PublishTargets<'_>,
+    _targets: &PublishTargets<'_>,
     operation: &BufferOperation,
     local_peer_id: PeerId,
-) -> Result<()> {
+) -> Result<RoomPublishOutcome> {
     let track_id = operation
         .state
         .track
         .as_ref()
         .map_or_else(String::new, |track| track.track_id.clone());
-    publish_room_wire(
+    publish_room_wire_with_outcome(
         swarm,
         topic,
-        targets,
         &WireMessage::PlaybackBufferPrepare {
             operation_id: operation.operation_id.clone(),
             session_id: operation.state.session_id.clone(),
@@ -4928,18 +5046,17 @@ fn publish_playback_buffer_prepare(
 fn publish_playback_buffer_status(
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
-    targets: &PublishTargets<'_>,
+    _targets: &PublishTargets<'_>,
     operation_id: &str,
     session_id: &str,
     local_peer_id: PeerId,
     status: PlaybackBufferStatusKind,
     buffered_until_ms: Option<u64>,
     error: Option<String>,
-) -> Result<()> {
-    publish_room_wire(
+) -> Result<RoomPublishOutcome> {
+    publish_room_wire_with_outcome(
         swarm,
         topic,
-        targets,
         &WireMessage::PlaybackBufferStatus {
             operation_id: operation_id.to_string(),
             session_id: session_id.to_string(),
@@ -4950,6 +5067,19 @@ fn publish_playback_buffer_status(
             nonce: new_nonce(local_peer_id),
         },
     )
+}
+
+fn describe_buffer_publish_result(
+    action: &str,
+    result: Result<RoomPublishOutcome>,
+) -> Option<String> {
+    match result {
+        Ok(RoomPublishOutcome::Published) => None,
+        Ok(RoomPublishOutcome::NoSubscribers) => {
+            Some(format!("{action} not sent: no gossipsub subscribers"))
+        }
+        Err(err) => Some(format!("{action} failed: {err:#}")),
+    }
 }
 
 fn publish_local_buffer_health(

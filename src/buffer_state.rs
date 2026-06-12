@@ -159,6 +159,21 @@ impl BufferCoordinator {
         Some(operation.clone())
     }
 
+    pub(crate) fn remove_expected_peer(
+        &mut self,
+        peer_id: &str,
+        now: Instant,
+    ) -> Option<BufferQuorum> {
+        let operation = self.active.as_mut()?;
+        let removed_expected = operation.expected_peers.remove(peer_id);
+        let removed_status = operation.statuses.remove(peer_id).is_some();
+        if removed_expected || removed_status {
+            Some(operation.quorum(now))
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn mark_prepare_published(&mut self, operation_id: &str, now: Instant) -> bool {
         let Some(operation) = self.active.as_mut() else {
             return false;
@@ -780,6 +795,49 @@ mod tests {
                 threshold: 2
             })
         ));
+    }
+
+    #[test]
+    fn removing_expected_peer_recomputes_quorum() {
+        let now = Instant::now();
+        let mut coordinator = BufferCoordinator::new();
+        coordinator.start_leader_operation(
+            "op".to_string(),
+            state("session"),
+            PlaybackBufferOperationKind::Seek,
+            None,
+            peers(["local", "slow"]),
+            now + Duration::from_secs(10),
+        );
+        coordinator.mark_status(
+            "op",
+            "session",
+            "local",
+            PlaybackBufferStatusKind::Ready,
+            Some(12_000),
+            None,
+            now,
+        );
+
+        assert!(matches!(
+            coordinator.quorum(now),
+            Some(BufferQuorum::Waiting {
+                ready: 1,
+                threshold: 2,
+                ..
+            })
+        ));
+        assert!(matches!(
+            coordinator.remove_expected_peer("slow", now),
+            Some(BufferQuorum::Ready {
+                ready: 1,
+                threshold: 1
+            })
+        ));
+        let view = coordinator.active().unwrap().view("local", now);
+        assert_eq!(view.eligible_peers, 1);
+        assert_eq!(view.ready, 1);
+        assert_eq!(view.threshold, 1);
     }
 
     #[test]
