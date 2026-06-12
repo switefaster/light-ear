@@ -74,7 +74,9 @@ pub(crate) struct RemoteQueueApply {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct BeginPrepare {
+    #[allow(dead_code)]
     pub(crate) canceled: Option<PlaybackCancel>,
     pub(crate) state: PlaybackState,
     pub(crate) expected_peers: HashSet<String>,
@@ -93,6 +95,7 @@ impl Default for PlaybackPhase {
 }
 
 impl PreparingPlayback {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn leader(state: PlaybackState, expected_peers: HashSet<String>, deadline: Instant) -> Self {
         Self {
             state,
@@ -167,6 +170,7 @@ impl MusicState {
             .and_then(|index| self.queue.remove(index))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn pop_next_queue_item(&mut self) -> Option<QueueItem> {
         self.queue.pop_front()
     }
@@ -220,6 +224,7 @@ impl MusicState {
         !self.has_pending_playback() && !self.has_track()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn begin_playback_prepare(
         &mut self,
         item: QueueItem,
@@ -464,6 +469,7 @@ impl MusicState {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn resume_playback_for_vote(
         &mut self,
         actor_peer_id: PeerId,
@@ -479,6 +485,7 @@ impl MusicState {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn seek_playback(
         &mut self,
         local_peer_id: PeerId,
@@ -497,6 +504,7 @@ impl MusicState {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn seek_playback_for_vote(
         &mut self,
         actor_peer_id: PeerId,
@@ -518,6 +526,7 @@ impl MusicState {
         self.mark_queue_changed(updated_at_micros);
     }
 
+    #[allow(dead_code)]
     fn update_playback_state(
         &mut self,
         _now_micros: i64,

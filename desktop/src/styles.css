@@ -745,6 +745,12 @@ h2 {
   background: rgba(189, 77, 61, 0.12);
 }
 
+.pill.buffering {
+  color: #234c6f;
+  border-color: rgba(44, 119, 174, 0.32);
+  background: rgba(44, 119, 174, 0.13);
+}
+
 .leader-chip,
 .count-chip {
   color: var(--muted);

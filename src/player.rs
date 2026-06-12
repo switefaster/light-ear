@@ -367,6 +367,7 @@ fn decode_audio(audio: Arc<[u8]>) -> Result<DecodedAudio> {
     let mut sample_rate = None;
     let mut samples = Vec::new();
     let mut decode_errors = 0usize;
+    let mut first_decode_error = None;
 
     loop {
         let packet = match format.next_packet() {
@@ -414,10 +415,16 @@ fn decode_audio(audio: Arc<[u8]>) -> Result<DecodedAudio> {
                 samples.extend(packet_samples);
                 decode_errors = 0;
             }
-            Err(SymphoniaError::DecodeError(_)) => {
+            Err(SymphoniaError::DecodeError(err)) => {
                 decode_errors += 1;
+                first_decode_error.get_or_insert_with(|| err.to_string());
                 if decode_errors > 3 {
-                    bail!("too many audio decode errors");
+                    bail!(
+                        "too many audio decode errors: {}",
+                        first_decode_error
+                            .as_deref()
+                            .unwrap_or("unknown decode error")
+                    );
                 }
             }
             Err(SymphoniaError::IoError(err))

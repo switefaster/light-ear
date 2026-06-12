@@ -43,6 +43,7 @@ const initialRoom = {
   statuses: [],
   logs: [],
   playback: null,
+  playbackBuffer: null,
   peerCount: 0,
   localPeerId: "",
   backendRunning: false,
@@ -406,6 +407,7 @@ function RoomConsole({ config, room, setRoom, callCommand, onOpenLog }) {
 
       <PlayerDock
         playback={playback}
+        buffer={room.playbackBuffer}
         progress={progress}
         volume={volume}
         onCommand={callCommand}
@@ -550,6 +552,7 @@ function RoomNavBar({
 
 function PlayerDock({
   playback,
+  buffer,
   progress,
   volume,
   onCommand,
@@ -560,6 +563,9 @@ function PlayerDock({
   const leaderName = playback ? displayName(playback.leader_peer_id, playback.leader_name) : "";
   const playPauseCommand = playback?.playing ? "pause" : "resume";
   const playPauseLabel = playback ? (playback.playing ? "Pause" : "Resume") : "Play/Pause";
+  const bufferLabel = buffer
+    ? `${formatBufferKind(buffer.kind)} ${buffer.ready}/${buffer.threshold}`
+    : null;
 
   return (
     <section className="player-dock" aria-label="Playback controls">
@@ -572,6 +578,7 @@ function PlayerDock({
           <span className={`pill ${playback?.playing ? "playing" : playback ? "paused" : "neutral"}`}>
             {playback ? (playback.playing ? "playing" : "paused") : "standing by"}
           </span>
+          {bufferLabel && <span className="pill buffering">{bufferLabel}</span>}
           <span>{playback ? `leader ${leaderName}` : "no track selected"}</span>
         </div>
       </div>
@@ -1432,6 +1439,8 @@ function applyBackendEvent(current, event) {
       return { ...current, messages: event.payload };
     case "playback":
       return { ...current, playback: event.payload };
+    case "playback_buffer":
+      return { ...current, playbackBuffer: event.payload };
     case "queue":
       return { ...current, queue: event.payload };
     case "vote":
@@ -1510,6 +1519,12 @@ function numberOrNull(value) {
 function formatMs(value) {
   const seconds = Math.floor((value || 0) / 1000);
   return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+function formatBufferKind(value) {
+  if (value === "seek") return "seek";
+  if (value === "resume") return "resume";
+  return "start";
 }
 
 function normalizeMicros(value) {

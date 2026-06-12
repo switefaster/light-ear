@@ -47,6 +47,12 @@ The desktop path is the primary product path. The terminal UI still exists as a 
 - `src/music_state.rs`
   - Internal pure-ish music state machine for queue, playback phase, pending prepare, playback version, and active vote.
   - This is where most queue/playback/vote rules should be tested.
+- `src/buffer_state.rs`
+  - Internal buffer quorum coordinator for start, seek, and resume operations.
+  - It tracks short-lived operation ids, expected real room peers, local/remote buffer status, quorum readiness, timeout, and impossible quorum.
+- `src/media_cache.rs`
+  - Range-cache foundation for long media: byte-range mapping, HTTP Range probing, deterministic cache paths, and cache eviction helpers.
+  - The current player still loads audio into the existing `AudioPlayer`; wiring a streaming decoder onto this cache is a separate follow-up.
 - `src/connection_state.rs`
   - Internal connection strategy layer for routes, direct addresses, gossipsub warmup, chat subscription readiness, direct promotion backoff, and relay handoff.
   - This module returns effects; `backend.rs` performs the libp2p calls.
@@ -87,6 +93,8 @@ Inbound gossipsub and direct messages reuse the same wire-message handler. Actor
 - queue state `updated_by` must match the source;
 - playback state/prepare leader must match the source;
 - playback ready peer must match the source;
+- playback buffer prepare/cancel leader must match the source;
+- playback buffer status peer must match the source;
 - vote proposer/ballot peer must match the source.
 
 This validation is why deterministic vote application is local-only on most peers: for playback votes, every peer applies the same state locally from the proposal timestamp and proposer identity, but only the peer whose id matches the resulting `leader_peer_id` publishes the playback state.
@@ -167,6 +175,17 @@ Current rules:
 
 - The peer that starts the next queue item becomes the prepare/playback leader.
 - The expected ready set includes real room peers only: local peer included, relay/rendezvous infrastructure excluded.
+- New start, seek, and resume paths use `PlaybackBufferPrepare`,
+  `PlaybackBufferStatus`, and `PlaybackBufferCancel` as temporary coordination
+  messages before publishing a playable `PlaybackState`.
+- `PlaybackState` remains the only authoritative room playback state. Buffer
+  operations are short-lived and should be cleared on ready, cancel, timeout, or
+  impossible quorum.
+- Buffer quorum is a strict majority of real room peers. Start removes the queue
+  item only after quorum succeeds; seek/resume publish their target playback
+  state only after quorum succeeds.
+- Direct seek by the current track requester still avoids a vote, but it pauses
+  first and waits for buffer quorum before publishing the target anchor.
 - `PlaybackReady` counts only when the local peer is leader, session matches, and the ready peer is expected.
 - Duplicate or unknown ready messages do not change ready count.
 - Peer disconnect removes that peer from pending expected/ready sets; if all remaining expected peers are ready, playback may start.
@@ -193,6 +212,13 @@ Playback does not stream audio from peer to peer. Each client resolves and downl
 The resolver prefers DASH audio and can fall back to single-file `durl` media. WBI signing and media selection helpers have deterministic unit tests. If a playurl response is HTTP 412 or contains no usable media URL, the backend tries the legacy playurl path before surfacing failure.
 
 Downloads run outside the main swarm event loop. Skip/cancel/vote messages can arrive while a download is in flight. Download results must be checked against the current session id and track id before loading audio.
+
+For long media, the first implemented guardrail is room-level buffer quorum plus
+a tested range-cache foundation. The cache defaults are a 12-second ready
+window, 5-second low watermark, 15-second high watermark, and 2 GiB maximum
+cache size. HTTP Range unsupported, expired, or forbidden media should fail the
+local buffer operation instead of silently falling back to a full in-memory
+download in the future streaming path.
 
 ## Frontend Contract
 

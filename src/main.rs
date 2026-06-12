@@ -86,7 +86,11 @@ impl App {
                 }
             }
             UiEvent::Playback(playback) => self.playback = playback,
-            UiEvent::Queue(_) | UiEvent::Vote(_) | UiEvent::Peers(_) | UiEvent::PeerNames(_) => {}
+            UiEvent::Queue(_)
+            | UiEvent::Vote(_)
+            | UiEvent::PlaybackBuffer(_)
+            | UiEvent::Peers(_)
+            | UiEvent::PeerNames(_) => {}
         }
     }
 }

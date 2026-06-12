@@ -72,6 +72,21 @@ guardrail:
 - Bilibili/audio downloads for playback prepare run off the main swarm event
   loop. Skip/cancel may arrive while a download is in flight; stale download
   results must be ignored by session id and track id.
+- Long-video playback uses short-lived buffer coordination around the existing
+  authoritative `PlaybackState`. `PlaybackBufferPrepare`,
+  `PlaybackBufferStatus`, and `PlaybackBufferCancel` are temporary quorum and
+  diagnostic messages; do not treat them as room playback truth.
+- Start, seek, and resume should wait for a strict majority of real room peers
+  to report buffered readiness before the leader publishes the playable
+  `PlaybackState`. Queue items are removed only after start quorum succeeds.
+- Buffer quorum counts real room peers only, including the local peer and
+  excluding relay/rendezvous infrastructure. Leader-side media failure must
+  cancel or converge the operation; follower failure should stay local except
+  for its buffer status report.
+- The first long-video foundation keeps `PlaybackState` compatible and adds a
+  tested range-cache module, but the current audio output path still loads a
+  decoded track into the existing player. Treat the range-backed decoder as the
+  next implementation step, not as fully wired streaming playback.
 - Music download, decode, device, or playback-sync failures must converge
   explicitly instead of leaving a peer in fake playback. A leader failure should
   publish cancel/idle for the affected session and then try the next queued

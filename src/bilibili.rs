@@ -73,6 +73,7 @@ struct BilibiliDash {
 struct BilibiliAudio {
     id: u64,
     bandwidth: Option<u64>,
+    codecs: Option<String>,
     #[serde(rename = "baseUrl")]
     base_url_camel: Option<String>,
     #[serde(rename = "base_url")]
@@ -94,8 +95,24 @@ impl BilibiliAudio {
             .or(self.base_url_snake.as_deref())
     }
 
-    fn quality_key(&self) -> (u64, u64) {
-        (self.bandwidth.unwrap_or(0), self.id)
+    fn quality_key(&self) -> Option<(u8, u64, u64)> {
+        let codec_priority = self.decoder_codec_priority()?;
+        Some((codec_priority, self.bandwidth.unwrap_or(0), self.id))
+    }
+
+    fn decoder_codec_priority(&self) -> Option<u8> {
+        let Some(codecs) = self.codecs.as_deref() else {
+            return Some(1);
+        };
+        if codecs
+            .split(',')
+            .map(|codec| codec.trim().to_ascii_lowercase())
+            .any(|codec| codec == "mp4a.40.2")
+        {
+            return Some(2);
+        }
+
+        None
     }
 }
 
@@ -324,7 +341,7 @@ fn best_media_url(player: BilibiliPlayerInfo) -> Result<String> {
             .into_iter()
             .filter_map(|audio| {
                 let base_url = audio.base_url()?;
-                Some((audio.quality_key(), base_url.to_string()))
+                Some((audio.quality_key()?, base_url.to_string()))
             })
             .max_by_key(|(quality, _)| *quality)
         {
@@ -739,12 +756,14 @@ mod tests {
                     BilibiliAudio {
                         id: 30216,
                         bandwidth: Some(64),
+                        codecs: None,
                         base_url_camel: Some("https://example.test/low.m4s".to_string()),
                         base_url_snake: None,
                     },
                     BilibiliAudio {
                         id: 30280,
                         bandwidth: Some(128),
+                        codecs: None,
                         base_url_camel: None,
                         base_url_snake: Some("https://example.test/high.m4s".to_string()),
                     },
@@ -765,6 +784,36 @@ mod tests {
     }
 
     #[test]
+    fn best_media_url_prefers_decoder_supported_aac_lc() {
+        let player = BilibiliPlayerInfo {
+            dash: Some(BilibiliDash {
+                audio: Some(vec![
+                    BilibiliAudio {
+                        id: 30280,
+                        bandwidth: Some(192),
+                        codecs: Some("mp4a.40.5".to_string()),
+                        base_url_camel: Some("https://example.test/he-aac.m4s".to_string()),
+                        base_url_snake: None,
+                    },
+                    BilibiliAudio {
+                        id: 30232,
+                        bandwidth: Some(132),
+                        codecs: Some("mp4a.40.2".to_string()),
+                        base_url_camel: Some("https://example.test/aac-lc.m4s".to_string()),
+                        base_url_snake: None,
+                    },
+                ]),
+            }),
+            durl: None,
+        };
+
+        assert_eq!(
+            best_media_url(player).unwrap(),
+            "https://example.test/aac-lc.m4s"
+        );
+    }
+
+    #[test]
     fn best_media_url_uses_single_durl_when_dash_audio_is_missing() {
         let player = BilibiliPlayerInfo {
             dash: None,
@@ -773,6 +822,32 @@ mod tests {
                 size: Some(5_880_463),
                 url: "https://example.test/video.mp4".to_string(),
                 backup_url: Some(vec!["https://example.test/backup.mp4".to_string()]),
+            }]),
+        };
+
+        assert_eq!(
+            best_media_url(player).unwrap(),
+            "https://example.test/video.mp4"
+        );
+    }
+
+    #[test]
+    fn best_media_url_falls_back_to_durl_when_dash_codec_is_unsupported() {
+        let player = BilibiliPlayerInfo {
+            dash: Some(BilibiliDash {
+                audio: Some(vec![BilibiliAudio {
+                    id: 30280,
+                    bandwidth: Some(192),
+                    codecs: Some("fLaC".to_string()),
+                    base_url_camel: Some("https://example.test/flac.m4s".to_string()),
+                    base_url_snake: None,
+                }]),
+            }),
+            durl: Some(vec![BilibiliDurl {
+                order: 1,
+                size: Some(5_880_463),
+                url: "https://example.test/video.mp4".to_string(),
+                backup_url: None,
             }]),
         };
 

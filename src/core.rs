@@ -105,6 +105,39 @@ pub struct PlaybackView {
     pub leader_peer_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackBufferOperationKind {
+    Start,
+    Seek,
+    Resume,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackBufferStatusKind {
+    Ready,
+    Buffering,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaybackBufferView {
+    pub operation_id: String,
+    pub session_id: String,
+    pub track_id: String,
+    pub kind: PlaybackBufferOperationKind,
+    pub local_status: PlaybackBufferStatusKind,
+    pub ready: usize,
+    pub buffering: usize,
+    pub failed: usize,
+    pub threshold: usize,
+    pub eligible_peers: usize,
+    pub position_ms: u64,
+    pub buffered_until_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoteView {
     pub vote_id: String,
@@ -141,6 +174,7 @@ pub enum FrontendEvent {
     LocalPeerId(String),
     History(Vec<ChatRecord>),
     Playback(Option<PlaybackView>),
+    PlaybackBuffer(Option<PlaybackBufferView>),
     Queue(QueueState),
     Vote(Option<VoteView>),
     Peers(Vec<PeerConnectionView>),
@@ -207,6 +241,35 @@ pub enum WireMessage {
         nonce: u64,
     },
     PlaybackCancel {
+        session_id: String,
+        leader_peer_id: String,
+        reason: String,
+        #[serde(default)]
+        nonce: u64,
+    },
+    PlaybackBufferPrepare {
+        operation_id: String,
+        session_id: String,
+        track_id: String,
+        position_ms: u64,
+        kind: PlaybackBufferOperationKind,
+        expected_peers: Vec<String>,
+        leader_peer_id: String,
+        #[serde(default)]
+        nonce: u64,
+    },
+    PlaybackBufferStatus {
+        operation_id: String,
+        session_id: String,
+        peer_id: String,
+        status: PlaybackBufferStatusKind,
+        buffered_until_ms: Option<u64>,
+        error: Option<String>,
+        #[serde(default)]
+        nonce: u64,
+    },
+    PlaybackBufferCancel {
+        operation_id: String,
         session_id: String,
         leader_peer_id: String,
         reason: String,
