@@ -5245,8 +5245,8 @@ mod tests {
         DIRECT_PROMOTION_FAILURE_DEDUP_WINDOW, DIRECT_PROMOTION_MAX_FAILURES,
         DIRECT_PROMOTION_MEDIUM_RETRY_FAILURES, DIRECT_PROMOTION_MEDIUM_RETRY_INTERVAL,
         DIRECT_PROMOTION_RETRY_INTERVAL, DIRECT_PROMOTION_SLOW_RETRY_FAILURES,
-        DIRECT_PROMOTION_SLOW_RETRY_INTERVAL, DirectPromotionBackoff, DirectPromotionFailureOutcome,
-        normalize_direct_peer_address,
+        DIRECT_PROMOTION_SLOW_RETRY_INTERVAL, DirectPromotionBackoff,
+        DirectPromotionFailureOutcome, normalize_direct_peer_address,
     };
 
     use super::*;

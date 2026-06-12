@@ -101,9 +101,7 @@ impl BilibiliAudio {
     }
 
     fn decoder_codec_priority(&self) -> Option<u8> {
-        let Some(codecs) = self.codecs.as_deref() else {
-            return Some(1);
-        };
+        let codecs = self.codecs.as_deref()?;
         if codecs
             .split(',')
             .map(|codec| codec.trim().to_ascii_lowercase())
@@ -373,7 +371,7 @@ fn best_media_url(player: BilibiliPlayerInfo) -> Result<String> {
         }
     }
 
-    bail!("bilibili media stream does not exist")
+    bail!("bilibili media stream with decoder-supported audio does not exist")
 }
 
 #[cfg(test)]
@@ -756,14 +754,14 @@ mod tests {
                     BilibiliAudio {
                         id: 30216,
                         bandwidth: Some(64),
-                        codecs: None,
+                        codecs: Some("mp4a.40.2".to_string()),
                         base_url_camel: Some("https://example.test/low.m4s".to_string()),
                         base_url_snake: None,
                     },
                     BilibiliAudio {
                         id: 30280,
                         bandwidth: Some(128),
-                        codecs: None,
+                        codecs: Some("mp4a.40.2".to_string()),
                         base_url_camel: None,
                         base_url_snake: Some("https://example.test/high.m4s".to_string()),
                     },
@@ -840,6 +838,32 @@ mod tests {
                     bandwidth: Some(192),
                     codecs: Some("fLaC".to_string()),
                     base_url_camel: Some("https://example.test/flac.m4s".to_string()),
+                    base_url_snake: None,
+                }]),
+            }),
+            durl: Some(vec![BilibiliDurl {
+                order: 1,
+                size: Some(5_880_463),
+                url: "https://example.test/video.mp4".to_string(),
+                backup_url: None,
+            }]),
+        };
+
+        assert_eq!(
+            best_media_url(player).unwrap(),
+            "https://example.test/video.mp4"
+        );
+    }
+
+    #[test]
+    fn best_media_url_falls_back_to_durl_when_dash_codec_is_unknown() {
+        let player = BilibiliPlayerInfo {
+            dash: Some(BilibiliDash {
+                audio: Some(vec![BilibiliAudio {
+                    id: 30280,
+                    bandwidth: Some(192),
+                    codecs: None,
+                    base_url_camel: Some("https://example.test/unknown-aac.m4s".to_string()),
                     base_url_snake: None,
                 }]),
             }),
