@@ -3781,6 +3781,13 @@ async fn handle_audio_player_events(
                         .await?;
                         send_buffer_view(ui, buffer, local_peer_id).await;
                     }
+                } else if stream_event_matches_active_operation(
+                    buffer,
+                    &session_id,
+                    &track_id,
+                    None,
+                ) {
+                    continue;
                 } else if music.has_pending_playback() {
                     if !music_stream_event_matches(music, &session_id, &track_id) {
                         continue;
@@ -3834,8 +3841,14 @@ async fn handle_audio_player_events(
                     }
                 }
             }
-            player::AudioPlayerEvent::Cache(view) => {
-                if !stream_event_matches_current(buffer, music, &view.session_id, &view.track_id) {
+            player::AudioPlayerEvent::Cache { operation_id, view } => {
+                if !stream_event_matches_current(
+                    buffer,
+                    music,
+                    operation_id.as_deref(),
+                    &view.session_id,
+                    &view.track_id,
+                ) {
                     continue;
                 }
                 let status = match view.status {
@@ -3858,11 +3871,18 @@ async fn handle_audio_player_events(
                 let _ = ui.send(UiEvent::PlaybackCache(Some(view))).await;
             }
             player::AudioPlayerEvent::Buffering {
+                operation_id,
                 session_id,
                 track_id,
                 buffered_until_ms,
             } => {
-                if !stream_event_matches_current(buffer, music, &session_id, &track_id) {
+                if !stream_event_matches_current(
+                    buffer,
+                    music,
+                    operation_id.as_deref(),
+                    &session_id,
+                    &track_id,
+                ) {
                     continue;
                 }
                 let duration_ms = track_duration_for_session(music, &session_id, &track_id)
@@ -3895,7 +3915,7 @@ async fn handle_audio_player_events(
                 error,
             } => {
                 let matches_current = operation_id.as_deref().map_or_else(
-                    || music_stream_event_matches(music, &session_id, &track_id),
+                    || stream_event_matches_current(buffer, music, None, &session_id, &track_id),
                     |operation_id| {
                         active_buffer_operation_matches(
                             buffer,
@@ -4108,8 +4128,29 @@ async fn handle_audio_player_events(
 fn stream_event_matches_current(
     buffer: &BufferCoordinator,
     music: &MusicState,
+    operation_id: Option<&str>,
     session_id: &str,
     track_id: &str,
+) -> bool {
+    if let Some(operation) = buffer.active().filter(|operation| {
+        operation.state.session_id == session_id
+            && operation
+                .state
+                .track
+                .as_ref()
+                .is_some_and(|track| track.track_id == track_id)
+    }) {
+        return operation_id == Some(operation.operation_id.as_str());
+    }
+
+    music_stream_event_matches(music, session_id, track_id)
+}
+
+fn stream_event_matches_active_operation(
+    buffer: &BufferCoordinator,
+    session_id: &str,
+    track_id: &str,
+    operation_id: Option<&str>,
 ) -> bool {
     buffer.active().is_some_and(|operation| {
         operation.state.session_id == session_id
@@ -4118,7 +4159,9 @@ fn stream_event_matches_current(
                 .track
                 .as_ref()
                 .is_some_and(|track| track.track_id == track_id)
-    }) || music_stream_event_matches(music, session_id, track_id)
+            && operation_id
+                .is_none_or(|operation_id| operation_id == operation.operation_id.as_str())
+    })
 }
 
 fn active_buffer_operation_matches(
@@ -6461,7 +6504,7 @@ mod tests {
 
         assert!(music_stream_event_matches(&music, "session", "track"));
         assert!(stream_event_matches_current(
-            &buffer, &music, "session", "track"
+            &buffer, &music, None, "session", "track"
         ));
         assert!(!music_stream_event_matches(
             &music,
@@ -6500,7 +6543,21 @@ mod tests {
             &buffer, "op", "session", "track"
         ));
         assert!(stream_event_matches_current(
-            &buffer, &music, "session", "track"
+            &buffer,
+            &music,
+            Some("op"),
+            "session",
+            "track"
+        ));
+        assert!(!stream_event_matches_current(
+            &buffer, &music, None, "session", "track"
+        ));
+        assert!(!stream_event_matches_current(
+            &buffer,
+            &music,
+            Some("other-op"),
+            "session",
+            "track"
         ));
         assert!(!active_buffer_operation_matches(
             &buffer, "other-op", "session", "track"
@@ -6520,6 +6577,7 @@ mod tests {
         assert!(!stream_event_matches_current(
             &buffer,
             &music,
+            Some("op"),
             "other-session",
             "track"
         ));

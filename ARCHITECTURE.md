@@ -299,7 +299,10 @@ streaming prepare at that target and prioritizes the byte ranges requested by
 the demuxer/decoder. It must not wait for earlier sequential download progress
 to naturally reach the new position. Existing downloaded byte ranges are kept;
 only the stale decoder token and PCM window are replaced when the track/session
-matches.
+matches. If the demuxer cannot seek to the requested target, the current buffer
+operation should fail explicitly instead of silently decoding from an older base
+position. During the active seek operation, local cache and buffering events are
+accepted only when they carry that operation id.
 
 ## Frontend Contract
 

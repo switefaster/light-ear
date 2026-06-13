@@ -142,6 +142,10 @@ guardrail:
   `session_id + track_id` before they update buffer health, UI cache state,
   status, or playback failure handling. Stale events from canceled decoder or
   downloader tasks should be ignored silently.
+- While a start/seek/resume buffer operation is active for the same
+  `session_id + track_id`, local cache, buffering, and failure events must carry
+  that operation id to be accepted. This prevents old decoder windows from
+  keeping seek UI and quorum state pinned to the pre-seek position.
 - Local audio output device errors, such as headphone hotplug or default-device
   changes, should reopen the default output and reattach the current sink when
   possible. The player also polls the cross-platform default output device id

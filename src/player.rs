@@ -163,8 +163,12 @@ pub enum AudioPlayerEvent {
         track_id: String,
         buffered_until_ms: u64,
     },
-    Cache(PlaybackCacheView),
+    Cache {
+        operation_id: Option<String>,
+        view: PlaybackCacheView,
+    },
     Buffering {
+        operation_id: Option<String>,
         session_id: String,
         track_id: String,
         buffered_until_ms: u64,
@@ -339,16 +343,17 @@ impl AudioPlayer {
                     track_id: track.track_id.clone(),
                     buffered_until_ms,
                 });
-                let _ = self
-                    .event_tx
-                    .send(AudioPlayerEvent::Cache(PlaybackCacheView {
+                let _ = self.event_tx.send(AudioPlayerEvent::Cache {
+                    operation_id: operation_id.clone(),
+                    view: PlaybackCacheView {
                         session_id,
                         track_id: track.track_id,
                         status: PlaybackCacheStatus::Ready,
                         buffered_until_ms,
                         duration_ms: track.duration_ms,
                         error: None,
-                    }));
+                    },
+                });
                 return Ok(());
             }
 
@@ -363,16 +368,17 @@ impl AudioPlayer {
             }
 
             let buffered_until_ms = session.pcm.buffered_until_ms().min(track.duration_ms);
-            let _ = self
-                .event_tx
-                .send(AudioPlayerEvent::Cache(PlaybackCacheView {
+            let _ = self.event_tx.send(AudioPlayerEvent::Cache {
+                operation_id,
+                view: PlaybackCacheView {
                     session_id,
                     track_id: track.track_id,
                     status: PlaybackCacheStatus::Buffering,
                     buffered_until_ms,
                     duration_ms: track.duration_ms,
                     error: None,
-                }));
+                },
+            });
             return Ok(());
         }
 
@@ -513,7 +519,10 @@ impl AudioPlayer {
             });
             self.playing = false;
             if let Some(view) = cache_view {
-                let _ = self.event_tx.send(AudioPlayerEvent::Cache(view));
+                let _ = self.event_tx.send(AudioPlayerEvent::Cache {
+                    operation_id: None,
+                    view,
+                });
             }
             return Ok(());
         }
@@ -537,9 +546,9 @@ impl AudioPlayer {
                     self.restart_streaming(position_ms, true)?;
                 } else if let Some(session) = &self.streaming {
                     self.playing = false;
-                    let _ = self
-                        .event_tx
-                        .send(AudioPlayerEvent::Cache(PlaybackCacheView {
+                    let _ = self.event_tx.send(AudioPlayerEvent::Cache {
+                        operation_id: None,
+                        view: PlaybackCacheView {
                             session_id: session.session_id.clone(),
                             track_id: session.track_id.clone(),
                             status: PlaybackCacheStatus::Buffering,
@@ -549,7 +558,8 @@ impl AudioPlayer {
                                 .min(session.duration_ms),
                             duration_ms: session.duration_ms,
                             error: None,
-                        }));
+                        },
+                    });
                 }
             }
             return Ok(());
@@ -1043,6 +1053,7 @@ impl Iterator for StreamingPcmSource {
                         let buffered_until_ms =
                             self.shared.buffered_until_ms().min(self.duration_ms);
                         let _ = self.event_tx.send(AudioPlayerEvent::Buffering {
+                            operation_id: None,
                             session_id: self.session_id.clone(),
                             track_id: self.track_id.clone(),
                             buffered_until_ms,
@@ -1307,6 +1318,24 @@ impl SharedBytes {
         condvar.notify_all();
     }
 
+    fn prioritize_offset(&self, offset: u64) {
+        let (lock, condvar) = &*self.inner;
+        let mut state = lock.lock().expect("streaming bytes lock poisoned");
+        let offset = state
+            .total_bytes
+            .map_or(offset, |total| offset.min(total.saturating_sub(1)));
+        if !state
+            .ranges
+            .ranges()
+            .iter()
+            .any(|range| range.contains(offset))
+        {
+            state.requested_offsets.retain(|queued| *queued != offset);
+            state.requested_offsets.push_front(offset);
+        }
+        condvar.notify_all();
+    }
+
     fn take_requested_offset(&self, total: u64) -> Option<u64> {
         let (lock, _) = &*self.inner;
         let mut state = lock.lock().expect("streaming bytes lock poisoned");
@@ -1557,7 +1586,7 @@ impl StreamingSession {
         self.position_ms.store(position_ms, Ordering::Relaxed);
         if let Some(total) = self.bytes.total_bytes() {
             let seek_window = media_cache::range_for_window(position_ms, track.duration_ms, total);
-            self.bytes.request_offset(seek_window.start);
+            self.bytes.prioritize_offset(seek_window.start);
         }
 
         let bytes = self.bytes.clone();
@@ -1708,7 +1737,7 @@ async fn download_streaming_bytes(
     }
     if position_ms > 0 {
         let seek_window = media_cache::range_for_window(position_ms, track.duration_ms, total);
-        shared.request_offset(seek_window.start);
+        shared.prioritize_offset(seek_window.start);
     }
 
     while shared.contiguous_prefix_end() != Some(total.saturating_sub(1)) {
@@ -1825,8 +1854,8 @@ fn decode_streaming_audio_inner(
     let decoder_opts = DecoderOptions::default();
     let mut decoder = make_audio_decoder(&codec_params, &decoder_opts)
         .context("failed to create streaming audio decoder")?;
-    let decode_base_position_ms =
-        seek_streaming_format(&mut *format, track_id, position_ms).unwrap_or(0);
+    let decode_base_position_ms = seek_streaming_format(&mut *format, track_id, position_ms)
+        .with_context(|| format!("failed to seek streaming audio to {position_ms}ms"))?;
     pcm.set_base_position(decode_base_position_ms);
 
     let ready_until = position_ms
@@ -1885,18 +1914,21 @@ fn decode_streaming_audio_inner(
                     ready_until,
                 ) {
                     last_cache_event_ms = buffered_until_ms;
-                    let _ = event_tx.send(AudioPlayerEvent::Cache(PlaybackCacheView {
-                        session_id: session_id.clone(),
-                        track_id: track.track_id.clone(),
-                        status: if ready_sent {
-                            PlaybackCacheStatus::Ready
-                        } else {
-                            PlaybackCacheStatus::Preparing
+                    let _ = event_tx.send(AudioPlayerEvent::Cache {
+                        operation_id: operation_id.clone(),
+                        view: PlaybackCacheView {
+                            session_id: session_id.clone(),
+                            track_id: track.track_id.clone(),
+                            status: if ready_sent {
+                                PlaybackCacheStatus::Ready
+                            } else {
+                                PlaybackCacheStatus::Preparing
+                            },
+                            buffered_until_ms,
+                            duration_ms: track.duration_ms,
+                            error: None,
                         },
-                        buffered_until_ms,
-                        duration_ms: track.duration_ms,
-                        error: None,
-                    }));
+                    });
                 }
 
                 if !ready_sent && buffered_until_ms >= ready_until {
@@ -1907,14 +1939,17 @@ fn decode_streaming_audio_inner(
                         track_id: track.track_id.clone(),
                         buffered_until_ms,
                     });
-                    let _ = event_tx.send(AudioPlayerEvent::Cache(PlaybackCacheView {
-                        session_id: session_id.clone(),
-                        track_id: track.track_id.clone(),
-                        status: PlaybackCacheStatus::Ready,
-                        buffered_until_ms,
-                        duration_ms: track.duration_ms,
-                        error: None,
-                    }));
+                    let _ = event_tx.send(AudioPlayerEvent::Cache {
+                        operation_id: operation_id.clone(),
+                        view: PlaybackCacheView {
+                            session_id: session_id.clone(),
+                            track_id: track.track_id.clone(),
+                            status: PlaybackCacheStatus::Ready,
+                            buffered_until_ms,
+                            duration_ms: track.duration_ms,
+                            error: None,
+                        },
+                    });
                 }
             }
             Err(SymphoniaError::DecodeError(err)) => {
@@ -1945,20 +1980,23 @@ fn decode_streaming_audio_inner(
     let buffered_until_ms = pcm.buffered_until_ms().min(track.duration_ms);
     if !ready_sent && buffered_until_ms >= position_ms.min(track.duration_ms) {
         let _ = event_tx.send(AudioPlayerEvent::Prepared {
-            operation_id,
+            operation_id: operation_id.clone(),
             session_id: session_id.clone(),
             track_id: track.track_id.clone(),
             buffered_until_ms,
         });
     }
-    let _ = event_tx.send(AudioPlayerEvent::Cache(PlaybackCacheView {
-        session_id,
-        track_id: track.track_id,
-        status: PlaybackCacheStatus::Ready,
-        buffered_until_ms,
-        duration_ms: track.duration_ms,
-        error: None,
-    }));
+    let _ = event_tx.send(AudioPlayerEvent::Cache {
+        operation_id,
+        view: PlaybackCacheView {
+            session_id,
+            track_id: track.track_id,
+            status: PlaybackCacheStatus::Ready,
+            buffered_until_ms,
+            duration_ms: track.duration_ms,
+            error: None,
+        },
+    });
     Ok(())
 }
 
@@ -2176,6 +2214,25 @@ mod tests {
         bytes.request_offset(80);
         bytes.append(&[1, 2, 3, 4], media_cache::ByteRange::new(40, 43).unwrap());
         assert_eq!(bytes.take_requested_offset(1_000), Some(80));
+    }
+
+    #[test]
+    fn shared_bytes_prioritizes_seek_offset_over_stale_requests() {
+        let bytes = SharedBytes::new();
+        bytes.set_total(Some(1_000));
+
+        bytes.request_offset(100);
+        bytes.request_offset(200);
+        bytes.prioritize_offset(800);
+
+        assert_eq!(bytes.take_requested_offset(1_000), Some(800));
+        assert_eq!(bytes.take_requested_offset(1_000), Some(100));
+        assert_eq!(bytes.take_requested_offset(1_000), Some(200));
+
+        bytes.request_offset(900);
+        bytes.prioritize_offset(900);
+        assert_eq!(bytes.take_requested_offset(1_000), Some(900));
+        assert_eq!(bytes.take_requested_offset(1_000), None);
     }
 
     #[test]
