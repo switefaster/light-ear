@@ -3,10 +3,15 @@ name = "link-ear"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+fdk-aac-decoder = ["dep:symphonia-adapter-fdk-aac"]
+
 [dependencies]
 anyhow = "1.0.102"
 chrono = { version = "0.4.45", features = ["clock"] }
 clap = { version = "4.6.1", features = ["derive"] }
+cpal = "0.17.3"
 futures = "0.3.32"
 libp2p = { version = "0.56.0", features = ["dcutr", "dns", "gossipsub", "identify", "json", "macros", "mdns", "noise", "ping", "quic", "relay", "rendezvous", "tcp", "tokio", "yamux"] }
 md5 = "0.8.0"
@@ -15,6 +20,7 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "q
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "symphonia-aac", "symphonia-isomp4"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-symphonia = { version = "0.6.0", default-features = false, features = ["aac", "isomp4"] }
+symphonia = { version = "0.5.5", default-features = false, features = ["aac", "isomp4"] }
+symphonia-adapter-fdk-aac = { version = "0.1.3", optional = true }
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

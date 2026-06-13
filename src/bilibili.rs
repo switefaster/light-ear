@@ -1,31 +1,15 @@
-use std::{
-    error::Error,
-    fmt,
-    io::{Cursor, Read, Seek, SeekFrom},
-};
+use std::{error::Error, fmt};
 
 use anyhow::{Context, Result, anyhow, bail};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{
     Client, StatusCode, Url,
     header::{
-        ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL, CONTENT_RANGE, HeaderMap, HeaderValue, LOCATION,
-        PRAGMA, RANGE, REFERER, USER_AGENT,
+        ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL, HeaderMap, HeaderValue, LOCATION, PRAGMA, REFERER,
+        USER_AGENT,
     },
 };
 use serde::{Deserialize, de::DeserializeOwned};
-use symphonia::{
-    core::{
-        codecs::{
-            CodecParameters,
-            audio::{AudioDecoderOptions, CODEC_ID_NULL_AUDIO},
-        },
-        formats::{FormatOptions, probe::Hint},
-        io::{MediaSource, MediaSourceStream},
-        meta::MetadataOptions,
-    },
-    default::{get_codecs, get_probe},
-};
 
 use crate::core::PlaybackTrack;
 
@@ -39,8 +23,6 @@ const BILIBILI_API: &str = "https://api.bilibili.com/x";
 const BILIBILI_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36";
 const BILIBILI_ORIGIN: &str = "https://www.bilibili.com";
 const BILIBILI_API_ACCEPT: &str = "application/json, text/plain, */*";
-const BILIBILI_MEDIA_ACCEPT: &str = "*/*";
-const MEDIA_DECODER_PROBE_BYTES: u64 = 1024 * 1024;
 const BVID_LEN: usize = 12;
 const BILIBILI_SHORT_LINK_HOSTS: &[&str] = &["b23.tv", "bili2233.cn"];
 
@@ -108,11 +90,6 @@ struct MediaCandidate {
     url: String,
 }
 
-struct ProbeMediaSource {
-    cursor: Cursor<Vec<u8>>,
-    byte_len: u64,
-}
-
 impl BilibiliAudio {
     fn base_url(&self) -> Option<&str> {
         self.base_url_camel
@@ -127,15 +104,32 @@ impl BilibiliAudio {
 
     fn decoder_codec_priority(&self) -> Option<u8> {
         let codecs = self.codecs.as_deref()?;
-        if codecs
+        let mut best = None;
+        for codec in codecs
             .split(',')
             .map(|codec| codec.trim().to_ascii_lowercase())
-            .any(|codec| codec == "mp4a.40.2")
         {
-            return Some(2);
+            best = best.max(aac_codec_priority(codec.as_str()));
         }
+        best
+    }
+}
 
-        None
+#[cfg(not(feature = "fdk-aac-decoder"))]
+fn aac_codec_priority(codec: &str) -> Option<u8> {
+    match codec {
+        "mp4a.40.2" => Some(3),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "fdk-aac-decoder")]
+fn aac_codec_priority(codec: &str) -> Option<u8> {
+    match codec {
+        "mp4a.40.2" => Some(3),
+        "mp4a.40.5" => Some(2),
+        "mp4a.40.29" => Some(1),
+        _ => None,
     }
 }
 
@@ -149,38 +143,6 @@ impl BilibiliDurl {
             urls.extend(backup_urls.into_iter().filter(|url| !url.is_empty()));
         }
         urls
-    }
-}
-
-impl ProbeMediaSource {
-    fn new(bytes: Vec<u8>) -> Self {
-        let byte_len = bytes.len() as u64;
-        Self {
-            cursor: Cursor::new(bytes),
-            byte_len,
-        }
-    }
-}
-
-impl Read for ProbeMediaSource {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.cursor.read(buf)
-    }
-}
-
-impl Seek for ProbeMediaSource {
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        self.cursor.seek(pos)
-    }
-}
-
-impl MediaSource for ProbeMediaSource {
-    fn is_seekable(&self) -> bool {
-        true
-    }
-
-    fn byte_len(&self) -> Option<u64> {
-        Some(self.byte_len)
     }
 }
 
@@ -291,20 +253,16 @@ pub async fn resolve_track(
         .ok_or_else(|| anyhow!("part {} does not exist", part_index + 1))?;
 
     let player = resolve_player_info(client, bvid, page.cid, &referer).await?;
-    let media_url = match best_probeable_media_url(client, player, &referer).await {
+    let media_url = match select_media_url(player) {
         Ok(url) => url,
         Err(err) => {
             let legacy = resolve_player_info_legacy(client, bvid, page.cid, &referer)
                 .await
                 .with_context(|| {
-                    format!(
-                        "play url had no decoder-supported media and legacy fallback failed: {err:#}"
-                    )
+                    format!("play url had no supported media and legacy fallback failed: {err:#}")
                 })?;
-            best_probeable_media_url(client, legacy, &referer).await.with_context(|| {
-                format!(
-                    "legacy play url had no decoder-supported media after WBI media failure: {err:#}"
-                )
+            select_media_url(legacy).with_context(|| {
+                format!("legacy play url had no supported media after WBI media failure: {err:#}")
             })?
         }
     };
@@ -401,37 +359,17 @@ async fn resolve_player_info_legacy(
         .await
 }
 
-async fn best_probeable_media_url(
-    client: &Client,
-    player: BilibiliPlayerInfo,
-    referer: &str,
-) -> Result<String> {
-    let candidates = media_candidates(player)?;
-    let mut errors = Vec::new();
-    for candidate in candidates {
-        match probe_media_decoder(client, referer, &candidate.url).await {
-            Ok(()) => return Ok(candidate.url),
-            Err(err) => errors.push(format!("{}: {err:#}", candidate.url)),
-        }
-    }
-
-    bail!(
-        "bilibili media stream with decoder-supported audio does not exist{}",
-        if errors.is_empty() {
-            String::new()
-        } else {
-            format!("; rejected candidates: {}", errors.join(" | "))
-        }
-    )
-}
-
-#[cfg(test)]
-fn best_media_url(player: BilibiliPlayerInfo) -> Result<String> {
+fn select_media_url(player: BilibiliPlayerInfo) -> Result<String> {
     media_candidates(player)?
         .into_iter()
         .next()
         .map(|candidate| candidate.url)
-        .ok_or_else(|| anyhow!("bilibili media stream with decoder-supported audio does not exist"))
+        .ok_or_else(|| anyhow!("bilibili media stream with supported audio does not exist"))
+}
+
+#[cfg(test)]
+fn best_media_url(player: BilibiliPlayerInfo) -> Result<String> {
+    select_media_url(player)
 }
 
 fn media_candidates(player: BilibiliPlayerInfo) -> Result<Vec<MediaCandidate>> {
@@ -472,78 +410,7 @@ fn media_candidates(player: BilibiliPlayerInfo) -> Result<Vec<MediaCandidate>> {
         }
     }
 
-    bail!("bilibili media stream with decoder-supported audio does not exist")
-}
-
-async fn probe_media_decoder(client: &Client, referer: &str, url: &str) -> Result<()> {
-    let response = client
-        .get(url)
-        .header(ACCEPT, BILIBILI_MEDIA_ACCEPT)
-        .header(RANGE, format!("bytes=0-{}", MEDIA_DECODER_PROBE_BYTES - 1))
-        .header(REFERER, referer)
-        .header("origin", BILIBILI_ORIGIN)
-        .send()
-        .await
-        .with_context(|| format!("failed to probe bilibili media decoder for {url}"))?;
-
-    let status = response.status();
-    let headers = response.headers().clone();
-    if !status.is_success() {
-        response
-            .error_for_status()
-            .context("bilibili media decoder probe failed")?;
-        unreachable!("non-success response returned Ok");
-    }
-    if status != StatusCode::PARTIAL_CONTENT && headers.get(CONTENT_RANGE).is_none() {
-        bail!("bilibili media decoder probe did not return an HTTP range response");
-    }
-
-    let bytes = response
-        .bytes()
-        .await
-        .context("failed to read bilibili media decoder probe")?;
-    if bytes.is_empty() {
-        bail!("bilibili media decoder probe returned no bytes");
-    }
-
-    probe_media_decoder_bytes(bytes.to_vec())
-}
-
-fn probe_media_decoder_bytes(bytes: Vec<u8>) -> Result<()> {
-    let source = ProbeMediaSource::new(bytes);
-    let mss = MediaSourceStream::new(Box::new(source), Default::default());
-    let mut hint = Hint::new();
-    hint.with_extension("m4a");
-
-    let probed = get_probe()
-        .probe(
-            &hint,
-            mss,
-            FormatOptions::default(),
-            MetadataOptions::default(),
-        )
-        .context("failed to probe bilibili media container")?;
-    let format = probed;
-    let track = format
-        .tracks()
-        .iter()
-        .find(|track| {
-            matches!(
-                track.codec_params,
-                Some(CodecParameters::Audio(ref params))
-                    if params.codec != CODEC_ID_NULL_AUDIO
-            )
-        })
-        .ok_or_else(|| anyhow!("bilibili media does not contain supported audio parameters"))?;
-    let codec_params = match track.codec_params.clone() {
-        Some(CodecParameters::Audio(params)) => params,
-        _ => bail!("bilibili media does not contain audio codec parameters"),
-    };
-
-    get_codecs()
-        .make_audio_decoder(&codec_params, &AudioDecoderOptions::default())
-        .context("failed to create bilibili media audio decoder")?;
-    Ok(())
+    bail!("bilibili media stream with supported audio does not exist")
 }
 
 #[cfg(test)]
@@ -1004,6 +871,31 @@ mod tests {
         assert_eq!(
             best_media_url(player).unwrap(),
             "https://example.test/video.mp4"
+        );
+    }
+
+    #[cfg(feature = "fdk-aac-decoder")]
+    #[test]
+    fn best_media_url_accepts_he_aac_with_fdk_decoder() {
+        let player = BilibiliPlayerInfo {
+            dash: Some(BilibiliDash {
+                audio: Some(vec![BilibiliAudio {
+                    id: 30280,
+                    bandwidth: Some(192),
+                    codecs: Some("mp4a.40.5".to_string()),
+                    base_url_camel: Some("https://example.test/he-aac.m4s".to_string()),
+                    base_url_snake: None,
+                }]),
+            }),
+            durl: Some(vec![BilibiliDurl {
+                url: "https://example.test/fallback.mp4".to_string(),
+                backup_url: None,
+            }]),
+        };
+
+        assert_eq!(
+            best_media_url(player).unwrap(),
+            "https://example.test/he-aac.m4s"
         );
     }
 

@@ -5,26 +5,28 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use cpal::traits::{DeviceTrait, HostTrait};
 use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player, Source};
+#[cfg(not(feature = "fdk-aac-decoder"))]
+use symphonia::default::get_codecs;
 use symphonia::{
     core::{
-        codecs::{
-            CodecParameters,
-            audio::{AudioDecoderOptions, CODEC_ID_NULL_AUDIO},
-        },
+        audio::SampleBuffer,
+        codecs::{CODEC_TYPE_NULL, CodecParameters, CodecRegistry, Decoder, DecoderOptions},
         errors::Error as SymphoniaError,
-        formats::{FormatOptions, SeekMode, SeekTo, probe::Hint},
+        formats::{FormatOptions, SeekMode, SeekTo, Track},
         io::{MediaSource, MediaSourceStream},
         meta::MetadataOptions,
+        probe::Hint,
         units::Time,
     },
-    default::{get_codecs, get_probe},
+    default::get_probe,
 };
 use tokio::sync::mpsc;
 
@@ -43,6 +45,8 @@ pub struct AudioPlayer {
     position_ms: u64,
     started_at_micros: i64,
     playing: bool,
+    output_device_id: Option<String>,
+    device_watcher: AudioDeviceWatcher,
     volume: Arc<AtomicU32>,
     event_tx: mpsc::UnboundedSender<AudioPlayerEvent>,
     event_rx: mpsc::UnboundedReceiver<AudioPlayerEvent>,
@@ -83,6 +87,7 @@ struct MemoryMediaSource {
 
 struct StreamingMediaSource {
     shared: SharedBytes,
+    decoder: DecodeToken,
     cursor: u64,
 }
 
@@ -125,10 +130,28 @@ struct StreamingPcmState {
 struct StreamingSession {
     session_id: String,
     track_id: String,
+    track: PlaybackTrack,
     duration_ms: u64,
     pcm: SharedPcm,
     bytes: SharedBytes,
+    decoder: DecodeToken,
     position_ms: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+struct DecodeToken {
+    canceled: Arc<AtomicBool>,
+}
+
+struct AudioDeviceWatcher {
+    known_device_id: Option<String>,
+    last_checked: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutputDeviceChange {
+    previous: Option<String>,
+    current: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +178,10 @@ pub enum AudioPlayerEvent {
     OutputDeviceError {
         error: String,
     },
+    OutputDeviceChanged {
+        previous: Option<String>,
+        current: Option<String>,
+    },
     Ended {
         session_id: String,
         track_id: String,
@@ -164,6 +191,7 @@ pub enum AudioPlayerEvent {
 impl AudioPlayer {
     pub fn new() -> Result<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let output_device_id = default_output_device_id();
         let stream = open_default_output(event_tx.clone())?;
         Ok(Self {
             stream,
@@ -175,6 +203,8 @@ impl AudioPlayer {
             position_ms: 0,
             started_at_micros: 0,
             playing: false,
+            output_device_id: output_device_id.clone(),
+            device_watcher: AudioDeviceWatcher::new(output_device_id),
             volume: Arc::new(AtomicU32::new(volume_percent_to_gain(100).to_bits())),
             event_tx,
             event_rx,
@@ -290,7 +320,7 @@ impl AudioPlayer {
         position_ms: u64,
     ) -> Result<()> {
         let position_ms = position_ms.min(track.duration_ms);
-        if let Some(session) = self.streaming.as_ref().filter(|session| {
+        if let Some(session) = self.streaming.as_mut().filter(|session| {
             session.session_id == session_id && session.track_id == track.track_id
         }) {
             self.track_id = Some(track.track_id.clone());
@@ -301,12 +331,7 @@ impl AudioPlayer {
             session.position_ms.store(position_ms, Ordering::Relaxed);
 
             let buffered_until_ms = session.pcm.buffered_until_ms().min(track.duration_ms);
-            if stream_ready_for_position(
-                position_ms,
-                track.duration_ms,
-                buffered_until_ms,
-                session.pcm.is_complete(),
-            ) {
+            if stream_pcm_ready_for_position(&session.pcm, position_ms, track.duration_ms) {
                 let _ = self.event_tx.send(AudioPlayerEvent::Prepared {
                     operation_id: operation_id.clone(),
                     session_id: session_id.clone(),
@@ -326,19 +351,28 @@ impl AudioPlayer {
                 return Ok(());
             }
 
-            if position_ms <= buffered_until_ms {
-                let _ = self
-                    .event_tx
-                    .send(AudioPlayerEvent::Cache(PlaybackCacheView {
-                        session_id,
-                        track_id: track.track_id,
-                        status: PlaybackCacheStatus::Buffering,
-                        buffered_until_ms,
-                        duration_ms: track.duration_ms,
-                        error: None,
-                    }));
-                return Ok(());
+            if position_ms < session.pcm.base_position_ms() || position_ms > buffered_until_ms {
+                session.restart_decoder(
+                    operation_id.clone(),
+                    session_id.clone(),
+                    track.clone(),
+                    position_ms,
+                    self.event_tx.clone(),
+                );
             }
+
+            let buffered_until_ms = session.pcm.buffered_until_ms().min(track.duration_ms);
+            let _ = self
+                .event_tx
+                .send(AudioPlayerEvent::Cache(PlaybackCacheView {
+                    session_id,
+                    track_id: track.track_id,
+                    status: PlaybackCacheStatus::Buffering,
+                    buffered_until_ms,
+                    duration_ms: track.duration_ms,
+                    error: None,
+                }));
+            return Ok(());
         }
 
         if let Some(sink) = self.sink.take() {
@@ -357,13 +391,16 @@ impl AudioPlayer {
 
         let bytes = SharedBytes::new();
         let pcm = SharedPcm::new();
+        let decoder = DecodeToken::new();
         let position = Arc::new(AtomicU64::new(self.position_ms));
         let session = StreamingSession {
             session_id: session_id.clone(),
             track_id: track.track_id.clone(),
+            track: track.clone(),
             duration_ms: track.duration_ms,
             pcm: pcm.clone(),
             bytes: bytes.clone(),
+            decoder: decoder.clone(),
             position_ms: Arc::clone(&position),
         };
         self.streaming = Some(session);
@@ -400,10 +437,12 @@ impl AudioPlayer {
         let decode_tx = self.event_tx.clone();
         let decode_bytes = bytes;
         let decode_pcm = pcm;
+        let decode_token = decoder;
         tokio::task::spawn_blocking(move || {
             decode_streaming_audio(
                 decode_bytes,
                 decode_pcm,
+                decode_token,
                 decode_tx,
                 operation_id,
                 session_id,
@@ -417,6 +456,13 @@ impl AudioPlayer {
 
     pub fn drain_events(&mut self) -> Vec<AudioPlayerEvent> {
         let mut events = Vec::new();
+        if let Some(change) = self.device_watcher.poll(self.playing) {
+            self.output_device_id = change.current.clone();
+            events.push(AudioPlayerEvent::OutputDeviceChanged {
+                previous: change.previous,
+                current: change.current,
+            });
+        }
         while let Ok(event) = self.event_rx.try_recv() {
             events.push(event);
         }
@@ -425,7 +471,47 @@ impl AudioPlayer {
 
     pub fn seek(&mut self, position_ms: u64, playing: bool, now_micros: i64) -> Result<()> {
         if self.streaming.is_some() {
-            return self.restart_streaming(position_ms, playing);
+            let position_ms = position_ms.min(
+                self.streaming
+                    .as_ref()
+                    .map(|streaming| streaming.duration_ms)
+                    .unwrap_or(position_ms),
+            );
+            let ready = self.streaming.as_ref().is_some_and(|streaming| {
+                streaming.position_ms.store(position_ms, Ordering::Relaxed);
+                stream_pcm_ready_for_position(&streaming.pcm, position_ms, streaming.duration_ms)
+            });
+            self.position_ms = position_ms;
+            if ready {
+                return self.restart_streaming(position_ms, playing);
+            }
+
+            let cache_view = self.streaming.as_mut().map(|streaming| {
+                if position_ms < streaming.pcm.base_position_ms()
+                    || position_ms > streaming.pcm.buffered_until_ms().min(streaming.duration_ms)
+                {
+                    streaming.restart_decoder(
+                        None,
+                        streaming.session_id.clone(),
+                        streaming.track.clone(),
+                        position_ms,
+                        self.event_tx.clone(),
+                    );
+                }
+                PlaybackCacheView {
+                    session_id: streaming.session_id.clone(),
+                    track_id: streaming.track_id.clone(),
+                    status: PlaybackCacheStatus::Buffering,
+                    buffered_until_ms: streaming.pcm.buffered_until_ms().min(streaming.duration_ms),
+                    duration_ms: streaming.duration_ms,
+                    error: None,
+                }
+            });
+            self.playing = false;
+            if let Some(view) = cache_view {
+                let _ = self.event_tx.send(AudioPlayerEvent::Cache(view));
+            }
+            return Ok(());
         }
         self.restart(position_ms, playing, now_micros)
     }
@@ -440,7 +526,27 @@ impl AudioPlayer {
                     sink.pause();
                 }
             } else if playing {
-                self.restart_streaming(self.position_ms(now_micros), true)?;
+                let position_ms = self.position_ms(now_micros);
+                if self.streaming.as_ref().is_some_and(|session| {
+                    stream_pcm_ready_for_position(&session.pcm, position_ms, session.duration_ms)
+                }) {
+                    self.restart_streaming(position_ms, true)?;
+                } else if let Some(session) = &self.streaming {
+                    self.playing = false;
+                    let _ = self
+                        .event_tx
+                        .send(AudioPlayerEvent::Cache(PlaybackCacheView {
+                            session_id: session.session_id.clone(),
+                            track_id: session.track_id.clone(),
+                            status: PlaybackCacheStatus::Buffering,
+                            buffered_until_ms: session
+                                .pcm
+                                .buffered_until_ms()
+                                .min(session.duration_ms),
+                            duration_ms: session.duration_ms,
+                            error: None,
+                        }));
+                }
             }
             return Ok(());
         }
@@ -487,17 +593,14 @@ impl AudioPlayer {
         self.reopen_output_device()?;
 
         if self.streaming.is_some() {
-            if self
-                .streaming
-                .as_ref()
-                .and_then(|session| session.pcm.spec())
-                .is_some()
-            {
+            if self.streaming.as_ref().is_some_and(|session| {
+                stream_pcm_ready_for_position(&session.pcm, position_ms, session.duration_ms)
+            }) {
                 self.restart_streaming(position_ms, playing)?;
                 return Ok(true);
             }
             self.position_ms = position_ms;
-            self.playing = false;
+            self.playing = playing;
             return Ok(false);
         }
 
@@ -600,6 +703,9 @@ impl AudioPlayer {
     fn reopen_output_device(&mut self) -> Result<()> {
         let stream = open_default_output(self.event_tx.clone())?;
         self.stream = stream;
+        self.output_device_id = default_output_device_id();
+        self.device_watcher
+            .reset(self.output_device_id.clone(), Instant::now());
         Ok(())
     }
 }
@@ -618,6 +724,63 @@ fn open_default_output(
         .context("failed to open default audio output")
 }
 
+fn default_output_device_id() -> Option<String> {
+    cpal::default_host()
+        .default_output_device()
+        .and_then(|device| device.id().ok())
+        .map(|id| id.to_string())
+}
+
+impl AudioDeviceWatcher {
+    const PLAYING_INTERVAL: Duration = Duration::from_secs(1);
+    const IDLE_INTERVAL: Duration = Duration::from_secs(5);
+
+    fn new(known_device_id: Option<String>) -> Self {
+        Self {
+            known_device_id,
+            last_checked: Instant::now(),
+        }
+    }
+
+    fn poll(&mut self, playing: bool) -> Option<OutputDeviceChange> {
+        let now = Instant::now();
+        let interval = if playing {
+            Self::PLAYING_INTERVAL
+        } else {
+            Self::IDLE_INTERVAL
+        };
+        if now.saturating_duration_since(self.last_checked) < interval {
+            return None;
+        }
+        self.last_checked = now;
+        self.observe(default_output_device_id())
+    }
+
+    fn reset(&mut self, known_device_id: Option<String>, now: Instant) {
+        self.known_device_id = known_device_id;
+        self.last_checked = now;
+    }
+
+    fn observe(&mut self, current: Option<String>) -> Option<OutputDeviceChange> {
+        output_device_change(&mut self.known_device_id, current)
+    }
+}
+
+fn output_device_change(
+    previous: &mut Option<String>,
+    current: Option<String>,
+) -> Option<OutputDeviceChange> {
+    if *previous == current {
+        return None;
+    }
+    let change = OutputDeviceChange {
+        previous: previous.clone(),
+        current: current.clone(),
+    };
+    *previous = current;
+    Some(change)
+}
+
 pub fn volume_percent_to_gain(percent: u8) -> f32 {
     (percent.min(100) as f32) / 100.0
 }
@@ -633,6 +796,63 @@ fn stream_ready_for_position(
         .saturating_add(media_cache::READY_WINDOW_MS)
         .min(duration_ms);
     buffered_until_ms >= ready_until || (complete && buffered_until_ms >= position_ms)
+}
+
+fn stream_pcm_ready_for_position(pcm: &SharedPcm, position_ms: u64, duration_ms: u64) -> bool {
+    position_ms >= pcm.base_position_ms()
+        && pcm.spec().is_some()
+        && stream_ready_for_position(
+            position_ms,
+            duration_ms,
+            pcm.buffered_until_ms().min(duration_ms),
+            pcm.is_complete(),
+        )
+}
+
+fn is_audio_track(track: &Track) -> bool {
+    track.codec_params.codec != CODEC_TYPE_NULL
+        && (track.codec_params.channels.is_some() || track.codec_params.sample_rate.is_some())
+}
+
+fn make_audio_decoder(
+    codec_params: &CodecParameters,
+    decoder_opts: &DecoderOptions,
+) -> symphonia::core::errors::Result<Box<dyn Decoder>> {
+    codec_registry().make(codec_params, decoder_opts)
+}
+
+fn decoded_to_interleaved_f32(decoded: symphonia::core::audio::AudioBufferRef<'_>) -> Vec<f32> {
+    let spec = *decoded.spec();
+    let mut sample_buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+    sample_buffer.copy_interleaved_ref(decoded);
+    sample_buffer.samples().to_vec()
+}
+
+#[cfg(not(feature = "fdk-aac-decoder"))]
+fn codec_registry() -> &'static CodecRegistry {
+    get_codecs()
+}
+
+#[cfg(feature = "fdk-aac-decoder")]
+fn codec_registry() -> &'static CodecRegistry {
+    use std::sync::OnceLock;
+
+    static REGISTRY: OnceLock<CodecRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let mut registry = CodecRegistry::new();
+        registry.register_all::<symphonia_adapter_fdk_aac::AacDecoder>();
+        registry
+    })
+}
+
+#[cfg(all(test, not(feature = "fdk-aac-decoder")))]
+fn decoder_backend_name() -> &'static str {
+    "symphonia-native-aac"
+}
+
+#[cfg(all(test, feature = "fdk-aac-decoder"))]
+fn decoder_backend_name() -> &'static str {
+    "fdk-aac"
 }
 
 impl DecodedAudio {
@@ -855,14 +1075,18 @@ impl MediaSource for MemoryMediaSource {
 }
 
 impl StreamingMediaSource {
-    fn new(shared: SharedBytes) -> Self {
-        Self { shared, cursor: 0 }
+    fn new(shared: SharedBytes, decoder: DecodeToken) -> Self {
+        Self {
+            shared,
+            decoder,
+            cursor: 0,
+        }
     }
 }
 
 impl Read for StreamingMediaSource {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let bytes = self.shared.read_at(self.cursor, buf)?;
+        let bytes = self.shared.read_at(self.cursor, buf, &self.decoder)?;
         self.cursor = self.cursor.saturating_add(bytes as u64);
         Ok(bytes)
     }
@@ -896,6 +1120,22 @@ impl MediaSource for StreamingMediaSource {
 
     fn byte_len(&self) -> Option<u64> {
         self.shared.total_bytes()
+    }
+}
+
+impl DecodeToken {
+    fn new() -> Self {
+        Self {
+            canceled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn cancel(&self) {
+        self.canceled.store(true, Ordering::Relaxed);
+    }
+
+    fn is_canceled(&self) -> bool {
+        self.canceled.load(Ordering::Relaxed)
     }
 }
 
@@ -1026,7 +1266,12 @@ impl SharedBytes {
             .contiguous_until(0)
     }
 
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read_at(
+        &self,
+        offset: u64,
+        buf: &mut [u8],
+        decoder: &DecodeToken,
+    ) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -1034,7 +1279,7 @@ impl SharedBytes {
         let (lock, condvar) = &*self.inner;
         let mut state = lock.lock().expect("streaming bytes lock poisoned");
         loop {
-            if state.canceled {
+            if state.canceled || decoder.is_canceled() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Interrupted,
                     "stream canceled",
@@ -1062,11 +1307,14 @@ impl SharedBytes {
             if state.complete {
                 return Ok(0);
             }
-            state.requested_offset = Some(offset);
+            if !decoder.is_canceled() {
+                state.requested_offset = Some(offset);
+            }
             condvar.notify_all();
-            state = condvar
-                .wait(state)
+            let (next, _) = condvar
+                .wait_timeout(state, Duration::from_millis(250))
                 .expect("streaming bytes lock poisoned while waiting");
+            state = next;
         }
     }
 }
@@ -1215,8 +1463,48 @@ impl SharedPcm {
 
 impl StreamingSession {
     fn cancel(self) {
+        self.decoder.cancel();
         self.bytes.cancel();
         self.pcm.cancel();
+    }
+
+    fn restart_decoder(
+        &mut self,
+        operation_id: Option<String>,
+        session_id: String,
+        track: PlaybackTrack,
+        position_ms: u64,
+        event_tx: mpsc::UnboundedSender<AudioPlayerEvent>,
+    ) {
+        self.decoder.cancel();
+        self.pcm.cancel();
+
+        let pcm = SharedPcm::new();
+        let decoder = DecodeToken::new();
+        self.track_id = track.track_id.clone();
+        self.track = track.clone();
+        self.duration_ms = track.duration_ms;
+        self.pcm = pcm.clone();
+        self.decoder = decoder.clone();
+        self.position_ms.store(position_ms, Ordering::Relaxed);
+        if let Some(total) = self.bytes.total_bytes() {
+            let seek_window = media_cache::range_for_window(position_ms, track.duration_ms, total);
+            self.bytes.request_offset(seek_window.start);
+        }
+
+        let bytes = self.bytes.clone();
+        tokio::task::spawn_blocking(move || {
+            decode_streaming_audio(
+                bytes,
+                pcm,
+                decoder,
+                event_tx,
+                operation_id,
+                session_id,
+                track,
+                position_ms,
+            );
+        });
     }
 }
 
@@ -1230,29 +1518,19 @@ fn decode_audio(audio: Arc<[u8]>) -> Result<DecodedAudio> {
     let format_opts = FormatOptions::default();
     let metadata_opts = MetadataOptions::default();
     let probed = get_probe()
-        .probe(&hint, mss, format_opts, metadata_opts)
+        .format(&hint, mss, &format_opts, &metadata_opts)
         .context("failed to probe audio format")?;
 
-    let mut format = probed;
+    let mut format = probed.format;
     let track = format
         .tracks()
         .iter()
-        .find(|track| {
-            matches!(
-                track.codec_params,
-                Some(CodecParameters::Audio(ref params))
-                    if params.codec != CODEC_ID_NULL_AUDIO
-            )
-        })
+        .find(|track| is_audio_track(track))
         .ok_or_else(|| anyhow!("audio stream does not contain a supported track"))?;
     let track_id = track.id;
-    let codec_params = match track.codec_params.clone() {
-        Some(CodecParameters::Audio(params)) => params,
-        _ => bail!("audio stream does not contain audio codec parameters"),
-    };
-    let decoder_opts = AudioDecoderOptions::default();
-    let mut decoder = get_codecs()
-        .make_audio_decoder(&codec_params, &decoder_opts)
+    let codec_params = track.codec_params.clone();
+    let decoder_opts = DecoderOptions::default();
+    let mut decoder = make_audio_decoder(&codec_params, &decoder_opts)
         .context("failed to create audio decoder")?;
 
     let mut channels = None;
@@ -1263,8 +1541,7 @@ fn decode_audio(audio: Arc<[u8]>) -> Result<DecodedAudio> {
 
     loop {
         let packet = match format.next_packet() {
-            Ok(Some(packet)) => packet,
-            Ok(None) => break,
+            Ok(packet) => packet,
             Err(SymphoniaError::IoError(err))
                 if err.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
@@ -1278,16 +1555,16 @@ fn decode_audio(audio: Arc<[u8]>) -> Result<DecodedAudio> {
             format.metadata().pop();
         }
 
-        if packet.track_id != track_id {
+        if packet.track_id() != track_id {
             continue;
         }
 
         match decoder.decode(&packet) {
             Ok(decoded) => {
                 let spec = decoded.spec();
-                let packet_channels = NonZeroU16::new(spec.channels().count() as u16)
+                let packet_channels = NonZeroU16::new(spec.channels.count() as u16)
                     .ok_or_else(|| anyhow!("decoded audio has invalid channel count"))?;
-                let packet_sample_rate = NonZeroU32::new(spec.rate())
+                let packet_sample_rate = NonZeroU32::new(spec.rate)
                     .ok_or_else(|| anyhow!("decoded audio has invalid sample rate"))?;
 
                 match (channels, sample_rate) {
@@ -1302,8 +1579,7 @@ fn decode_audio(audio: Arc<[u8]>) -> Result<DecodedAudio> {
                     }
                 }
 
-                let mut packet_samples = Vec::new();
-                decoded.copy_to_vec_interleaved::<f32>(&mut packet_samples);
+                let packet_samples = decoded_to_interleaved_f32(decoded);
                 samples.extend(packet_samples);
                 decode_errors = 0;
             }
@@ -1413,6 +1689,7 @@ fn write_cache_chunk(path: &PathBuf, start: u64, bytes: &[u8]) -> Result<()> {
 fn decode_streaming_audio(
     bytes: SharedBytes,
     pcm: SharedPcm,
+    decoder_token: DecodeToken,
     event_tx: mpsc::UnboundedSender<AudioPlayerEvent>,
     operation_id: Option<String>,
     session_id: String,
@@ -1422,6 +1699,7 @@ fn decode_streaming_audio(
     if let Err(err) = decode_streaming_audio_inner(
         bytes,
         pcm.clone(),
+        decoder_token,
         event_tx.clone(),
         operation_id.clone(),
         session_id.clone(),
@@ -1443,13 +1721,14 @@ fn decode_streaming_audio(
 fn decode_streaming_audio_inner(
     bytes: SharedBytes,
     pcm: SharedPcm,
+    decoder_token: DecodeToken,
     event_tx: mpsc::UnboundedSender<AudioPlayerEvent>,
     operation_id: Option<String>,
     session_id: String,
     track: PlaybackTrack,
     position_ms: u64,
 ) -> Result<()> {
-    let source = StreamingMediaSource::new(bytes);
+    let source = StreamingMediaSource::new(bytes, decoder_token.clone());
     let mss = MediaSourceStream::new(Box::new(source), Default::default());
 
     let mut hint = Hint::new();
@@ -1458,29 +1737,19 @@ fn decode_streaming_audio_inner(
     let format_opts = FormatOptions::default();
     let metadata_opts = MetadataOptions::default();
     let probed = get_probe()
-        .probe(&hint, mss, format_opts, metadata_opts)
+        .format(&hint, mss, &format_opts, &metadata_opts)
         .context("failed to probe streaming audio format")?;
 
-    let mut format = probed;
+    let mut format = probed.format;
     let track_info = format
         .tracks()
         .iter()
-        .find(|track| {
-            matches!(
-                track.codec_params,
-                Some(CodecParameters::Audio(ref params))
-                    if params.codec != CODEC_ID_NULL_AUDIO
-            )
-        })
+        .find(|track| is_audio_track(track))
         .ok_or_else(|| anyhow!("streaming audio does not contain a supported track"))?;
     let track_id = track_info.id;
-    let codec_params = match track_info.codec_params.clone() {
-        Some(CodecParameters::Audio(params)) => params,
-        _ => bail!("streaming audio does not contain audio codec parameters"),
-    };
-    let decoder_opts = AudioDecoderOptions::default();
-    let mut decoder = get_codecs()
-        .make_audio_decoder(&codec_params, &decoder_opts)
+    let codec_params = track_info.codec_params.clone();
+    let decoder_opts = DecoderOptions::default();
+    let mut decoder = make_audio_decoder(&codec_params, &decoder_opts)
         .context("failed to create streaming audio decoder")?;
     let decode_base_position_ms =
         seek_streaming_format(&mut *format, track_id, position_ms).unwrap_or(0);
@@ -1495,9 +1764,12 @@ fn decode_streaming_audio_inner(
     let mut first_decode_error = None;
 
     loop {
+        if decoder_token.is_canceled() {
+            return Ok(());
+        }
+
         let packet = match format.next_packet() {
-            Ok(Some(packet)) => packet,
-            Ok(None) => break,
+            Ok(packet) => packet,
             Err(SymphoniaError::IoError(err))
                 if err.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
@@ -1514,21 +1786,20 @@ fn decode_streaming_audio_inner(
             format.metadata().pop();
         }
 
-        if packet.track_id != track_id {
+        if packet.track_id() != track_id {
             continue;
         }
 
         match decoder.decode(&packet) {
             Ok(decoded) => {
                 let spec = decoded.spec();
-                let channels = NonZeroU16::new(spec.channels().count() as u16)
+                let channels = NonZeroU16::new(spec.channels.count() as u16)
                     .ok_or_else(|| anyhow!("decoded streaming audio has invalid channel count"))?;
-                let sample_rate = NonZeroU32::new(spec.rate())
+                let sample_rate = NonZeroU32::new(spec.rate)
                     .ok_or_else(|| anyhow!("decoded streaming audio has invalid sample rate"))?;
                 pcm.set_spec(channels, sample_rate)?;
 
-                let mut packet_samples = Vec::new();
-                decoded.copy_to_vec_interleaved::<f32>(&mut packet_samples);
+                let packet_samples = decoded_to_interleaved_f32(decoded);
                 pcm.push_samples(&packet_samples);
                 decode_errors = 0;
 
@@ -1623,7 +1894,7 @@ fn seek_streaming_format(
         return Some(0);
     }
 
-    let time = Time::try_from_secs_f64(position_ms as f64 / 1000.0)?;
+    let time = time_from_millis(position_ms);
     format
         .seek(
             SeekMode::Accurate,
@@ -1634,6 +1905,10 @@ fn seek_streaming_format(
         )
         .ok()
         .map(|_| position_ms)
+}
+
+fn time_from_millis(position_ms: u64) -> Time {
+    Time::new(position_ms / 1000, (position_ms % 1000) as f64 / 1000.0)
 }
 
 #[cfg(test)]
@@ -1681,6 +1956,18 @@ mod tests {
         assert!(stream_ready_for_position(30_000, 120_000, 45_000, false));
         assert!(!stream_ready_for_position(30_000, 120_000, 39_000, false));
         assert!(stream_ready_for_position(118_000, 120_000, 120_000, true));
+    }
+
+    #[cfg(not(feature = "fdk-aac-decoder"))]
+    #[test]
+    fn decoder_backend_defaults_to_native_aac() {
+        assert_eq!(decoder_backend_name(), "symphonia-native-aac");
+    }
+
+    #[cfg(feature = "fdk-aac-decoder")]
+    #[test]
+    fn decoder_backend_uses_fdk_feature() {
+        assert_eq!(decoder_backend_name(), "fdk-aac");
     }
 
     #[test]
@@ -1748,7 +2035,19 @@ mod tests {
     fn shared_bytes_wakes_readers_on_cancel() {
         let bytes = SharedBytes::new();
         bytes.cancel();
-        let mut source = StreamingMediaSource::new(bytes);
+        let mut source = StreamingMediaSource::new(bytes, DecodeToken::new());
+        let mut buf = [0_u8; 1];
+
+        let err = source.read(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn shared_bytes_wakes_readers_on_decoder_cancel() {
+        let bytes = SharedBytes::new();
+        let decoder = DecodeToken::new();
+        decoder.cancel();
+        let mut source = StreamingMediaSource::new(bytes, decoder);
         let mut buf = [0_u8; 1];
 
         let err = source.read(&mut buf).unwrap_err();
@@ -1765,7 +2064,10 @@ mod tests {
         );
         let mut buf = [0_u8; 2];
 
-        assert_eq!(bytes.read_at(501, &mut buf).unwrap(), 2);
+        assert_eq!(
+            bytes.read_at(501, &mut buf, &DecodeToken::new()).unwrap(),
+            2
+        );
         assert_eq!(buf, [11, 12]);
     }
 
@@ -1779,6 +2081,48 @@ mod tests {
         );
         let mut buf = [0_u8; 2];
 
-        assert_eq!(bytes.read_at(1_000, &mut buf).unwrap(), 0);
+        assert_eq!(
+            bytes.read_at(1_000, &mut buf, &DecodeToken::new()).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn output_device_change_tracks_default_output_id_changes() {
+        let mut previous = Some("speaker".to_string());
+
+        assert_eq!(
+            output_device_change(&mut previous, Some("speaker".to_string())),
+            None
+        );
+        assert_eq!(
+            output_device_change(&mut previous, Some("headphones".to_string())),
+            Some(OutputDeviceChange {
+                previous: Some("speaker".to_string()),
+                current: Some("headphones".to_string()),
+            })
+        );
+        assert_eq!(previous, Some("headphones".to_string()));
+        assert_eq!(
+            output_device_change(&mut previous, None),
+            Some(OutputDeviceChange {
+                previous: Some("headphones".to_string()),
+                current: None,
+            })
+        );
+        assert_eq!(previous, None);
+    }
+
+    #[test]
+    fn pcm_ready_requires_target_inside_current_window() {
+        let pcm = SharedPcm::new();
+        pcm.set_base_position(60_000);
+        pcm.set_spec(NonZeroU16::new(1).unwrap(), NonZeroU32::new(1_000).unwrap())
+            .unwrap();
+        pcm.push_samples(&vec![0.0; 20_000]);
+
+        assert!(stream_pcm_ready_for_position(&pcm, 62_000, 120_000));
+        assert!(!stream_pcm_ready_for_position(&pcm, 30_000, 120_000));
+        assert!(!stream_pcm_ready_for_position(&pcm, 79_000, 120_000));
     }
 }

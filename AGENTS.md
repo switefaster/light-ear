@@ -35,6 +35,7 @@ boundaries:
 - `cargo check --bin link-ear-relay`
 - `cargo check --manifest-path src-tauri\Cargo.toml`
 - `npm.cmd run build`
+- Optional local AAC enhancement check: `cargo check --features fdk-aac-decoder`
 
 For relay promotion policy or rendezvous behavior, include
 `cargo check --bin link-ear-relay`. For desktop bridge work, include the Tauri
@@ -69,6 +70,15 @@ guardrail:
 - Bilibili/audio streaming prepare runs off the main swarm event loop. Range
   download and Symphonia decode events must be checked by session id, operation
   id, and track id before they affect playback or buffer quorum.
+- Bilibili resolve should select plausible media URLs only. Do not add a
+  resolve-time decoder probe that can reject otherwise usable tracks because of
+  partial Range metadata, missing `moov`, or decoder-specific AAC limitations;
+  decode failures belong to streaming prepare and must converge there.
+- AAC decoding defaults to Symphonia's native decoder on the normal build. The
+  optional `fdk-aac-decoder` feature registers the FDK AAC Symphonia adapter
+  instead and must stay opt-in because it brings native/library licensing
+  constraints. Do not register native AAC and FDK AAC in the same codec
+  registry.
 - Long-video playback uses short-lived buffer coordination around the existing
   authoritative `PlaybackState`. `PlaybackBufferPrepare`,
   `PlaybackBufferStatus`, and `PlaybackBufferCancel` are temporary quorum and
@@ -89,7 +99,8 @@ guardrail:
   may start once the requested position has a ready playback window. Seek beyond
   the decoded window should restart streaming prepare at the target position and
   prioritize the requested byte range instead of waiting for earlier sequential
-  download progress to catch up.
+  download progress to catch up. Preserve the existing byte cache while
+  replacing only the stale decoder/PCM window when possible.
 - Active playback buffer health is temporary coordination, not room truth.
   `PlaybackBufferHealth` lets the leader pause when a strict majority of real
   room peers falls below the low watermark for the grace window, then resume
@@ -105,8 +116,10 @@ guardrail:
   state arrives.
 - Local audio output device errors, such as headphone hotplug or default-device
   changes, should reopen the default output and reattach the current sink when
-  possible. This is local recovery and must not publish room playback changes or
-  mark the media session failed by itself.
+  possible. The player also polls the cross-platform default output device id
+  while active (about 1s) and idle (about 5s) to notice default-device changes
+  without platform-specific listeners. This is local recovery and must not
+  publish room playback changes or mark the media session failed by itself.
 - Each peer may cast only one ballot per vote. Votes should resolve early when
   they reach majority or when remaining pending peers can no longer make the
   vote pass. UI vote views should expose approvals, rejections, pending count,

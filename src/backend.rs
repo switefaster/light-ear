@@ -3689,6 +3689,38 @@ async fn handle_audio_player_events(
                     }
                 }
             }
+            player::AudioPlayerEvent::OutputDeviceChanged { previous, current } => {
+                send_status(
+                    ui,
+                    format!(
+                        "audio output device changed from {} to {}; reopening output",
+                        previous.as_deref().unwrap_or("none"),
+                        current.as_deref().unwrap_or("none")
+                    ),
+                )
+                .await;
+                match audio_player
+                    .as_mut()
+                    .map(|player| player.recover_output_device(current_timestamp_micros()))
+                {
+                    Some(Ok(true)) => {
+                        send_status(
+                            ui,
+                            "audio output reopened and playback reattached".to_string(),
+                        )
+                        .await;
+                    }
+                    Some(Ok(false)) => {
+                        send_status(ui, "audio output reopened".to_string()).await;
+                    }
+                    Some(Err(err)) => {
+                        send_status(ui, format!("audio output recovery failed: {err:#}")).await;
+                    }
+                    None => {
+                        send_status(ui, "audio output unavailable".to_string()).await;
+                    }
+                }
+            }
             player::AudioPlayerEvent::Ended {
                 session_id,
                 track_id,

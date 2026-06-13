@@ -59,9 +59,14 @@ The desktop path is the primary product path. The legacy terminal UI has been re
 - `src/bilibili.rs`
   - Bilibili resolve and signing helpers.
   - Prefer deterministic helper tests for URL/signature/media selection changes.
+  - Resolve selects plausible media URLs and does not run decoder probes; decode
+    failures converge through streaming prepare.
 - `src/player.rs`
   - Local audio output, volume/position control, HTTP Range streaming prepare, background decode, and local cache progress events.
   - Volume is local-only and must not enter shared playback wire state.
+  - The default build uses Symphonia native AAC. The opt-in
+    `fdk-aac-decoder` feature swaps in the FDK AAC Symphonia adapter for
+    broader AAC support.
 - `src/playback_health.rs`
   - Internal active-playback buffer-health quorum state for majority-loss pause decisions.
 
@@ -216,7 +221,9 @@ Current rules:
 
 Playback does not stream audio from peer to peer. Each client resolves and streams audio locally from Bilibili using HTTP Range requests.
 
-The resolver prefers DASH audio and can fall back to single-file `durl` media. WBI signing and media selection helpers have deterministic unit tests. If a playurl response is HTTP 412 or contains no usable media URL, the backend tries the legacy playurl path before surfacing failure.
+The resolver prefers DASH audio and can fall back to single-file `durl` media. WBI signing and media selection helpers have deterministic unit tests. If a playurl response is HTTP 412 or contains no usable media URL, the backend tries the legacy playurl path before surfacing failure. Resolve does not download a partial media Range to prove decoder support; partial metadata and AAC decoder limits are handled by streaming prepare so a valid queue item is not rejected too early.
+
+AAC decoding is feature-gated. Default builds use Symphonia's native AAC decoder and only prefer AAC-LC media (`mp4a.40.2`). `cargo check --features fdk-aac-decoder` enables `symphonia-adapter-fdk-aac`, registers its AAC decoder instead of native AAC, and allows HE-AAC candidates (`mp4a.40.5` / `mp4a.40.29`). This feature is not part of the default CI path because it introduces native FDK AAC build and licensing constraints.
 
 Range fetch and decode run outside the main swarm event loop. Skip/cancel/vote messages can arrive while media work is in flight. Player events must be checked against the current session id, operation id, and track id before changing quorum or playback state.
 
@@ -230,13 +237,17 @@ silently falling back to a full in-memory download.
 Audio output device errors are local recoverable events. When the rodio/cpal
 stream reports an error, the backend reopens the current default output device
 and reattaches the current sink at the local playback position when possible.
-This recovery must not publish a room playback change or mark the media session
-failed by itself.
+The player also polls the default output device id every second while playing
+and every five seconds while idle, which provides a cross-platform default
+device change watcher without platform-specific callbacks. This recovery must
+not publish a room playback change or mark the media session failed by itself.
 
 When seek targets a position outside the decoded window, the player restarts the
 streaming prepare at that target and prioritizes the byte ranges requested by
 the demuxer/decoder. It must not wait for earlier sequential download progress
-to naturally reach the new position.
+to naturally reach the new position. Existing downloaded byte ranges are kept;
+only the stale decoder token and PCM window are replaced when the track/session
+matches.
 
 ## Frontend Contract
 
