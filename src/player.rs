@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use cpal::traits::{DeviceTrait, HostTrait};
-use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player, Source};
+use rodio::{DeviceSinkBuilder, DeviceSinkError, MixerDeviceSink, Player, Source};
 #[cfg(not(feature = "fdk-aac-decoder"))]
 use symphonia::default::get_codecs;
 use symphonia::{
@@ -718,15 +718,50 @@ fn open_default_output(
     event_tx: mpsc::UnboundedSender<AudioPlayerEvent>,
 ) -> Result<MixerDeviceSink> {
     let diagnostics = default_output_diagnostics();
-    DeviceSinkBuilder::from_default_device()
-        .with_context(|| format!("failed to configure default audio output ({diagnostics})"))?
-        .with_error_callback(move |err| {
-            let _ = event_tx.send(AudioPlayerEvent::OutputDeviceError {
-                error: err.to_string(),
-            });
-        })
-        .open_sink_or_fallback()
-        .context("failed to open default audio output")
+    let callback = move |err: cpal::StreamError| {
+        let _ = event_tx.send(AudioPlayerEvent::OutputDeviceError {
+            error: err.to_string(),
+        });
+    };
+    open_default_sink_with_callback(callback)
+        .with_context(|| format!("failed to open default audio output ({diagnostics})"))
+}
+
+fn open_default_sink_with_callback<E>(callback: E) -> Result<MixerDeviceSink, DeviceSinkError>
+where
+    E: FnMut(cpal::StreamError) + Clone + Send + 'static,
+{
+    let original_error = match DeviceSinkBuilder::from_default_device() {
+        Ok(builder) => match builder
+            .with_error_callback(callback.clone())
+            .open_sink_or_fallback()
+        {
+            Ok(sink) => return Ok(sink),
+            Err(err) => err,
+        },
+        Err(err) => err,
+    };
+
+    let devices = match cpal::default_host().output_devices() {
+        Ok(devices) => devices,
+        Err(_) => return Err(original_error),
+    };
+
+    for device in devices.filter(|device| {
+        device
+            .description()
+            .map(|description| description.driver().is_some_and(|driver| driver != "null"))
+            .unwrap_or(false)
+    }) {
+        if let Ok(sink) = DeviceSinkBuilder::from_device(device)
+            .map(|builder| builder.with_error_callback(callback.clone()))
+            .and_then(|builder| builder.open_sink_or_fallback())
+        {
+            return Ok(sink);
+        }
+    }
+
+    Err(original_error)
 }
 
 fn default_output_device_id() -> Option<String> {

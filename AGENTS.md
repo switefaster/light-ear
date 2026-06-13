@@ -156,6 +156,10 @@ guardrail:
   preparation is active. Include host/default-device diagnostics in output-open
   errors so user logs identify missing default devices versus sink-open
   failures.
+- Open local audio output through the rodio default-sink fallback path. On Linux,
+  `DeviceSinkBuilder::from_default_device()` can fail while querying
+  `alsa:default` config even though another output device would work; keep the
+  fallback that enumerates alternative non-null output devices.
 - Each peer may cast only one ballot per vote. Votes should resolve early when
   they reach majority or when remaining pending peers can no longer make the
   vote pass. UI vote views should expose approvals, rejections, pending count,

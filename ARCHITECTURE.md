@@ -232,6 +232,11 @@ Current rules:
   stable device id when available. This is especially useful for Linux/Wayland
   reports where PipeWire/ALSA default device configuration may be missing even
   though the rest of the room state is healthy.
+- Audio output opening intentionally follows rodio's default-sink fallback
+  strategy: try the default device first, then enumerate alternative non-null
+  output devices. Calling `DeviceSinkBuilder::from_default_device()` alone is
+  too strict on some Linux systems because querying `alsa:default` config can
+  fail even when another usable output sink exists.
 - Direct seek by the current track requester still avoids a vote, but it pauses
   first and waits for buffer quorum before publishing the target anchor.
 - `PlaybackReady` counts only when the local peer is leader, session matches, and the ready peer is expected.
