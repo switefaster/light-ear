@@ -95,6 +95,14 @@ guardrail:
   `PlaybackBufferPrepare` / `PlaybackBufferStatus` publish failures should be
   reported as status, but must not abort local prepare, local ready, or quorum
   resolution.
+- Gossipsub `AllQueuesFull` means room message delivery is congested, not that
+  the backend should exit. Treat it as a recoverable publish outcome, keep local
+  state machines moving, and rely on existing state/summary republish paths for
+  convergence.
+- Event-triggered sync announcements must be coalesced. mDNS, connection, and
+  subscription events can arrive several times for the same peer/address set;
+  do not publish immediate history/queue/name summaries or music snapshots for
+  every duplicate event.
 - Long-video playback uses HTTP Range cache plus background decode. The player
   may start once the requested position has a ready playback window. Seek beyond
   the decoded window should restart streaming prepare at the target position and
@@ -104,7 +112,9 @@ guardrail:
 - Active playback buffer health is temporary coordination, not room truth.
   `PlaybackBufferHealth` lets the leader pause when a strict majority of real
   room peers falls below the low watermark for the grace window, then resume
-  through the normal buffer quorum path.
+  through the normal buffer quorum path. Health/cache progress updates must be
+  rate-limited before gossipsub publish; UI-local cache updates may be more
+  frequent, but room health messages should not be emitted per decoded packet.
 - Cache progress is local UI state. `PlaybackCache` is sent to the desktop to
   render local cached/decoded progress and must not be mirrored into
   `PlaybackState`.

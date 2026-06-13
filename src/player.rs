@@ -809,6 +809,16 @@ fn stream_pcm_ready_for_position(pcm: &SharedPcm, position_ms: u64, duration_ms:
         )
 }
 
+fn should_emit_stream_cache_event(
+    buffered_until_ms: u64,
+    last_cache_event_ms: u64,
+    ready_sent: bool,
+    ready_until_ms: u64,
+) -> bool {
+    buffered_until_ms >= last_cache_event_ms.saturating_add(1000)
+        || (!ready_sent && buffered_until_ms >= ready_until_ms)
+}
+
 fn is_audio_track(track: &Track) -> bool {
     track.codec_params.codec != CODEC_TYPE_NULL
         && (track.codec_params.channels.is_some() || track.codec_params.sample_rate.is_some())
@@ -1804,9 +1814,12 @@ fn decode_streaming_audio_inner(
                 decode_errors = 0;
 
                 let buffered_until_ms = pcm.buffered_until_ms().min(track.duration_ms);
-                if buffered_until_ms >= last_cache_event_ms.saturating_add(1000)
-                    || buffered_until_ms >= ready_until
-                {
+                if should_emit_stream_cache_event(
+                    buffered_until_ms,
+                    last_cache_event_ms,
+                    ready_sent,
+                    ready_until,
+                ) {
                     last_cache_event_ms = buffered_until_ms;
                     let _ = event_tx.send(AudioPlayerEvent::Cache(PlaybackCacheView {
                         session_id: session_id.clone(),
@@ -1956,6 +1969,17 @@ mod tests {
         assert!(stream_ready_for_position(30_000, 120_000, 45_000, false));
         assert!(!stream_ready_for_position(30_000, 120_000, 39_000, false));
         assert!(stream_ready_for_position(118_000, 120_000, 120_000, true));
+    }
+
+    #[test]
+    fn stream_cache_event_is_not_packet_hot_after_ready() {
+        assert!(should_emit_stream_cache_event(
+            12_000, 11_500, false, 12_000
+        ));
+        assert!(!should_emit_stream_cache_event(
+            12_100, 12_000, true, 12_000
+        ));
+        assert!(should_emit_stream_cache_event(13_000, 12_000, true, 12_000));
     }
 
     #[cfg(not(feature = "fdk-aac-decoder"))]

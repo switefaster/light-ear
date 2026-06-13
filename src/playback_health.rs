@@ -17,6 +17,7 @@ pub(crate) struct PlaybackHealthStatus {
 pub(crate) struct PlaybackHealth {
     session_id: Option<String>,
     statuses: HashMap<String, PlaybackHealthStatus>,
+    published_statuses: HashMap<String, PlaybackHealthStatus>,
     loss_since: Option<Instant>,
     paused_for_loss: bool,
 }
@@ -38,6 +39,7 @@ impl PlaybackHealth {
         }
         self.session_id = Some(session_id.to_string());
         self.statuses.clear();
+        self.published_statuses.clear();
         self.loss_since = None;
         self.paused_for_loss = false;
     }
@@ -45,6 +47,7 @@ impl PlaybackHealth {
     pub(crate) fn clear(&mut self) {
         self.session_id = None;
         self.statuses.clear();
+        self.published_statuses.clear();
         self.loss_since = None;
         self.paused_for_loss = false;
     }
@@ -66,6 +69,39 @@ impl PlaybackHealth {
                 updated_at: now,
             },
         );
+    }
+
+    pub(crate) fn mark_local_status_for_publish(
+        &mut self,
+        session_id: &str,
+        peer_id: &str,
+        status: PlaybackBufferStatusKind,
+        buffered_until_ms: Option<u64>,
+        now: Instant,
+        min_interval: Duration,
+        _min_buffer_advance_ms: u64,
+    ) -> bool {
+        self.reset_session(session_id);
+        let next = PlaybackHealthStatus {
+            status,
+            buffered_until_ms,
+            updated_at: now,
+        };
+        let should_publish = self.published_statuses.get(peer_id).is_none_or(|previous| {
+            let interval_elapsed =
+                now.saturating_duration_since(previous.updated_at) >= min_interval;
+            let buffer_advanced = previous
+                .buffered_until_ms
+                .zip(next.buffered_until_ms)
+                .is_none_or(|(previous, next)| next > previous);
+            previous.status != next.status || (interval_elapsed && buffer_advanced)
+        });
+
+        self.statuses.insert(peer_id.to_string(), next.clone());
+        if should_publish {
+            self.published_statuses.insert(peer_id.to_string(), next);
+        }
+        should_publish
     }
 
     pub(crate) fn evaluate(
@@ -309,5 +345,48 @@ mod tests {
                 threshold: 1
             }
         );
+    }
+
+    #[test]
+    fn local_health_publish_is_rate_limited_without_hiding_status_changes() {
+        let now = Instant::now();
+        let mut health = PlaybackHealth::new();
+
+        assert!(health.mark_local_status_for_publish(
+            "session",
+            "local",
+            PlaybackBufferStatusKind::Ready,
+            Some(12_000),
+            now,
+            Duration::from_secs(1),
+            5_000,
+        ));
+        assert!(!health.mark_local_status_for_publish(
+            "session",
+            "local",
+            PlaybackBufferStatusKind::Ready,
+            Some(13_000),
+            now + Duration::from_millis(100),
+            Duration::from_secs(1),
+            5_000,
+        ));
+        assert!(health.mark_local_status_for_publish(
+            "session",
+            "local",
+            PlaybackBufferStatusKind::Buffering,
+            Some(13_000),
+            now + Duration::from_millis(200),
+            Duration::from_secs(1),
+            5_000,
+        ));
+        assert!(health.mark_local_status_for_publish(
+            "session",
+            "local",
+            PlaybackBufferStatusKind::Buffering,
+            Some(14_000),
+            now + Duration::from_secs(2),
+            Duration::from_secs(1),
+            5_000,
+        ));
     }
 }

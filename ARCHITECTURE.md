@@ -91,6 +91,18 @@ Room protocol messages are `WireMessage` values serialized as JSON. They flow ov
 
 `HistoryRequest`, `HistoryResponse`, `QueueRequest`, and `QueueResponse` keep their `target` fields, but they are still broadcast over gossipsub and ignored by non-target peers. If gossipsub reports `NoPeersSubscribedToTopic`, the backend reports a status error and does not attempt direct request-response fallback.
 
+`AllQueuesFull` is a recoverable congestion outcome. It should be reported as a
+low-noise status where the caller has UI context, but it must not unwind
+`run_network` or abort playback/queue/vote state machines. Authoritative state
+can converge through the normal periodic state and summary republish paths
+after gossipsub queues recover.
+
+Event-triggered sync is coalesced. Connection, subscription, and mDNS discovery
+events can arrive in bursts for the same peer through multiple addresses, so
+immediate name/history/queue summaries and music snapshots have short minimum
+intervals, and follow-up summary bursts are merged instead of stacked. The
+periodic summary and playback-state timers remain the steady convergence path.
+
 Inbound gossipsub messages use source validation against the authenticated source peer:
 
 - chat/name/history summary/request actors must match the source;
@@ -186,6 +198,11 @@ Current rules:
 - During active playback, peers publish `PlaybackBufferHealth` with local buffer
   health. If the leader sees healthy peers below strict majority for 3 seconds,
   it publishes a paused state and starts a resume buffer operation.
+- Local cache progress can update the desktop frequently, but
+  `PlaybackBufferHealth` publishes are rate-limited so fast decode/download
+  progress cannot fill gossipsub peer queues. Status changes publish
+  immediately; same-status progress publishes only after a wall-clock interval
+  and actual buffer advancement.
 - `PlaybackState` remains the only authoritative room playback state. Buffer
   operations and health messages are short-lived and should be cleared or
   superseded by ready, cancel, timeout, impossible quorum, or session changes.

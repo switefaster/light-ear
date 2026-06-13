@@ -53,6 +53,8 @@ use crate::{
 
 const HISTORY_SYNC_INTERVAL: Duration = Duration::from_secs(10);
 const HISTORY_SYNC_BURST_TICK: Duration = Duration::from_millis(200);
+const SYNC_IMMEDIATE_MIN_INTERVAL: Duration = Duration::from_secs(1);
+const MUSIC_SNAPSHOT_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const HISTORY_REQUEST_COOLDOWN: Duration = Duration::from_secs(5);
 const QUEUE_REQUEST_COOLDOWN: Duration = Duration::from_secs(5);
 const MUSIC_LOCAL_INTERVAL: Duration = Duration::from_millis(100);
@@ -64,6 +66,8 @@ const BUFFER_PREPARE_REPUBLISH_INTERVAL: Duration = Duration::from_secs(2);
 const BUFFER_READY_WINDOW_MS: u64 = media_cache::READY_WINDOW_MS;
 const BUFFER_HEALTH_LOSS_GRACE: Duration = Duration::from_secs(3);
 const BUFFER_HEALTH_STALE_AFTER: Duration = Duration::from_secs(5);
+const BUFFER_HEALTH_PUBLISH_MIN_INTERVAL: Duration = Duration::from_secs(1);
+const BUFFER_HEALTH_PUBLISH_MIN_ADVANCE_MS: u64 = media_cache::LOW_WATERMARK_MS;
 const VOTE_TIMEOUT: Duration = Duration::from_secs(20);
 const RENDEZVOUS_DISCOVER_INTERVAL: Duration = Duration::from_secs(30);
 const RENDEZVOUS_REGISTER_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -108,12 +112,14 @@ struct PublishTargets<'a> {
 enum RoomPublishOutcome {
     Published,
     NoSubscribers,
+    Congested,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RoomPublishPlan {
     Published,
     NoSubscribers,
+    Congested,
     Failed,
 }
 
@@ -133,6 +139,13 @@ enum RendezvousDiscoverMode {
 struct ZeroPeerRecovery {
     active: bool,
     discover_deadlines: VecDeque<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct SyncAnnouncementState {
+    pending: VecDeque<Instant>,
+    last_immediate: Option<Instant>,
+    last_music_snapshot: Option<Instant>,
 }
 
 impl ZeroPeerRecovery {
@@ -195,7 +208,7 @@ pub async fn run_network(
     let mut peer_names = HashMap::new();
     let mut history_request_times = HashMap::new();
     let mut queue_request_times = HashMap::new();
-    let mut pending_sync_summaries = VecDeque::new();
+    let mut sync_announcements = SyncAnnouncementState::default();
     let mut rendezvous_nodes = HashSet::new();
     let mut rendezvous_cookies = HashMap::new();
     let relay_addrs = prioritize_multiaddrs(config.relay.clone());
@@ -372,6 +385,9 @@ pub async fn run_network(
                         Ok(RoomPublishOutcome::Published) => {}
                         Ok(RoomPublishOutcome::NoSubscribers) => {
                             send_status(&ui, "gossipsub publish failed: no peers subscribed to the room topic".to_string()).await;
+                        }
+                        Ok(RoomPublishOutcome::Congested) => {
+                            send_status(&ui, "gossipsub publish delayed: peer queues are full".to_string()).await;
                         }
                         Err(err) => {
                             send_status(&ui, format!("publish failed: {err}")).await;
@@ -949,7 +965,7 @@ pub async fn run_network(
                     rendezvous_nodes: &rendezvous_nodes,
                 };
                 if let Err(err) = publish_pending_sync_summaries(
-                    &mut pending_sync_summaries,
+                    &mut sync_announcements,
                     &mut swarm,
                     &topic,
                     &targets,
@@ -1033,7 +1049,7 @@ pub async fn run_network(
                         &rendezvous_nodes,
                         &rendezvous_namespace,
                         &rendezvous_cookies,
-                        &mut pending_sync_summaries,
+                        &mut sync_announcements,
                         &ui,
                     )
                     .await;
@@ -1050,7 +1066,7 @@ pub async fn run_network(
                     peer_names: &mut peer_names,
                     history_request_times: &mut history_request_times,
                     queue_request_times: &mut queue_request_times,
-                    pending_sync_summaries: &mut pending_sync_summaries,
+                    sync_announcements: &mut sync_announcements,
                     http_client: &http_client,
                     failed_audio_sessions: &mut failed_audio_sessions,
                     buffer_coordinator: &mut buffer_coordinator,
@@ -1109,7 +1125,7 @@ struct HistoryContext<'a> {
     peer_names: &'a mut HashMap<String, PeerNameClaim>,
     history_request_times: &'a mut HashMap<String, Instant>,
     queue_request_times: &'a mut HashMap<String, Instant>,
-    pending_sync_summaries: &'a mut VecDeque<Instant>,
+    sync_announcements: &'a mut SyncAnnouncementState,
     http_client: &'a reqwest::Client,
     failed_audio_sessions: &'a mut HashSet<String>,
     buffer_coordinator: &'a mut BufferCoordinator,
@@ -1260,7 +1276,7 @@ async fn handle_swarm_event(
             let count = connected_room_peer_count(swarm, rendezvous_nodes);
             let _ = ui.send(UiEvent::PeerCount(count)).await;
             if count > 0 && !rendezvous_nodes.contains(&peer_id) && zero_peer_recovery.finish() {
-                schedule_sync_burst(ctx.pending_sync_summaries);
+                schedule_sync_burst(ctx.sync_announcements);
                 send_status(
                     ui,
                     format!("room peer {peer_id} reconnected; refreshing sync"),
@@ -1270,9 +1286,14 @@ async fn handle_swarm_event(
             if let Err(err) = trigger_sync(swarm, &targets, &mut ctx) {
                 send_status(ui, format!("sync summary failed: {err}")).await;
             }
-            if let Err(err) =
-                publish_music_snapshot(swarm, ctx.topic, &targets, ctx.local_peer_id, ctx.music)
-            {
+            if let Err(err) = publish_music_snapshot_if_due(
+                ctx.sync_announcements,
+                swarm,
+                ctx.topic,
+                &targets,
+                ctx.local_peer_id,
+                ctx.music,
+            ) {
                 send_status(ui, format!("music snapshot failed: {err}")).await;
             }
         }
@@ -1362,9 +1383,14 @@ async fn handle_swarm_event(
                 if let Err(err) = trigger_sync(swarm, &targets, &mut ctx) {
                     send_status(ui, format!("sync summary failed: {err}")).await;
                 }
-                if let Err(err) =
-                    publish_music_snapshot(swarm, ctx.topic, &targets, ctx.local_peer_id, ctx.music)
-                {
+                if let Err(err) = publish_music_snapshot_if_due(
+                    ctx.sync_announcements,
+                    swarm,
+                    ctx.topic,
+                    &targets,
+                    ctx.local_peer_id,
+                    ctx.music,
+                ) {
                     send_status(ui, format!("music snapshot failed: {err}")).await;
                 }
             }
@@ -1619,7 +1645,7 @@ async fn run_zero_peer_recovery(
     rendezvous_nodes: &HashSet<PeerId>,
     namespace: &rendezvous::Namespace,
     rendezvous_cookies: &HashMap<PeerId, rendezvous::Cookie>,
-    pending_sync_summaries: &mut VecDeque<Instant>,
+    sync_announcements: &mut SyncAnnouncementState,
     ui: &mpsc::Sender<UiEvent>,
 ) {
     ensure_rendezvous_connections(swarm, relay_addrs, rendezvous_nodes, ui).await;
@@ -1633,7 +1659,7 @@ async fn run_zero_peer_recovery(
         ui,
     )
     .await;
-    schedule_sync_burst(pending_sync_summaries);
+    schedule_sync_burst(sync_announcements);
 }
 
 async fn ensure_rendezvous_connections(
@@ -2050,35 +2076,48 @@ fn trigger_sync(
     targets: &PublishTargets<'_>,
     ctx: &mut HistoryContext<'_>,
 ) -> Result<()> {
-    publish_sync_summary(
-        swarm,
-        ctx.topic,
-        targets,
-        ctx.local_peer_id,
-        ctx.local_name,
-        ctx.local_joined_at,
-        ctx.history,
-        ctx.music.queue_version,
-        ctx.music.queue_updated_at,
-        &ctx.music.queue,
-    )?;
-    schedule_sync_burst(ctx.pending_sync_summaries);
+    let now = Instant::now();
+    if should_publish_immediate_sync(ctx.sync_announcements, now) {
+        publish_sync_summary(
+            swarm,
+            ctx.topic,
+            targets,
+            ctx.local_peer_id,
+            ctx.local_name,
+            ctx.local_joined_at,
+            ctx.history,
+            ctx.music.queue_version,
+            ctx.music.queue_updated_at,
+            &ctx.music.queue,
+        )?;
+        ctx.sync_announcements.last_immediate = Some(now);
+    }
+    schedule_sync_burst(ctx.sync_announcements);
     Ok(())
 }
 
-fn schedule_sync_burst(pending: &mut VecDeque<Instant>) {
+fn should_publish_immediate_sync(state: &SyncAnnouncementState, now: Instant) -> bool {
+    state
+        .last_immediate
+        .is_none_or(|last| now.saturating_duration_since(last) >= SYNC_IMMEDIATE_MIN_INTERVAL)
+}
+
+fn schedule_sync_burst(state: &mut SyncAnnouncementState) {
+    if !state.pending.is_empty() {
+        return;
+    }
     let now = Instant::now();
     for delay in [
         Duration::from_millis(300),
         Duration::from_millis(900),
         Duration::from_millis(1800),
     ] {
-        pending.push_back(now + delay);
+        state.pending.push_back(now + delay);
     }
 }
 
 fn publish_pending_sync_summaries(
-    pending: &mut VecDeque<Instant>,
+    state: &mut SyncAnnouncementState,
     swarm: &mut libp2p::Swarm<Behaviour>,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
@@ -2091,8 +2130,12 @@ fn publish_pending_sync_summaries(
     queue: &VecDeque<QueueItem>,
 ) -> Result<()> {
     let now = Instant::now();
-    while pending.front().is_some_and(|deadline| *deadline <= now) {
-        pending.pop_front();
+    while state
+        .pending
+        .front()
+        .is_some_and(|deadline| *deadline <= now)
+    {
+        state.pending.pop_front();
         publish_sync_summary(
             swarm,
             topic,
@@ -2105,6 +2148,7 @@ fn publish_pending_sync_summaries(
             queue_updated_at,
             queue,
         )?;
+        state.last_immediate = Some(now);
     }
     Ok(())
 }
@@ -2207,6 +2251,15 @@ async fn apply_wire_message(
                         )
                         .await;
                     }
+                    Ok(RoomPublishOutcome::Congested) => {
+                        send_status(
+                            ui,
+                            format!(
+                                "history request for {peer_id} delayed: gossipsub queues are full"
+                            ),
+                        )
+                        .await;
+                    }
                     Err(err) => {
                         send_status(ui, format!("history request failed: {err}")).await;
                     }
@@ -2241,6 +2294,15 @@ async fn apply_wire_message(
                             ui,
                             format!(
                                 "history response to {requester} not sent: no gossipsub subscribers"
+                            ),
+                        )
+                        .await;
+                    }
+                    Ok(RoomPublishOutcome::Congested) => {
+                        send_status(
+                            ui,
+                            format!(
+                                "history response to {requester} delayed: gossipsub queues are full"
                             ),
                         )
                         .await;
@@ -2334,6 +2396,15 @@ async fn apply_wire_message(
                         )
                         .await;
                     }
+                    Ok(RoomPublishOutcome::Congested) => {
+                        send_status(
+                            ui,
+                            format!(
+                                "queue request for {peer_id} delayed: gossipsub queues are full"
+                            ),
+                        )
+                        .await;
+                    }
                     Err(err) => {
                         send_status(ui, format!("queue request failed: {err}")).await;
                     }
@@ -2374,6 +2445,15 @@ async fn apply_wire_message(
                             ui,
                             format!(
                                 "queue response to {requester} not sent: no gossipsub subscribers"
+                            ),
+                        )
+                        .await;
+                    }
+                    Ok(RoomPublishOutcome::Congested) => {
+                        send_status(
+                            ui,
+                            format!(
+                                "queue response to {requester} delayed: gossipsub queues are full"
                             ),
                         )
                         .await;
@@ -3182,6 +3262,16 @@ async fn request_queue_for_vote_context(
             )
             .await;
         }
+        Ok(RoomPublishOutcome::Congested) => {
+            send_status(
+                ui,
+                format!(
+                    "queue request for vote {} delayed: gossipsub queues are full",
+                    proposal.vote_id
+                ),
+            )
+            .await;
+        }
         Err(err) => {
             send_status(ui, format!("queue request for vote context failed: {err}")).await;
         }
@@ -3326,6 +3416,7 @@ fn classify_room_publish_error(error: &gossipsub::PublishError) -> RoomPublishPl
     match error {
         gossipsub::PublishError::Duplicate => RoomPublishPlan::Published,
         gossipsub::PublishError::NoPeersSubscribedToTopic => RoomPublishPlan::NoSubscribers,
+        gossipsub::PublishError::AllQueuesFull(_) => RoomPublishPlan::Congested,
         _ => RoomPublishPlan::Failed,
     }
 }
@@ -3341,6 +3432,7 @@ fn publish_room_wire_with_outcome(
         Err(err) => match classify_room_publish_error(&err) {
             RoomPublishPlan::Published => Ok(RoomPublishOutcome::Published),
             RoomPublishPlan::NoSubscribers => Ok(RoomPublishOutcome::NoSubscribers),
+            RoomPublishPlan::Congested => Ok(RoomPublishOutcome::Congested),
             RoomPublishPlan::Failed => Err(anyhow!(err)),
         },
     }
@@ -3406,6 +3498,28 @@ fn publish_music_snapshot(
     }
 
     Ok(())
+}
+
+fn publish_music_snapshot_if_due(
+    sync: &mut SyncAnnouncementState,
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    topic: &gossipsub::IdentTopic,
+    targets: &PublishTargets<'_>,
+    local_peer_id: PeerId,
+    music: &MusicState,
+) -> Result<()> {
+    let now = Instant::now();
+    if !should_publish_music_snapshot(sync, now) {
+        return Ok(());
+    }
+    publish_music_snapshot(swarm, topic, targets, local_peer_id, music)?;
+    sync.last_music_snapshot = Some(now);
+    Ok(())
+}
+
+fn should_publish_music_snapshot(sync: &SyncAnnouncementState, now: Instant) -> bool {
+    sync.last_music_snapshot
+        .is_none_or(|last| now.saturating_duration_since(last) >= MUSIC_SNAPSHOT_MIN_INTERVAL)
 }
 
 fn build_queue_state(local_peer_id: PeerId, music: &MusicState) -> QueueState {
@@ -5110,6 +5224,9 @@ fn describe_buffer_publish_result(
         Ok(RoomPublishOutcome::NoSubscribers) => {
             Some(format!("{action} not sent: no gossipsub subscribers"))
         }
+        Ok(RoomPublishOutcome::Congested) => {
+            Some(format!("{action} delayed: gossipsub peer queues are full"))
+        }
         Err(err) => Some(format!("{action} failed: {err:#}")),
     }
 }
@@ -5124,13 +5241,18 @@ fn publish_local_buffer_health(
     status: PlaybackBufferStatusKind,
     buffered_until_ms: Option<u64>,
 ) -> Result<()> {
-    playback_health.mark_status(
+    let should_publish = playback_health.mark_local_status_for_publish(
         session_id,
         &local_peer_id.to_string(),
         status.clone(),
         buffered_until_ms,
         Instant::now(),
+        BUFFER_HEALTH_PUBLISH_MIN_INTERVAL,
+        BUFFER_HEALTH_PUBLISH_MIN_ADVANCE_MS,
     );
+    if !should_publish {
+        return Ok(());
+    }
     publish_playback_buffer_health(
         swarm,
         topic,
@@ -5578,6 +5700,46 @@ mod tests {
         assert_eq!(recovery.discover_deadlines.front().copied(), Some(later));
     }
 
+    #[test]
+    fn sync_burst_scheduling_is_coalesced() {
+        let mut sync = SyncAnnouncementState::default();
+
+        schedule_sync_burst(&mut sync);
+        assert_eq!(sync.pending.len(), 3);
+        let first = sync.pending.clone();
+
+        schedule_sync_burst(&mut sync);
+        assert_eq!(sync.pending, first);
+    }
+
+    #[test]
+    fn immediate_sync_and_music_snapshot_are_rate_limited() {
+        let now = Instant::now();
+        let mut sync = SyncAnnouncementState::default();
+
+        assert!(should_publish_immediate_sync(&sync, now));
+        sync.last_immediate = Some(now);
+        assert!(!should_publish_immediate_sync(
+            &sync,
+            now + Duration::from_millis(999)
+        ));
+        assert!(should_publish_immediate_sync(
+            &sync,
+            now + SYNC_IMMEDIATE_MIN_INTERVAL
+        ));
+
+        assert!(should_publish_music_snapshot(&sync, now));
+        sync.last_music_snapshot = Some(now);
+        assert!(!should_publish_music_snapshot(
+            &sync,
+            now + Duration::from_millis(999)
+        ));
+        assert!(should_publish_music_snapshot(
+            &sync,
+            now + MUSIC_SNAPSHOT_MIN_INTERVAL
+        ));
+    }
+
     fn record(id: impl Into<String>, sent_at: i64) -> ChatRecord {
         ChatRecord {
             id: id.into(),
@@ -5995,6 +6157,10 @@ mod tests {
         assert_eq!(
             classify_room_publish_error(&gossipsub::PublishError::NoPeersSubscribedToTopic),
             RoomPublishPlan::NoSubscribers
+        );
+        assert_eq!(
+            classify_room_publish_error(&gossipsub::PublishError::AllQueuesFull(1)),
+            RoomPublishPlan::Congested
         );
     }
 
