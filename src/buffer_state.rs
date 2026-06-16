@@ -238,14 +238,6 @@ impl BufferCoordinator {
         self.active.as_ref().map(|operation| operation.quorum(now))
     }
 
-    pub(crate) fn take_ready(&mut self, now: Instant) -> Option<BufferOperation> {
-        if matches!(self.quorum(now), Some(BufferQuorum::Ready { .. })) {
-            self.active.take()
-        } else {
-            None
-        }
-    }
-
     pub(crate) fn cancel(&mut self, operation_id: &str) -> Option<BufferOperation> {
         if self
             .active
@@ -499,7 +491,6 @@ mod tests {
                 threshold: 2
             })
         ));
-        assert_eq!(coordinator.take_ready(now).unwrap().operation_id, "op");
     }
 
     #[test]

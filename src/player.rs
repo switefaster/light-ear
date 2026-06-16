@@ -529,6 +529,30 @@ impl AudioPlayer {
         self.restart(position_ms, playing, now_micros)
     }
 
+    pub fn start_prepared_stream(
+        &mut self,
+        session_id: &str,
+        track_id: &str,
+        position_ms: u64,
+        playing: bool,
+    ) -> Result<bool> {
+        let ready = self.streaming.as_ref().is_some_and(|streaming| {
+            streaming.session_id == session_id
+                && streaming.track_id == track_id
+                && stream_pcm_ready_for_position(
+                    &streaming.pcm,
+                    position_ms.min(streaming.duration_ms),
+                    streaming.duration_ms,
+                )
+        });
+        if !ready {
+            return Ok(false);
+        }
+
+        self.restart_streaming(position_ms, playing)?;
+        Ok(true)
+    }
+
     pub fn set_playing(&mut self, playing: bool, now_micros: i64) -> Result<()> {
         if self.streaming.is_some() {
             self.playing = playing;
