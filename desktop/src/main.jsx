@@ -795,7 +795,12 @@ function QueueDrawer({ open, queue, callCommand, onClose, onRequestMove, display
   return (
     <>
       {open && <button className="drawer-scrim" type="button" aria-label="Close queue" onClick={onClose}></button>}
-      <aside className={`queue-drawer${open ? " open" : ""}`} aria-hidden={!open} aria-label="Queue widget">
+      <aside
+        className={`queue-drawer${open ? " open" : ""}`}
+        aria-hidden={!open}
+        inert={!open}
+        aria-label="Queue widget"
+      >
         <div className="drawer-head">
           <div>
             <p className="overline">Music</p>

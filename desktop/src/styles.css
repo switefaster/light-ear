@@ -1958,15 +1958,28 @@ h2 {
 
   .room-navbar {
     grid-template-columns: minmax(0, 1fr) auto;
-    grid-template-rows: auto auto;
+    grid-template-areas:
+      "brand queue"
+      "meta meta"
+      "status status";
+    grid-template-rows: auto auto auto;
+  }
+
+  .nav-brand {
+    grid-area: brand;
   }
 
   .nav-meta {
-    grid-column: 1 / -1;
+    grid-area: meta;
   }
 
   .status-ticker {
-    display: none;
+    grid-area: status;
+    display: flex;
+  }
+
+  .queue-nav-button {
+    grid-area: queue;
   }
 
   .player-dock {
@@ -2151,6 +2164,16 @@ h2 {
   .queue-card > .icon-button {
     grid-area: remove;
     justify-self: end;
+  }
+
+  .player-dock .transport-buttons {
+    flex-wrap: nowrap;
+    align-items: center;
+  }
+
+  .player-dock .volume-control {
+    flex: 1 1 auto;
+    min-width: 0;
   }
 
   .modal-actions {
