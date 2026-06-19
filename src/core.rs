@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
@@ -12,6 +12,10 @@ pub struct ChatRecord {
     pub peer_id: String,
     #[serde(default)]
     pub joined_at: Option<i64>,
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub causal_frontier: BTreeMap<String, u64>,
     pub author: String,
     pub text: String,
     pub sent_at: i64,
@@ -221,6 +225,10 @@ pub enum WireMessage {
         peer_id: String,
         #[serde(default)]
         joined_at: Option<i64>,
+        #[serde(default)]
+        seq: u64,
+        #[serde(default)]
+        causal_frontier: BTreeMap<String, u64>,
         name: String,
         text: String,
         sent_at: i64,

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     io,
     sync::atomic::{AtomicU64, Ordering},
@@ -419,12 +419,15 @@ pub async fn run_network(
             command = commands.recv() => match command {
                 Some(NetworkCommand::Chat(text)) => {
                     let sent_at = current_timestamp_micros();
+                    let causal_frontier = history_frontier(&history);
                     message_seq += 1;
                     let id = new_message_id(local_peer_id, sent_at, message_seq, &text);
                     let record = ChatRecord {
                         id: id.clone(),
                         peer_id: local_peer_id.to_string(),
                         joined_at: Some(local_joined_at),
+                        seq: message_seq,
+                        causal_frontier: causal_frontier.clone(),
                         author: config.name.clone(),
                         text,
                         sent_at,
@@ -436,6 +439,8 @@ pub async fn run_network(
                         id: Some(id),
                         peer_id: local_peer_id.to_string(),
                         joined_at: Some(local_joined_at),
+                        seq: message_seq,
+                        causal_frontier,
                         name: record.author,
                         text: record.text,
                         sent_at,
@@ -2308,6 +2313,8 @@ async fn apply_wire_message(
             id,
             peer_id,
             joined_at,
+            seq,
+            causal_frontier,
             name,
             text,
             sent_at,
@@ -2318,6 +2325,8 @@ async fn apply_wire_message(
                 id,
                 peer_id,
                 joined_at,
+                seq,
+                causal_frontier,
                 name,
                 text,
                 sent_at,
@@ -3235,6 +3244,8 @@ async fn apply_chat_message(
     id: Option<String>,
     peer_id: String,
     joined_at: Option<i64>,
+    seq: u64,
+    causal_frontier: BTreeMap<String, u64>,
     name: String,
     text: String,
     sent_at: i64,
@@ -3258,6 +3269,8 @@ async fn apply_chat_message(
         id,
         peer_id: claimed_peer_id.to_string(),
         joined_at,
+        seq,
+        causal_frontier,
         author: name,
         text,
         sent_at,
@@ -3280,11 +3293,7 @@ fn insert_record(
     }
 
     history.push(record);
-    history.sort_by(|left, right| {
-        normalize_timestamp_micros(left.sent_at)
-            .cmp(&normalize_timestamp_micros(right.sent_at))
-            .then_with(|| left.id.cmp(&right.id))
-    });
+    sort_history_causally(history);
 
     if history.len() > MAX_MESSAGES {
         let overflow = history.len() - MAX_MESSAGES;
@@ -3294,6 +3303,99 @@ fn insert_record(
     }
 
     true
+}
+
+fn sort_history_causally(history: &mut Vec<ChatRecord>) {
+    let mut remaining = (0..history.len()).collect::<Vec<_>>();
+    let mut ordered = Vec::with_capacity(history.len());
+
+    while !remaining.is_empty() {
+        let mut ready = remaining
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                !remaining.iter().copied().any(|other| {
+                    candidate != &other && chat_depends_on(&history[*candidate], &history[other])
+                })
+            })
+            .collect::<Vec<_>>();
+
+        if ready.is_empty() {
+            let fallback = remaining
+                .iter()
+                .copied()
+                .min_by(|left, right| chat_fallback_order(&history[*left], &history[*right]))
+                .expect("remaining is not empty");
+            ready.push(fallback);
+        }
+
+        ready.sort_by(|left, right| chat_fallback_order(&history[*left], &history[*right]));
+        for index in ready {
+            ordered.push(history[index].clone());
+            remaining.retain(|remaining| *remaining != index);
+        }
+    }
+
+    *history = ordered;
+}
+
+fn chat_depends_on(record: &ChatRecord, candidate_dependency: &ChatRecord) -> bool {
+    if record.id == candidate_dependency.id {
+        return false;
+    }
+    if candidate_dependency.seq == 0 || candidate_dependency.peer_id.is_empty() {
+        return false;
+    }
+    let Some(candidate_key) = chat_record_actor_key(candidate_dependency) else {
+        return false;
+    };
+    let record_key = chat_record_actor_key(record);
+    if record_key.as_ref() == Some(&candidate_key)
+        && record.seq > 0
+        && candidate_dependency.seq < record.seq
+    {
+        return true;
+    }
+
+    record
+        .causal_frontier
+        .get(&candidate_key)
+        .is_some_and(|latest_seen| candidate_dependency.seq <= *latest_seen)
+}
+
+fn chat_fallback_order(left: &ChatRecord, right: &ChatRecord) -> std::cmp::Ordering {
+    normalize_timestamp_micros(left.sent_at)
+        .cmp(&normalize_timestamp_micros(right.sent_at))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn history_frontier(history: &[ChatRecord]) -> BTreeMap<String, u64> {
+    let mut frontier = BTreeMap::new();
+    for record in history {
+        let Some(actor_key) = chat_record_actor_key(record) else {
+            continue;
+        };
+
+        frontier
+            .entry(actor_key)
+            .and_modify(|seq: &mut u64| *seq = (*seq).max(record.seq))
+            .or_insert(record.seq);
+    }
+    frontier
+}
+
+fn chat_record_actor_key(record: &ChatRecord) -> Option<String> {
+    if record.seq == 0 || record.peer_id.is_empty() {
+        return None;
+    }
+    Some(chat_actor_key(&record.peer_id, record.joined_at))
+}
+
+fn chat_actor_key(peer_id: &str, joined_at: Option<i64>) -> String {
+    joined_at.map_or_else(
+        || peer_id.to_string(),
+        |joined_at| format!("{peer_id}@{joined_at}"),
+    )
 }
 
 async fn send_history_snapshot(ui: &mpsc::Sender<UiEvent>, history: &[ChatRecord]) {
@@ -6473,6 +6575,8 @@ mod tests {
             id: id.into(),
             peer_id: "peer".to_string(),
             joined_at: Some(1_700_000_000_000_000),
+            seq: 0,
+            causal_frontier: BTreeMap::new(),
             author: "alice".to_string(),
             text: "hello".to_string(),
             sent_at,
@@ -6709,6 +6813,45 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids, ["older-micros", "middle-millis", "later-seconds"]);
         assert_eq!(seen_messages.len(), 3);
+    }
+
+    #[test]
+    fn insert_record_orders_causal_dependencies_before_clock_time() {
+        let mut history = Vec::new();
+        let mut seen_messages = HashSet::new();
+        let mut frontier = BTreeMap::new();
+        let joined_at = Some(1_700_000_000_000_000);
+        frontier.insert(chat_actor_key("alice", joined_at), 1);
+
+        let alice = ChatRecord {
+            id: "alice-1".to_string(),
+            peer_id: "alice".to_string(),
+            joined_at,
+            seq: 1,
+            causal_frontier: BTreeMap::new(),
+            author: "alice".to_string(),
+            text: "question".to_string(),
+            sent_at: 1_700_000_000_200_000,
+        };
+        let bob = ChatRecord {
+            id: "bob-1".to_string(),
+            peer_id: "bob".to_string(),
+            joined_at,
+            seq: 1,
+            causal_frontier: frontier,
+            author: "bob".to_string(),
+            text: "answer".to_string(),
+            sent_at: 1_700_000_000_100_000,
+        };
+
+        assert!(insert_record(&mut history, &mut seen_messages, bob));
+        assert!(insert_record(&mut history, &mut seen_messages, alice));
+
+        let ids = history
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["alice-1", "bob-1"]);
     }
 
     #[test]
@@ -7252,6 +7395,8 @@ mod tests {
                     id: None,
                     peer_id: source.to_string(),
                     joined_at: None,
+                    seq: 1,
+                    causal_frontier: BTreeMap::new(),
                     name: "alice".to_string(),
                     text: "hello".to_string(),
                     sent_at: 1_700_000_000_000_000,
@@ -7266,6 +7411,8 @@ mod tests {
                     id: None,
                     peer_id: String::new(),
                     joined_at: None,
+                    seq: 1,
+                    causal_frontier: BTreeMap::new(),
                     name: "alice".to_string(),
                     text: "hello".to_string(),
                     sent_at: 1_700_000_000_000_000,
