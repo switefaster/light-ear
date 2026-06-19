@@ -1,6 +1,6 @@
-# link-ear
+# light-ear
 
-`link-ear` is a Rust/libp2p peer-to-peer chat and shared listening app. Peers can chat, co-manage a music queue, and keep playback state roughly synchronized through the Tauri desktop shell.
+`light-ear` is a Rust/libp2p peer-to-peer chat and shared listening app. Peers can chat, co-manage a music queue, and keep playback state roughly synchronized through the Tauri desktop shell.
 
 ## Run
 
@@ -30,7 +30,7 @@ The relay address is also used as a rendezvous server. Each client registers und
 Run a minimal public relay plus rendezvous node on a reachable host:
 
 ```powershell
-cargo run --bin link-ear-relay -- --port 4001 --secret-key-seed 0
+cargo run --bin light-ear-relay -- --port 4001 --secret-key-seed 0
 ```
 
 The relay also serves a small topology dashboard on `127.0.0.1:8080` by default:
@@ -42,7 +42,7 @@ http://127.0.0.1:8080/
 Use `--web-addr` to bind it somewhere else, for example on all interfaces:
 
 ```powershell
-cargo run --bin link-ear-relay -- --port 4001 --web-addr 0.0.0.0:8080
+cargo run --bin light-ear-relay -- --port 4001 --web-addr 0.0.0.0:8080
 ```
 
 Pass `--no-web` to disable the page. The dashboard shows the relay-observed control-plane topology: active relay connections, rendezvous registrations by namespace, advertised peer addresses, and recent relay/rendezvous events. Direct peer-to-peer edges are not visible to the relay unless clients explicitly report them later.
@@ -56,14 +56,14 @@ Open TCP and UDP on the chosen port. The relay prints its peer id at startup; cl
 If the relay host needs to advertise a specific public address, pass it explicitly:
 
 ```powershell
-cargo run --bin link-ear-relay -- --external-addr /ip4/203.0.113.20/tcp/4001
+cargo run --bin light-ear-relay -- --external-addr /ip4/203.0.113.20/tcp/4001
 ```
 
 Client setup fields:
 
 ```text
 Name                       Display name in chat
-Topic                      Gossipsub topic, default link-ear.chat.v1
+Topic                      Gossipsub topic, default light-ear.chat.v1
 Listen                     Add listen multiaddrs
 Peers                      Dial explicit peer multiaddrs
 Relay                      Dial and reserve through relay multiaddrs

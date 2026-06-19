@@ -25,7 +25,7 @@ const RELAY_MAX_CIRCUIT_DURATION: Duration = Duration::from_secs(60 * 60 * 6);
 const RELAY_MAX_CIRCUIT_BYTES: u64 = 0;
 
 #[derive(Debug, Parser)]
-#[command(author, version, about = "Public link-ear relay and rendezvous node")]
+#[command(author, version, about = "Public light-ear relay and rendezvous node")]
 struct Cli {
     #[arg(long, default_value_t = 4001)]
     port: u16,
@@ -327,7 +327,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     rendezvous::server::Config::default(),
                 ),
                 identify: identify::Behaviour::new(identify::Config::new(
-                    "/link-ear-relay/0.1.0".to_string(),
+                    "/light-ear-relay/0.1.0".to_string(),
                     key.public(),
                 )),
                 ping: ping::Behaviour::default(),
@@ -499,14 +499,14 @@ fn start_dashboard(
     let listener = TcpListener::bind(address)?;
     let local_addr = listener.local_addr()?;
     let handle = thread::Builder::new()
-        .name("link-ear-relay-dashboard".to_string())
+        .name("light-ear-relay-dashboard".to_string())
         .spawn(move || {
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
                         let topology = Arc::clone(&topology);
                         if let Err(err) = thread::Builder::new()
-                            .name("link-ear-relay-dashboard-client".to_string())
+                            .name("light-ear-relay-dashboard-client".to_string())
                             .spawn(move || handle_http_connection(stream, topology))
                         {
                             eprintln!("dashboard request thread failed: {err}");
@@ -668,7 +668,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>link-ear relay topology</title>
+  <title>light-ear relay topology</title>
   <style>
     :root {
       color-scheme: light;
@@ -898,7 +898,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 <body>
   <main>
     <header>
-      <h1>link-ear relay topology</h1>
+      <h1>light-ear relay topology</h1>
       <div class="timestamp">
         <div id="health">loading</div>
         <div id="updated">waiting for topology</div>

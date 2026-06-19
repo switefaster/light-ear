@@ -1,8 +1,8 @@
-# link-ear agent notes
+# light-ear agent notes
 
 ## Project goal
 
-`link-ear` is a P2P chat and shared listening app. Peers chat, co-manage a music
+`light-ear` is a P2P chat and shared listening app. Peers chat, co-manage a music
 queue, and try to keep playback state close enough that everyone hears the same
 track at roughly the same time.
 
@@ -15,7 +15,7 @@ connections when direct addresses become usable so relay traffic stays bounded.
 - `src/backend.rs`: main libp2p runtime, protocol message handling, history sync,
   queue sync, voting, playback state sync, relay-to-direct promotion.
 - `src/core.rs`: shared protocol and UI-facing data types plus small utilities.
-- `src/bin/link-ear-relay.rs`: public relay/rendezvous node plus topology
+- `src/bin/light-ear-relay.rs`: public relay/rendezvous node plus topology
   dashboard.
 - `src-tauri/src/main.rs`: Tauri command bridge into the Rust backend.
 - `desktop/src/main.jsx`: React/Vite desktop UI.
@@ -32,13 +32,13 @@ boundaries:
 
 - `cargo test --lib`
 - `cargo check`
-- `cargo check --bin link-ear-relay`
+- `cargo check --bin light-ear-relay`
 - `cargo check --manifest-path src-tauri\Cargo.toml`
 - `npm.cmd run build`
-- Optional local AAC enhancement check: `cargo check --features fdk-aac-decoder`
+- AAC enhancement/release parity check: `cargo check --features fdk-aac-decoder`
 
 For relay promotion policy or rendezvous behavior, include
-`cargo check --bin link-ear-relay`. For desktop bridge work, include the Tauri
+`cargo check --bin light-ear-relay`. For desktop bridge work, include the Tauri
 manifest check and the frontend build.
 
 For backend network convergence changes, run the loopback smoke test as a quick

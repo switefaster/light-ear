@@ -1,14 +1,18 @@
 [package]
-name = "link-ear-desktop"
+name = "light-ear-desktop"
 version = "0.1.0"
 edition = "2024"
+
+[features]
+default = []
+fdk-aac-decoder = ["light-ear/fdk-aac-decoder"]
 
 [build-dependencies]
 tauri-build = { version = "2.6.2", features = [] }
 
 [dependencies]
 libp2p = { version = "0.56.0", default-features = false }
-link-ear = { path = ".." }
+light-ear = { path = ".." }
 serde = { version = "1.0.228", features = ["derive"] }
 tauri = { version = "2.11.2", features = [] }
 tauri-plugin-clipboard-manager = "2.3.2"

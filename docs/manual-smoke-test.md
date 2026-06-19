@@ -6,7 +6,7 @@ readiness, and slow peer synchronization.
 
 ## Setup
 
-Use one unique topic per run, for example `link-ear.smoke.2026-06-11.1`.
+Use one unique topic per run, for example `light-ear.smoke.2026-06-11.1`.
 Record the commit, OS, network type, and app build for every participant.
 
 Recommended topology:
@@ -19,7 +19,7 @@ Recommended topology:
 Start the relay/rendezvous node:
 
 ```powershell
-cargo run --bin link-ear-relay -- --port 4001 --web-addr 0.0.0.0:8080
+cargo run --bin light-ear-relay -- --port 4001 --web-addr 0.0.0.0:8080
 ```
 
 Open the relay dashboard and note the printed relay peer id:

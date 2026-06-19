@@ -9,7 +9,7 @@ use std::{
 };
 
 use libp2p::Multiaddr;
-use link_ear::{
+use light_ear::{
     backend::{self, BackendConfig},
     core::NetworkCommand,
 };
@@ -186,7 +186,7 @@ async fn export_status_logs(
     let mut dialog = app
         .dialog()
         .file()
-        .set_title("Export link-ear log")
+        .set_title("Export light-ear log")
         .add_filter("JSON Lines", &["jsonl"])
         .set_file_name(filename);
     if let Ok(directory) = app
@@ -268,7 +268,7 @@ fn sanitize_log_filename(value: &str) -> String {
     }
     filename = filename.trim_matches(['-', '.', '_']).to_string();
     if filename.is_empty() {
-        filename = "link-ear-log.jsonl".to_string();
+        filename = "light-ear-log.jsonl".to_string();
     }
     if !filename.ends_with(".jsonl") {
         filename.push_str(".jsonl");
@@ -292,28 +292,28 @@ mod tests {
     #[test]
     fn sanitize_log_filename_keeps_safe_jsonl_name() {
         assert_eq!(
-            sanitize_log_filename("link-ear-log-20260613-120000.jsonl"),
-            "link-ear-log-20260613-120000.jsonl"
+            sanitize_log_filename("light-ear-log-20260613-120000.jsonl"),
+            "light-ear-log-20260613-120000.jsonl"
         );
     }
 
     #[test]
     fn sanitize_log_filename_rejects_path_segments() {
         assert_eq!(
-            sanitize_log_filename("../some/path/link-ear-log"),
-            "some-path-link-ear-log.jsonl"
+            sanitize_log_filename("../some/path/light-ear-log"),
+            "some-path-light-ear-log.jsonl"
         );
     }
 
     #[test]
     fn normalize_log_export_path_adds_missing_extension() {
         assert_eq!(
-            normalize_log_export_path(PathBuf::from("link-ear-log")),
-            PathBuf::from("link-ear-log.jsonl")
+            normalize_log_export_path(PathBuf::from("light-ear-log")),
+            PathBuf::from("light-ear-log.jsonl")
         );
         assert_eq!(
-            normalize_log_export_path(PathBuf::from("link-ear-log.txt")),
-            PathBuf::from("link-ear-log.txt")
+            normalize_log_export_path(PathBuf::from("light-ear-log.txt")),
+            PathBuf::from("light-ear-log.txt")
         );
     }
 }
@@ -367,9 +367,9 @@ fn main() {
             let main_window = app
                 .get_webview_window("main")
                 .ok_or_else(|| "main window was not created".to_string())?;
-            main_window.set_title("link-ear")?;
+            main_window.set_title("light-ear")?;
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("failed to run link-ear desktop");
+        .expect("failed to run light-ear desktop");
 }

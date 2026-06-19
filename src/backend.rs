@@ -323,7 +323,7 @@ pub async fn run_network(
                 let peer_id = key.public().to_peer_id();
                 let gossipsub = build_gossipsub(key)?;
                 let identify = identify::Behaviour::new(identify::Config::new(
-                    "/link-ear/0.1.0".to_string(),
+                    "/light-ear/0.1.0".to_string(),
                     key.public(),
                 ));
                 let mdns = if config.no_mdns {
@@ -6948,7 +6948,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_loopback_smoke_syncs_chat_history_between_two_backends() {
-        let topic = format!("link-ear.test.{}", current_timestamp_micros());
+        let topic = format!("light-ear.test.{}", current_timestamp_micros());
         let mut alice = spawn_test_backend(
             "alice",
             &topic,

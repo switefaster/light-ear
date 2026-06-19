@@ -1456,6 +1456,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "fdk-aac"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7bb67e142688083cb9afb63f2424203fc98c4e7afb494bf912b60b55513b177e"
+dependencies = [
+ "fdk-aac-sys",
+]
+
+[[package]]
+name = "fdk-aac-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24516d2611506d5cb1833555adc75f6baf9fe2706b9c13e6fc33a6b22c51ca83"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3271,7 +3289,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "link-ear"
+name = "light-ear"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -3287,16 +3305,17 @@ dependencies = [
  "serde",
  "serde_json",
  "symphonia",
+ "symphonia-adapter-fdk-aac",
  "tokio",
  "tracing-subscriber",
 ]
 
 [[package]]
-name = "link-ear-desktop"
+name = "light-ear-desktop"
 version = "0.1.0"
 dependencies = [
  "libp2p",
- "link-ear",
+ "light-ear",
  "serde",
  "tauri",
  "tauri-build",
@@ -5511,6 +5530,17 @@ dependencies = [
  "symphonia-core",
  "symphonia-format-isomp4",
  "symphonia-metadata",
+]
+
+[[package]]
+name = "symphonia-adapter-fdk-aac"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82194865c2b438a75a2b40a12495d5d1a6c3cb2bb36671f9921ab44756ee77d2"
+dependencies = [
+ "fdk-aac",
+ "log",
+ "symphonia-core",
 ]
 
 [[package]]

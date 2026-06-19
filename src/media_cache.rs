@@ -82,7 +82,7 @@ impl From<PlaybackByteRange> for ByteRange {
 }
 
 pub(crate) fn cache_root() -> PathBuf {
-    std::env::temp_dir().join("link-ear-media-cache")
+    std::env::temp_dir().join("light-ear-media-cache")
 }
 
 pub(crate) fn cache_key(track: &PlaybackTrack) -> String {

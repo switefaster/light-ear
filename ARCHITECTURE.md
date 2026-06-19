@@ -1,6 +1,6 @@
-# link-ear architecture
+# light-ear architecture
 
-`link-ear` is a P2P chat and shared listening app. Its core goal is not to stream audio between peers, but to synchronize chat history, a shared queue, vote results, and playback state so each client can download audio locally and play it at roughly the same time.
+`light-ear` is a P2P chat and shared listening app. Its core goal is not to stream audio between peers, but to synchronize chat history, a shared queue, vote results, and playback state so each client can download audio locally and play it at roughly the same time.
 
 This document describes the current implementation boundaries. Runtime commands and examples live in `README.md`; repeatable real-world checks live in `docs/manual-smoke-test.md`.
 
@@ -32,7 +32,7 @@ The desktop path is the primary product path. The legacy terminal UI has been re
 - Desktop UI: `desktop/src/main.jsx`
   - Renders setup, chat, player, queue drawer, vote modal, peer overview, and status log.
   - Does not own protocol truth; it reflects backend events and invokes backend commands.
-- Relay/rendezvous server: `src/bin/link-ear-relay.rs`
+- Relay/rendezvous server: `src/bin/light-ear-relay.rs`
   - Provides circuit relay and rendezvous server behaviours.
   - Hosts a local topology dashboard for relay-observed state.
 
@@ -272,7 +272,7 @@ metadata ranges before playback-window or seek ranges so Symphonia can probe the
 container with the required init/index data instead of failing on an isolated
 `.m4s` fragment.
 
-AAC decoding is feature-gated. Default builds use Symphonia's native AAC decoder and only prefer AAC-LC media (`mp4a.40.2`). `cargo check --features fdk-aac-decoder` enables `symphonia-adapter-fdk-aac`, registers its AAC decoder instead of native AAC, and allows HE-AAC candidates (`mp4a.40.5` / `mp4a.40.29`). This feature is not part of the default CI path because it introduces native FDK AAC build and licensing constraints.
+AAC decoding is feature-gated. Default local builds use Symphonia's native AAC decoder and only prefer AAC-LC media (`mp4a.40.2`). `cargo check --features fdk-aac-decoder` enables `symphonia-adapter-fdk-aac`, registers its AAC decoder instead of native AAC, and allows HE-AAC candidates (`mp4a.40.5` / `mp4a.40.29`). CI checks both decoder modes, and release workflows build with `fdk-aac-decoder` enabled.
 
 Range fetch and decode run outside the main swarm event loop. Skip/cancel/vote messages can arrive while media work is in flight. Player events must be checked against the current session id, operation id, and track id before changing quorum or playback state.
 
@@ -346,7 +346,7 @@ The desktop UI should keep these behaviours:
 
 ## Relay/Rendezvous Server
 
-`link-ear-relay` combines:
+`light-ear-relay` combines:
 
 - libp2p relay server;
 - rendezvous server;
@@ -363,7 +363,7 @@ Useful checks:
 
 - `cargo test --lib`
 - `cargo check`
-- `cargo check --bin link-ear-relay`
+- `cargo check --bin light-ear-relay`
 - `cargo check --manifest-path src-tauri\Cargo.toml`
 - `npm.cmd run build`
 

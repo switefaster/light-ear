@@ -61,16 +61,21 @@ jobs:
         run: npm run build
 
       - name: Run Rust library tests
-        run: cargo test --lib --locked
+        run: |
+          cargo test --lib --locked
+          cargo test --lib --locked --features fdk-aac-decoder
 
       - name: Check Rust crates
         run: |
           cargo check --locked
-          cargo check --locked --bin link-ear-relay
+          cargo check --locked --bin light-ear-relay
           cargo check --locked --manifest-path src-tauri/Cargo.toml
+          cargo check --locked --features fdk-aac-decoder
+          cargo check --locked --bin light-ear-relay --features fdk-aac-decoder
+          cargo check --locked --manifest-path src-tauri/Cargo.toml --features fdk-aac-decoder
 
       - name: Build relay binary
-        run: cargo build --locked --release --bin link-ear-relay
+        run: cargo build --locked --release --bin light-ear-relay --features fdk-aac-decoder
 
       - name: Build Tauri desktop bundle
-        run: npx --yes @tauri-apps/cli@^2 build
+        run: npx --yes @tauri-apps/cli@^2 build --features fdk-aac-decoder

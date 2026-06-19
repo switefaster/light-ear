@@ -50,7 +50,7 @@ Last checked after this audit:
 cargo fmt
 cargo test --lib
 cargo check
-cargo check --bin link-ear-relay
+cargo check --bin light-ear-relay
 cargo check --manifest-path src-tauri\Cargo.toml
 npm.cmd run build
 git diff --check

@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+          - os: ubuntu-22.04
+            platform: linux
+          - os: macos-latest
+            platform: macos
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install Linux Tauri dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            libasound2-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            wget
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Check FDK AAC build
+        run: |
+          cargo check --locked --features fdk-aac-decoder
+          cargo check --locked --manifest-path src-tauri/Cargo.toml --features fdk-aac-decoder
+
+      - name: Build relay binary
+        run: cargo build --locked --release --bin light-ear-relay --features fdk-aac-decoder
+
+      - name: Package relay binary
+        shell: bash
+        run: |
+          mkdir -p relay-dist
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp target/release/light-ear-relay.exe relay-dist/light-ear-relay-${{ matrix.platform }}.exe
+          else
+            cp target/release/light-ear-relay relay-dist/light-ear-relay-${{ matrix.platform }}
+          fi
+
+      - name: Build and upload Tauri bundle
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "light-ear ${{ github.ref_name }}"
+          releaseBody: "Automated light-ear desktop release."
+          releaseDraft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          args: --features fdk-aac-decoder
+
+      - name: Upload relay binary
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "light-ear ${{ github.ref_name }}"
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: relay-dist/*

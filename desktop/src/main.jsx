@@ -32,8 +32,8 @@ const listen = tauri?.event?.listen ?? previewListen;
 const previewListeners = new Map();
 
 const initialConfig = {
-  name: "link-ear",
-  topic: "link-ear.chat.v1",
+  name: "light-ear",
+  topic: "light-ear.chat.v1",
   peers: "",
   relays: "",
   noMdns: false,
@@ -145,8 +145,8 @@ function App() {
 
     const started = await callCommand("start_backend", {
       config: {
-        name: config.name.trim() || "link-ear",
-        topic: config.topic.trim() || "link-ear.chat.v1",
+        name: config.name.trim() || "light-ear",
+        topic: config.topic.trim() || "light-ear.chat.v1",
         listen: [],
         peer: lines(config.peers),
         relay: lines(config.relays),
@@ -213,7 +213,7 @@ function SetupPage({ config, room, setConfig, onSubmit, onOpenLog }) {
           <div className="setup-identity">
             <div className="compact-mark" aria-hidden="true"><span></span></div>
             <div>
-              <p className="overline">link-ear</p>
+              <p className="overline">light-ear</p>
               <h1>Connection</h1>
             </div>
           </div>
@@ -388,7 +388,7 @@ function RoomConsole({ config, room, setRoom, callCommand, onOpenLog }) {
 
       <section
         className={`chat-stage${peersDisconnected ? " has-connection-alert" : ""}`}
-        aria-label="link-ear room chat"
+        aria-label="light-ear room chat"
       >
         {peersDisconnected && (
           <ConnectionAlert onOpenPeers={() => setPeerOverviewOpen(true)} />
@@ -540,7 +540,7 @@ function RoomNavBar({
           </button>
         )}
         <div className="compact-mark" aria-hidden="true"><span></span></div>
-        <strong>link-ear</strong>
+        <strong>light-ear</strong>
       </div>
 
       <div className="nav-meta">
@@ -1350,8 +1350,8 @@ function Brand({ localPeerId }) {
     <header className="brand-block">
       <div className="mark" aria-hidden="true"><span></span></div>
       <div className="brand-copy">
-        <p className="overline">link-ear</p>
-        <h1>link-ear</h1>
+        <p className="overline">light-ear</p>
+        <h1>light-ear</h1>
         <p className="peer-chip">{localPeerId || "offline"}</p>
       </div>
     </header>
@@ -1635,7 +1635,7 @@ function createLogEntry(status, index) {
 
 async function exportStatusLogs(entries) {
   if (!entries.length) return "";
-  const filename = `link-ear-log-${formatFileTimestamp(new Date())}.jsonl`;
+  const filename = `light-ear-log-${formatFileTimestamp(new Date())}.jsonl`;
   const body = entries
     .map((entry) => JSON.stringify({
       at: new Date(entry.at).toISOString(),
@@ -1845,7 +1845,7 @@ async function previewInvoke(command, args = {}) {
       emitPreview("backend-event", { type: "status", payload: `local volume set to ${args.percent}%` });
       return;
     case "export_status_logs":
-      return `preview-downloads/${args.filename || "link-ear-log.jsonl"}`;
+      return `preview-downloads/${args.filename || "light-ear-log.jsonl"}`;
     default:
       return;
   }
