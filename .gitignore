@@ -4,6 +4,8 @@
 /node_modules
 /desktop/dist
 /.tmp
+/.tauri/*.key
+/.tauri/*.key.pub
 
 .env
 .env.*

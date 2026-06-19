@@ -88,6 +88,8 @@ jobs:
           releaseBody: "Automated light-ear desktop release."
           releaseDraft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
+          uploadUpdaterJson: true
+          uploadUpdaterSignatures: true
           args: --features fdk-aac-decoder
 
       - name: Upload relay binary

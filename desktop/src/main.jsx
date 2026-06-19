@@ -58,10 +58,19 @@ const initialRoom = {
   peerDropAlert: false,
 };
 
+const initialUpdate = {
+  status: "idle",
+  info: null,
+  progress: null,
+  message: "",
+};
+
 function App() {
   const [config, setConfig] = useState(initialConfig);
   const [room, setRoom] = useState(initialRoom);
+  const [update, setUpdate] = useState(initialUpdate);
   const [logOpen, setLogOpen] = useState(false);
+  const updateProgressBucket = useRef(-1);
   const isConnected = room.backendRunning && Boolean(room.localPeerId);
 
   useEffect(() => {
@@ -86,10 +95,78 @@ function App() {
     }
   }
 
+  function handleUpdaterEvent(event) {
+    const name = event?.event;
+    const version = event?.version;
+    if (name === "started") {
+      updateProgressBucket.current = -1;
+      setUpdate((current) => ({
+        ...current,
+        status: "installing",
+        progress: { downloaded: 0, contentLength: null },
+        message: "",
+      }));
+      setRoom((current) => appendStatus(current, `installing update ${version || ""}`.trim()));
+      return;
+    }
+
+    if (name === "progress") {
+      const downloaded = Number(event.downloaded) || 0;
+      const contentLength = Number(event.contentLength) || null;
+      setUpdate((current) => ({
+        ...current,
+        status: "installing",
+        progress: { downloaded, contentLength },
+        message: "",
+      }));
+      if (contentLength) {
+        const percent = Math.floor((downloaded / contentLength) * 100);
+        const bucket = Math.min(75, Math.floor(percent / 25) * 25);
+        if (bucket > updateProgressBucket.current && bucket > 0) {
+          updateProgressBucket.current = bucket;
+          setRoom((current) => appendStatus(current, `update download ${bucket}%`));
+        }
+      }
+      return;
+    }
+
+    if (name === "finished") {
+      setUpdate((current) => ({
+        ...current,
+        status: "installing",
+        progress: current.progress,
+        message: "download finished",
+      }));
+      setRoom((current) => appendStatus(current, "update download finished"));
+      return;
+    }
+
+    if (name === "installed") {
+      setUpdate((current) => ({
+        ...current,
+        status: "restarting",
+        message: "restarting",
+      }));
+      setRoom((current) => appendStatus(current, "update installed; restarting"));
+      return;
+    }
+
+    if (name === "failed") {
+      const message = event?.message || "update failed";
+      setUpdate((current) => ({
+        ...current,
+        status: "failed",
+        message,
+      }));
+      setRoom((current) => appendStatus(current, message));
+    }
+  }
+
   useEffect(() => {
     let mounted = true;
     let cleanupEvent = () => {};
     let cleanupError = () => {};
+    let cleanupUpdater = () => {};
 
     listen("backend-event", ({ payload }) => {
       if (!mounted) return;
@@ -105,10 +182,18 @@ function App() {
       cleanupError = unlisten;
     });
 
+    listen("updater-event", ({ payload }) => {
+      if (!mounted) return;
+      handleUpdaterEvent(payload);
+    }).then((unlisten) => {
+      cleanupUpdater = unlisten;
+    });
+
     return () => {
       mounted = false;
       cleanupEvent();
       cleanupError();
+      cleanupUpdater();
     };
   }, []);
 
@@ -116,6 +201,36 @@ function App() {
     if (!isPreview) {
       setRoom((current) => appendStatus(current, "choose a room identity and connect"));
     }
+  }, []);
+
+  useEffect(() => {
+    if (isPreview || import.meta.env.DEV) return undefined;
+    let canceled = false;
+    setUpdate((current) => ({ ...current, status: "checking", message: "" }));
+    invoke("check_for_update")
+      .then((info) => {
+        if (canceled) return;
+        if (info) {
+          setUpdate({
+            status: "available",
+            info,
+            progress: null,
+            message: "",
+          });
+          setRoom((current) => appendStatus(current, `update ${info.version} available`));
+        } else {
+          setUpdate(initialUpdate);
+        }
+      })
+      .catch((error) => {
+        if (canceled) return;
+        const message = `update check failed: ${formatError(error)}`;
+        setUpdate({ ...initialUpdate, status: "failed", message });
+        setRoom((current) => appendStatus(current, message));
+      });
+    return () => {
+      canceled = true;
+    };
   }, []);
 
   async function callCommand(command, args = {}, options = {}) {
@@ -170,22 +285,56 @@ function App() {
     }
   }
 
+  async function installAvailableUpdate() {
+    if (!update.info || update.status === "installing" || update.status === "restarting") {
+      return;
+    }
+
+    updateProgressBucket.current = -1;
+    setUpdate((current) => ({
+      ...current,
+      status: "installing",
+      progress: { downloaded: 0, contentLength: null },
+      message: "",
+    }));
+    try {
+      await invoke("install_update");
+      setUpdate((current) => ({
+        ...current,
+        status: "restarting",
+        message: "restarting",
+      }));
+    } catch (error) {
+      const message = `update install failed: ${formatError(error)}`;
+      setUpdate((current) => ({
+        ...current,
+        status: "failed",
+        message,
+      }));
+      setRoom((current) => appendStatus(current, message));
+    }
+  }
+
   return (
     <>
       {!isConnected ? (
         <SetupPage
           config={config}
           room={room}
+          update={update}
           setConfig={setConfig}
           onSubmit={startBackend}
+          onInstallUpdate={installAvailableUpdate}
           onOpenLog={() => setLogOpen(true)}
         />
       ) : (
         <RoomConsole
           config={config}
           room={room}
+          update={update}
           setRoom={setRoom}
           callCommand={callCommand}
+          onInstallUpdate={installAvailableUpdate}
           onOpenLog={() => setLogOpen(true)}
         />
       )}
@@ -202,7 +351,7 @@ function App() {
   );
 }
 
-function SetupPage({ config, room, setConfig, onSubmit, onOpenLog }) {
+function SetupPage({ config, room, update, setConfig, onSubmit, onInstallUpdate, onOpenLog }) {
   const statusText = room.backendStarting ? "starting" : "offline";
   const [showPeerSettings, setShowPeerSettings] = useState(false);
 
@@ -283,6 +432,7 @@ function SetupPage({ config, room, setConfig, onSubmit, onOpenLog }) {
               <span className="toggle-box" aria-hidden="true"></span>
               <span>mDNS off</span>
             </label>
+            <UpdateButton update={update} onInstallUpdate={onInstallUpdate} />
             <button className="btn primary" type="submit" disabled={room.backendStarting}>
               <Radio size={18} aria-hidden="true" />
               {room.backendStarting ? "Starting" : "Connect"}
@@ -298,7 +448,7 @@ function SetupPage({ config, room, setConfig, onSubmit, onOpenLog }) {
   );
 }
 
-function RoomConsole({ config, room, setRoom, callCommand, onOpenLog }) {
+function RoomConsole({ config, room, update, setRoom, callCommand, onInstallUpdate, onOpenLog }) {
   const [chatText, setChatText] = useState("");
   const [chatComposing, setChatComposing] = useState(false);
   const [queueOpen, setQueueOpen] = useState(false);
@@ -383,6 +533,8 @@ function RoomConsole({ config, room, setRoom, callCommand, onOpenLog }) {
         onQueue={openQueue}
         onOpenPeers={() => setPeerOverviewOpen(true)}
         onOpenLog={onOpenLog}
+        update={update}
+        onInstallUpdate={onInstallUpdate}
         displayName={displayName}
       />
 
@@ -491,6 +643,41 @@ function RoomConsole({ config, room, setRoom, callCommand, onOpenLog }) {
   );
 }
 
+function UpdateButton({ update, onInstallUpdate, compact = false }) {
+  if (!update || !["available", "installing", "restarting"].includes(update.status)) {
+    return null;
+  }
+
+  const percent = update.progress?.contentLength
+    ? Math.min(99, Math.floor((update.progress.downloaded / update.progress.contentLength) * 100))
+    : null;
+  const version = update.info?.version;
+  const label = update.status === "available"
+    ? compact ? "Update" : `Install ${version || "update"}`
+    : update.status === "restarting"
+      ? "Restarting"
+      : percent
+        ? `Updating ${percent}%`
+        : "Updating";
+  const title = update.status === "available" && version
+    ? `Install update ${version}`
+    : label;
+
+  return (
+    <button
+      className={`btn ${compact ? "ghost update-nav-button" : "subtle update-button"}`}
+      type="button"
+      title={title}
+      aria-label={title}
+      disabled={update.status !== "available"}
+      onClick={onInstallUpdate}
+    >
+      <Download size={16} aria-hidden="true" />
+      {label}
+    </button>
+  );
+}
+
 function ConnectionAlert({ onOpenPeers }) {
   return (
     <button
@@ -516,6 +703,8 @@ function RoomNavBar({
   onQueue,
   onOpenPeers,
   onOpenLog,
+  update,
+  onInstallUpdate,
   displayName,
 }) {
   const latestStatus = room.statuses.at(-1) ?? "quiet";
@@ -571,11 +760,14 @@ function RoomNavBar({
         <span>{latestStatus}</span>
       </button>
 
-      <button className="btn ghost queue-nav-button" type="button" onClick={onQueue}>
-        <ListMusic size={17} aria-hidden="true" />
-        Queue
-        <span className="button-count">{queueCount}</span>
-      </button>
+      <div className="nav-actions">
+        <UpdateButton update={update} onInstallUpdate={onInstallUpdate} compact />
+        <button className="btn ghost queue-nav-button" type="button" onClick={onQueue}>
+          <ListMusic size={17} aria-hidden="true" />
+          Queue
+          <span className="button-count">{queueCount}</span>
+        </button>
+      </div>
     </nav>
   );
 }
@@ -1846,6 +2038,10 @@ async function previewInvoke(command, args = {}) {
       return;
     case "export_status_logs":
       return `preview-downloads/${args.filename || "light-ear-log.jsonl"}`;
+    case "check_for_update":
+      return null;
+    case "install_update":
+      return;
     default:
       return;
   }

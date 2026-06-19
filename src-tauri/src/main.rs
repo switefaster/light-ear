@@ -3,7 +3,10 @@
 use std::{
     fs,
     path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::Duration,
 };
@@ -13,16 +16,23 @@ use light_ear::{
     backend::{self, BackendConfig},
     core::NetworkCommand,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::sync::{Mutex, mpsc};
 
 #[derive(Default)]
 struct BackendState {
     commands: Mutex<Option<mpsc::Sender<NetworkCommand>>>,
     closing: AtomicBool,
+}
+
+#[derive(Default)]
+struct UpdaterState {
+    pending: StdMutex<Option<Update>>,
+    installing: AtomicBool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -34,6 +44,88 @@ struct DesktopConfig {
     peer: Vec<String>,
     relay: Vec<String>,
     no_mdns: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateInfo {
+    version: String,
+    current_version: String,
+    date: Option<String>,
+    body: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdaterEvent {
+    event: &'static str,
+    version: Option<String>,
+    downloaded: Option<u64>,
+    content_length: Option<u64>,
+    message: Option<String>,
+}
+
+impl UpdateInfo {
+    fn from_update(update: &Update) -> Self {
+        Self {
+            version: update.version.clone(),
+            current_version: update.current_version.clone(),
+            date: update.date.map(|date| date.to_string()),
+            body: update.body.clone(),
+        }
+    }
+}
+
+impl UpdaterEvent {
+    fn started(version: String) -> Self {
+        Self {
+            event: "started",
+            version: Some(version),
+            downloaded: None,
+            content_length: None,
+            message: None,
+        }
+    }
+
+    fn progress(version: String, downloaded: u64, content_length: Option<u64>) -> Self {
+        Self {
+            event: "progress",
+            version: Some(version),
+            downloaded: Some(downloaded),
+            content_length,
+            message: None,
+        }
+    }
+
+    fn finished(version: String) -> Self {
+        Self {
+            event: "finished",
+            version: Some(version),
+            downloaded: None,
+            content_length: None,
+            message: None,
+        }
+    }
+
+    fn installed(version: String) -> Self {
+        Self {
+            event: "installed",
+            version: Some(version),
+            downloaded: None,
+            content_length: None,
+            message: None,
+        }
+    }
+
+    fn failed(message: String) -> Self {
+        Self {
+            event: "failed",
+            version: None,
+            downloaded: None,
+            content_length: None,
+            message: Some(message),
+        }
+    }
 }
 
 #[tauri::command]
@@ -214,6 +306,82 @@ async fn export_status_logs(
 }
 
 #[tauri::command]
+async fn check_for_update(
+    app: AppHandle,
+    state: State<'_, UpdaterState>,
+) -> Result<Option<UpdateInfo>, String> {
+    let update = app
+        .updater()
+        .map_err(|err| format!("failed to initialize updater: {err}"))?
+        .check()
+        .await
+        .map_err(|err| format!("failed to check for updates: {err}"))?;
+    let info = update.as_ref().map(UpdateInfo::from_update);
+    *state
+        .pending
+        .lock()
+        .map_err(|_| "updater state lock poisoned".to_string())? = update;
+    Ok(info)
+}
+
+#[tauri::command]
+async fn install_update(app: AppHandle, state: State<'_, UpdaterState>) -> Result<(), String> {
+    if state.installing.swap(true, Ordering::SeqCst) {
+        return Err("update installation is already running".to_string());
+    }
+
+    let update = state
+        .pending
+        .lock()
+        .map_err(|_| "updater state lock poisoned".to_string())?
+        .take();
+    let Some(update) = update else {
+        state.installing.store(false, Ordering::SeqCst);
+        return Err("no pending update; check for updates first".to_string());
+    };
+
+    let version = update.version.clone();
+    let _ = app.emit("updater-event", UpdaterEvent::started(version.clone()));
+
+    let mut downloaded = 0_u64;
+    let progress_app = app.clone();
+    let progress_version = version.clone();
+    let finished_app = app.clone();
+    let finished_version = version.clone();
+
+    let result = update
+        .download_and_install(
+            move |chunk_length, content_length| {
+                downloaded = downloaded.saturating_add(chunk_length as u64);
+                let _ = progress_app.emit(
+                    "updater-event",
+                    UpdaterEvent::progress(progress_version.clone(), downloaded, content_length),
+                );
+            },
+            move || {
+                let _ = finished_app.emit(
+                    "updater-event",
+                    UpdaterEvent::finished(finished_version.clone()),
+                );
+            },
+        )
+        .await;
+
+    match result {
+        Ok(()) => {
+            let _ = app.emit("updater-event", UpdaterEvent::installed(version));
+            app.restart()
+        }
+        Err(err) => {
+            state.installing.store(false, Ordering::SeqCst);
+            let message = format!("failed to install update: {err}");
+            let _ = app.emit("updater-event", UpdaterEvent::failed(message.clone()));
+            Err(message)
+        }
+    }
+}
+
+#[tauri::command]
 async fn shutdown_backend(state: State<'_, BackendState>) -> Result<(), String> {
     shutdown_backend_state(state.inner()).await;
     Ok(())
@@ -321,8 +489,10 @@ mod tests {
 fn main() {
     tauri::Builder::default()
         .manage(BackendState::default())
+        .manage(UpdaterState::default())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .on_window_event(|window, event| {
             if !matches!(event, WindowEvent::CloseRequested { .. }) {
                 return;
@@ -361,6 +531,8 @@ fn main() {
             move_queue_item,
             vote,
             export_status_logs,
+            check_for_update,
+            install_update,
             shutdown_backend
         ])
         .setup(|app| {

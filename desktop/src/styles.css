@@ -176,6 +176,7 @@ h2 {
   gap: 12px;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
 }
 
 .optional-peers {
@@ -222,7 +223,8 @@ h2 {
 
 .nav-brand,
 .nav-meta,
-.status-ticker {
+.status-ticker,
+.nav-actions {
   display: flex;
   align-items: center;
   min-width: 0;
@@ -362,6 +364,26 @@ h2 {
 .status-ticker:focus-visible {
   outline: 3px solid rgba(47, 159, 120, 0.28);
   outline-offset: 2px;
+}
+
+.nav-actions {
+  gap: 8px;
+  justify-content: end;
+}
+
+.update-button,
+.update-nav-button {
+  min-height: 38px;
+  white-space: nowrap;
+}
+
+.update-button {
+  padding-inline: 11px;
+}
+
+.update-nav-button {
+  min-width: 0;
+  padding-inline: 11px;
 }
 
 .queue-nav-button {
@@ -1978,8 +2000,14 @@ h2 {
     display: flex;
   }
 
-  .queue-nav-button {
+  .nav-actions {
     grid-area: queue;
+  }
+
+  .queue-nav-button,
+  .update-nav-button {
+    min-width: 44px;
+    padding-inline: 10px;
   }
 
   .player-dock {
@@ -2111,11 +2139,6 @@ h2 {
 
   .nav-brand strong {
     display: none;
-  }
-
-  .queue-nav-button {
-    min-width: 44px;
-    padding-inline: 10px;
   }
 
   .queue-drawer {

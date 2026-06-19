@@ -25,6 +25,11 @@ Build the desktop bundle:
 npx --yes @tauri-apps/cli@^2 build
 ```
 
+Release builds are signed for the Tauri updater. The public updater key is in
+`src-tauri/tauri.conf.json`; keep `.tauri/light-ear-updater.key` private and set
+its contents as the GitHub secret `TAURI_SIGNING_PRIVATE_KEY`. If the key is
+password-protected, set `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` as well.
+
 The relay address is also used as a rendezvous server. Each client registers under the current topic, periodically discovers other peers in that topic, dials their relayed addresses, and then tries to upgrade relay-only peers to direct P2P connections when possible.
 
 Run a minimal public relay plus rendezvous node on a reachable host:
