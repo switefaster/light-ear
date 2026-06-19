@@ -37,6 +37,13 @@ use crate::{
 };
 
 const MEDIA_RANGE_FETCH_ATTEMPTS: usize = 3;
+const STREAM_BUFFER_TARGET_MS: u64 = media_cache::HIGH_WATERMARK_MS * 2;
+const STREAM_BUFFER_RESUME_MS: u64 = media_cache::HIGH_WATERMARK_MS;
+const STREAM_PCM_RETAIN_BEHIND_MS: u64 = media_cache::LOW_WATERMARK_MS;
+const STREAM_PCM_TRIM_GRANULARITY_MS: u64 = 1_000;
+const STREAM_BYTE_RETAIN_BEHIND_BYTES: u64 = media_cache::STREAM_CHUNK_BYTES * 4;
+const STREAM_DOWNLOAD_IDLE_SLEEP_MS: u64 = 250;
+const STREAM_DECODE_IDLE_SLEEP_MS: u64 = 100;
 
 pub struct AudioPlayer {
     stream: MixerDeviceSink,
@@ -74,6 +81,7 @@ struct StreamingPcmSource {
     channels: NonZeroU16,
     sample_rate: NonZeroU32,
     base_position_ms: u64,
+    dropped_samples: u64,
     volume: Arc<AtomicU32>,
     position_ms: Arc<AtomicU64>,
     event_tx: mpsc::UnboundedSender<AudioPlayerEvent>,
@@ -102,10 +110,10 @@ struct SharedBytes {
 struct StreamingBytesState {
     chunks: Vec<StreamingByteChunk>,
     total_bytes: Option<u64>,
-    complete: bool,
     canceled: bool,
     error: Option<String>,
     ranges: media_cache::RangeIndex,
+    pinned_ranges: Vec<media_cache::ByteRange>,
     requested_offsets: VecDeque<u64>,
 }
 
@@ -125,6 +133,7 @@ struct StreamingPcmState {
     channels: Option<NonZeroU16>,
     sample_rate: Option<NonZeroU32>,
     base_position_ms: u64,
+    dropped_samples: u64,
     complete: bool,
     canceled: bool,
     error: Option<String>,
@@ -422,11 +431,13 @@ impl AudioPlayer {
         let download_operation_id = operation_id.clone();
         let download_session_id = session_id.clone();
         let download_position_ms = position_ms;
+        let download_position = Arc::clone(&position);
         tokio::spawn(async move {
             if let Err(err) = download_streaming_bytes(
                 download_client,
                 download_track.clone(),
                 download_position_ms,
+                download_position,
                 download_bytes,
             )
             .await
@@ -450,6 +461,7 @@ impl AudioPlayer {
         let decode_bytes = bytes;
         let decode_pcm = pcm;
         let decode_token = decoder;
+        let decode_position = Arc::clone(&position);
         tokio::task::spawn_blocking(move || {
             decode_streaming_audio(
                 decode_bytes,
@@ -460,6 +472,7 @@ impl AudioPlayer {
                 session_id,
                 track,
                 position_ms,
+                decode_position,
             );
         });
 
@@ -913,6 +926,71 @@ fn should_emit_stream_cache_event(
         || (!ready_sent && buffered_until_ms >= ready_until_ms)
 }
 
+fn stream_byte_offset_for_position(position_ms: u64, duration_ms: u64, total_bytes: u64) -> u64 {
+    if duration_ms == 0 || total_bytes == 0 {
+        return 0;
+    }
+
+    position_ms
+        .min(duration_ms)
+        .saturating_mul(total_bytes)
+        .saturating_div(duration_ms)
+        .min(total_bytes.saturating_sub(1))
+}
+
+fn stream_byte_range_for_window(
+    position_ms: u64,
+    window_ms: u64,
+    duration_ms: u64,
+    total_bytes: u64,
+) -> media_cache::ByteRange {
+    if total_bytes == 0 {
+        return media_cache::ByteRange {
+            start: 0,
+            end_inclusive: 0,
+        };
+    }
+
+    let start = stream_byte_offset_for_position(position_ms, duration_ms, total_bytes);
+    let end_position_ms = position_ms.saturating_add(window_ms).min(duration_ms);
+    let end = stream_byte_offset_for_position(end_position_ms, duration_ms, total_bytes)
+        .saturating_add(256 * 1024)
+        .min(total_bytes.saturating_sub(1));
+    media_cache::ByteRange {
+        start,
+        end_inclusive: end.max(start),
+    }
+}
+
+fn retain_streaming_byte_window(
+    shared: &SharedBytes,
+    position_ms: u64,
+    duration_ms: u64,
+    total_bytes: u64,
+) {
+    if total_bytes == 0 {
+        return;
+    }
+
+    let anchor = stream_byte_offset_for_position(position_ms, duration_ms, total_bytes);
+    let target = stream_byte_range_for_window(
+        position_ms,
+        STREAM_BUFFER_TARGET_MS,
+        duration_ms,
+        total_bytes,
+    );
+    let retain_start = anchor.saturating_sub(STREAM_BYTE_RETAIN_BEHIND_BYTES);
+    let retain_end = target
+        .end_inclusive
+        .saturating_add(media_cache::STREAM_CHUNK_BYTES)
+        .min(total_bytes.saturating_sub(1));
+    shared.retain_window(retain_start, retain_end);
+}
+
+fn ranges_overlap(left: media_cache::ByteRange, right: media_cache::ByteRange) -> bool {
+    left.start <= right.end_inclusive && right.start <= left.end_inclusive
+}
+
 fn is_audio_track(track: &Track) -> bool {
     track.codec_params.codec != CODEC_TYPE_NULL
         && (track.codec_params.channels.is_some() || track.codec_params.sample_rate.is_some())
@@ -1010,12 +1088,14 @@ impl StreamingPcmSource {
         let pos = frames
             .saturating_mul(channels.get() as u128)
             .min(usize::MAX as u128) as usize;
+        let dropped_samples = shared.dropped_samples();
         Self {
             shared,
             pos: pos - pos % channels.get() as usize,
             channels,
             sample_rate,
             base_position_ms,
+            dropped_samples,
             volume,
             position_ms: position,
             event_tx,
@@ -1038,6 +1118,23 @@ impl StreamingPcmSource {
             Ordering::Relaxed,
         );
     }
+
+    fn sync_shared_base_position(&mut self) {
+        let (next_base_position_ms, next_dropped_samples) = self.shared.window_start();
+        if next_dropped_samples <= self.dropped_samples
+            && next_base_position_ms <= self.base_position_ms
+        {
+            return;
+        }
+
+        let dropped_samples = next_dropped_samples.saturating_sub(self.dropped_samples);
+        self.pos = self
+            .pos
+            .saturating_sub(dropped_samples.min(usize::MAX as u64) as usize);
+        self.pos -= self.pos % self.channels.get() as usize;
+        self.base_position_ms = next_base_position_ms;
+        self.dropped_samples = next_dropped_samples;
+    }
 }
 
 impl Iterator for StreamingPcmSource {
@@ -1045,6 +1142,7 @@ impl Iterator for StreamingPcmSource {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
+            self.sync_shared_base_position();
             match self.shared.sample(self.pos) {
                 PcmSample::Ready(sample) => {
                     self.pos += 1;
@@ -1251,10 +1349,10 @@ impl SharedBytes {
                 Mutex::new(StreamingBytesState {
                     chunks: Vec::new(),
                     total_bytes: None,
-                    complete: false,
                     canceled: false,
                     error: None,
                     ranges: media_cache::RangeIndex::default(),
+                    pinned_ranges: Vec::new(),
                     requested_offsets: VecDeque::new(),
                 }),
                 Condvar::new(),
@@ -1287,17 +1385,47 @@ impl SharedBytes {
         condvar.notify_all();
     }
 
+    fn pin_ranges(&self, ranges: &[media_cache::ByteRange]) {
+        if ranges.is_empty() {
+            return;
+        }
+
+        let (lock, condvar) = &*self.inner;
+        let mut state = lock.lock().expect("streaming bytes lock poisoned");
+        for range in ranges {
+            if !state.pinned_ranges.contains(range) {
+                state.pinned_ranges.push(*range);
+            }
+        }
+        condvar.notify_all();
+    }
+
+    fn retain_window(&self, retain_start: u64, retain_end: u64) {
+        let (lock, condvar) = &*self.inner;
+        let mut state = lock.lock().expect("streaming bytes lock poisoned");
+        let window = media_cache::ByteRange {
+            start: retain_start,
+            end_inclusive: retain_end.max(retain_start),
+        };
+        let pinned_ranges = state.pinned_ranges.clone();
+        state.chunks.retain(|chunk| {
+            ranges_overlap(chunk.range, window)
+                || pinned_ranges
+                    .iter()
+                    .any(|pinned| ranges_overlap(chunk.range, *pinned))
+        });
+        let mut ranges = media_cache::RangeIndex::default();
+        for chunk in &state.chunks {
+            ranges.insert(chunk.range);
+        }
+        state.ranges = ranges;
+        condvar.notify_all();
+    }
+
     fn fail(&self, error: String) {
         let (lock, condvar) = &*self.inner;
         let mut state = lock.lock().expect("streaming bytes lock poisoned");
         state.error = Some(error);
-        condvar.notify_all();
-    }
-
-    fn complete(&self) {
-        let (lock, condvar) = &*self.inner;
-        let mut state = lock.lock().expect("streaming bytes lock poisoned");
-        state.complete = true;
         condvar.notify_all();
     }
 
@@ -1379,12 +1507,34 @@ impl SharedBytes {
         None
     }
 
-    fn contiguous_prefix_end(&self) -> Option<u64> {
+    fn first_missing_offset(&self, range: media_cache::ByteRange) -> Option<u64> {
+        let (lock, _) = &*self.inner;
+        let state = lock.lock().expect("streaming bytes lock poisoned");
+        let mut cursor = range.start;
+        for cached in state.ranges.ranges() {
+            if cached.end_inclusive < cursor {
+                continue;
+            }
+            if cached.start > cursor {
+                return Some(cursor);
+            }
+            cursor = cached.end_inclusive.saturating_add(1);
+            if cursor > range.end_inclusive {
+                return None;
+            }
+        }
+        Some(cursor).filter(|offset| *offset <= range.end_inclusive)
+    }
+
+    #[cfg(test)]
+    fn in_memory_bytes(&self) -> u64 {
         let (lock, _) = &*self.inner;
         lock.lock()
             .expect("streaming bytes lock poisoned")
-            .ranges
-            .contiguous_until(0)
+            .chunks
+            .iter()
+            .map(|chunk| chunk.bytes.len() as u64)
+            .sum()
     }
 
     fn read_at(
@@ -1425,9 +1575,6 @@ impl SharedBytes {
                 buf[..len].copy_from_slice(&chunk.bytes[start..start + len]);
                 return Ok(len);
             }
-            if state.complete {
-                return Ok(0);
-            }
             if !decoder.is_canceled() {
                 if !state.requested_offsets.contains(&offset) {
                     state.requested_offsets.push_back(offset);
@@ -1459,6 +1606,7 @@ impl SharedPcm {
                     channels: None,
                     sample_rate: None,
                     base_position_ms: 0,
+                    dropped_samples: 0,
                     complete: false,
                     canceled: false,
                     error: None,
@@ -1502,6 +1650,42 @@ impl SharedPcm {
         condvar.notify_all();
     }
 
+    fn trim_before(&self, position_ms: u64, retain_behind_ms: u64) {
+        let (lock, condvar) = &*self.inner;
+        let mut state = lock.lock().expect("streaming pcm lock poisoned");
+        let (Some(channels), Some(sample_rate)) = (state.channels, state.sample_rate) else {
+            return;
+        };
+        let retain_from_ms = position_ms.saturating_sub(retain_behind_ms);
+        if retain_from_ms <= state.base_position_ms {
+            return;
+        }
+
+        let elapsed_ms = retain_from_ms.saturating_sub(state.base_position_ms);
+        if elapsed_ms < STREAM_PCM_TRIM_GRANULARITY_MS {
+            return;
+        }
+        let frames_to_drop = (elapsed_ms as u128)
+            .saturating_mul(sample_rate.get() as u128)
+            .saturating_div(1000);
+        let available_frames = (state.samples.len() / channels.get() as usize) as u128;
+        let frames_to_drop = frames_to_drop.min(available_frames);
+        if frames_to_drop == 0 {
+            return;
+        }
+
+        let samples_to_drop = frames_to_drop
+            .saturating_mul(channels.get() as u128)
+            .min(state.samples.len() as u128) as usize;
+        state.samples.drain(0..samples_to_drop);
+        state.dropped_samples = state.dropped_samples.saturating_add(samples_to_drop as u64);
+        let advanced_ms = frames_to_drop
+            .saturating_mul(1000)
+            .saturating_div(sample_rate.get() as u128) as u64;
+        state.base_position_ms = state.base_position_ms.saturating_add(advanced_ms);
+        condvar.notify_all();
+    }
+
     fn fail(&self, error: String) {
         let (lock, condvar) = &*self.inner;
         let mut state = lock.lock().expect("streaming pcm lock poisoned");
@@ -1534,6 +1718,19 @@ impl SharedPcm {
         lock.lock()
             .expect("streaming pcm lock poisoned")
             .base_position_ms
+    }
+
+    fn dropped_samples(&self) -> u64 {
+        let (lock, _) = &*self.inner;
+        lock.lock()
+            .expect("streaming pcm lock poisoned")
+            .dropped_samples
+    }
+
+    fn window_start(&self) -> (u64, u64) {
+        let (lock, _) = &*self.inner;
+        let state = lock.lock().expect("streaming pcm lock poisoned");
+        (state.base_position_ms, state.dropped_samples)
     }
 
     fn duration_ms(&self) -> u64 {
@@ -1616,6 +1813,7 @@ impl StreamingSession {
         }
 
         let bytes = self.bytes.clone();
+        let playback_position = Arc::clone(&self.position_ms);
         tokio::task::spawn_blocking(move || {
             decode_streaming_audio(
                 bytes,
@@ -1626,6 +1824,7 @@ impl StreamingSession {
                 session_id,
                 track,
                 position_ms,
+                playback_position,
             );
         });
     }
@@ -1742,6 +1941,7 @@ async fn download_streaming_bytes(
     client: reqwest::Client,
     track: PlaybackTrack,
     position_ms: u64,
+    playback_position: Arc<AtomicU64>,
     shared: SharedBytes,
 ) -> Result<()> {
     let root = media_cache::cache_root();
@@ -1755,38 +1955,77 @@ async fn download_streaming_bytes(
         .ok_or_else(|| anyhow!("media range probe did not report total length"))?;
     shared.set_total(Some(total));
 
-    let mut next_sequential = shared
-        .contiguous_prefix_end()
-        .map_or(0, |end| end.saturating_add(1));
-    for range in media_cache::metadata_ranges(&track, total) {
+    let metadata_ranges = media_cache::metadata_ranges(&track, total);
+    shared.pin_ranges(&metadata_ranges);
+    for range in &metadata_ranges {
         shared.request_offset(range.start);
     }
-    if position_ms > 0 {
-        let seek_window = media_cache::range_for_window(position_ms, track.duration_ms, total);
-        shared.prioritize_offset(seek_window.start);
-    }
+    let initial_window = stream_byte_range_for_window(
+        position_ms,
+        STREAM_BUFFER_TARGET_MS,
+        track.duration_ms,
+        total,
+    );
+    shared.prioritize_offset(initial_window.start);
 
-    while shared.contiguous_prefix_end() != Some(total.saturating_sub(1)) {
+    let mut prefetch_paused = false;
+    loop {
         if shared.is_canceled() {
             return Ok(());
         }
 
-        let start = shared
-            .take_requested_offset(total)
-            .unwrap_or(next_sequential)
-            .min(total.saturating_sub(1));
+        let current_position_ms = playback_position
+            .load(Ordering::Relaxed)
+            .min(track.duration_ms);
+        retain_streaming_byte_window(&shared, current_position_ms, track.duration_ms, total);
+
+        let target_window = stream_byte_range_for_window(
+            current_position_ms,
+            STREAM_BUFFER_TARGET_MS,
+            track.duration_ms,
+            total,
+        );
+        let resume_window = stream_byte_range_for_window(
+            current_position_ms,
+            STREAM_BUFFER_RESUME_MS,
+            track.duration_ms,
+            total,
+        );
+        let (start, end_cap) = if let Some(requested) = shared.take_requested_offset(total) {
+            prefetch_paused = false;
+            (
+                requested.min(total.saturating_sub(1)),
+                total.saturating_sub(1),
+            )
+        } else {
+            if prefetch_paused && shared.covers(resume_window) {
+                tokio::time::sleep(Duration::from_millis(STREAM_DOWNLOAD_IDLE_SLEEP_MS)).await;
+                continue;
+            }
+
+            if shared.covers(target_window) {
+                prefetch_paused = true;
+                tokio::time::sleep(Duration::from_millis(STREAM_DOWNLOAD_IDLE_SLEEP_MS)).await;
+                continue;
+            }
+
+            prefetch_paused = false;
+            let Some(missing) = shared.first_missing_offset(target_window) else {
+                tokio::time::sleep(Duration::from_millis(STREAM_DOWNLOAD_IDLE_SLEEP_MS)).await;
+                continue;
+            };
+            (
+                missing.min(total.saturating_sub(1)),
+                target_window.end_inclusive,
+            )
+        };
         let end = start
             .saturating_add(media_cache::STREAM_CHUNK_BYTES)
             .saturating_sub(1)
+            .min(end_cap)
             .min(total.saturating_sub(1));
         let range = media_cache::ByteRange::new(start, end)?;
         if shared.covers(range) {
-            next_sequential = shared
-                .contiguous_prefix_end()
-                .map_or(next_sequential, |end| end.saturating_add(1));
-            if next_sequential >= total {
-                break;
-            }
             continue;
         }
         let mut fetched = None;
@@ -1817,14 +2056,12 @@ async fn download_streaming_bytes(
         let (bytes, _) = fetched.expect("range fetch succeeded or returned");
         write_cache_chunk(&media_path, start, &bytes)?;
         shared.append(&bytes, range);
-        next_sequential = shared
-            .contiguous_prefix_end()
-            .map_or(next_sequential, |end| end.saturating_add(1));
+        let current_position_ms = playback_position
+            .load(Ordering::Relaxed)
+            .min(track.duration_ms);
+        retain_streaming_byte_window(&shared, current_position_ms, track.duration_ms, total);
         let _ = media_cache::evict_cache(&root, media_cache::MAX_CACHE_BYTES);
     }
-
-    shared.complete();
-    Ok(())
 }
 
 fn write_cache_chunk(path: &PathBuf, start: u64, bytes: &[u8]) -> Result<()> {
@@ -1837,6 +2074,38 @@ fn write_cache_chunk(path: &PathBuf, start: u64, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn throttle_streaming_decode(
+    pcm: &SharedPcm,
+    playback_position: &AtomicU64,
+    duration_ms: u64,
+    decoder_token: &DecodeToken,
+) {
+    loop {
+        if decoder_token.is_canceled() {
+            return;
+        }
+
+        let current_position_ms = playback_position.load(Ordering::Relaxed).min(duration_ms);
+        pcm.trim_before(current_position_ms, STREAM_PCM_RETAIN_BEHIND_MS);
+        let buffered_until_ms = pcm.buffered_until_ms().min(duration_ms);
+        let target_until_ms = current_position_ms
+            .saturating_add(STREAM_BUFFER_TARGET_MS)
+            .min(duration_ms);
+        if target_until_ms >= duration_ms || buffered_until_ms < target_until_ms {
+            return;
+        }
+
+        let resume_until_ms = current_position_ms
+            .saturating_add(STREAM_BUFFER_RESUME_MS)
+            .min(duration_ms);
+        if buffered_until_ms <= resume_until_ms {
+            return;
+        }
+
+        std::thread::sleep(Duration::from_millis(STREAM_DECODE_IDLE_SLEEP_MS));
+    }
+}
+
 fn decode_streaming_audio(
     bytes: SharedBytes,
     pcm: SharedPcm,
@@ -1846,6 +2115,7 @@ fn decode_streaming_audio(
     session_id: String,
     track: PlaybackTrack,
     position_ms: u64,
+    playback_position: Arc<AtomicU64>,
 ) {
     if let Err(err) = decode_streaming_audio_inner(
         bytes,
@@ -1856,6 +2126,7 @@ fn decode_streaming_audio(
         session_id.clone(),
         track.clone(),
         position_ms,
+        playback_position,
     ) {
         if decoder_token.is_canceled() {
             return;
@@ -1881,6 +2152,7 @@ fn decode_streaming_audio_inner(
     session_id: String,
     track: PlaybackTrack,
     position_ms: u64,
+    playback_position: Arc<AtomicU64>,
 ) -> Result<()> {
     let source = StreamingMediaSource::new(bytes, decoder_token.clone());
     let mss = MediaSourceStream::new(Box::new(source), Default::default());
@@ -1955,6 +2227,12 @@ fn decode_streaming_audio_inner(
 
                 let packet_samples = decoded_to_interleaved_f32(decoded);
                 pcm.push_samples(&packet_samples);
+                pcm.trim_before(
+                    playback_position
+                        .load(Ordering::Relaxed)
+                        .min(track.duration_ms),
+                    STREAM_PCM_RETAIN_BEHIND_MS,
+                );
                 decode_errors = 0;
 
                 let buffered_until_ms = pcm.buffered_until_ms().min(track.duration_ms);
@@ -2002,6 +2280,13 @@ fn decode_streaming_audio_inner(
                         },
                     });
                 }
+
+                throttle_streaming_decode(
+                    &pcm,
+                    &playback_position,
+                    track.duration_ms,
+                    &decoder_token,
+                );
             }
             Err(SymphoniaError::DecodeError(err)) => {
                 decode_errors += 1;
@@ -2118,6 +2403,21 @@ mod tests {
     }
 
     #[test]
+    fn shared_pcm_trims_consumed_samples_and_moves_base() {
+        let pcm = SharedPcm::new();
+        pcm.set_spec(NonZeroU16::new(1).unwrap(), NonZeroU32::new(10).unwrap())
+            .unwrap();
+        let samples = (0..100).map(|sample| sample as f32).collect::<Vec<_>>();
+        pcm.push_samples(&samples);
+
+        pcm.trim_before(8_000, 2_000);
+
+        assert_eq!(pcm.base_position_ms(), 6_000);
+        assert_eq!(pcm.duration_ms(), 4_000);
+        assert!(matches!(pcm.sample(0), PcmSample::Ready(sample) if sample == 60.0));
+    }
+
+    #[test]
     fn stream_ready_for_position_reuses_buffered_seek_window() {
         assert!(stream_ready_for_position(30_000, 120_000, 45_000, false));
         assert!(!stream_ready_for_position(30_000, 120_000, 39_000, false));
@@ -2209,6 +2509,39 @@ mod tests {
     }
 
     #[test]
+    fn streaming_source_continues_after_pcm_window_is_trimmed() {
+        let pcm = SharedPcm::new();
+        let channels = NonZeroU16::new(1).unwrap();
+        let sample_rate = NonZeroU32::new(10).unwrap();
+        pcm.set_spec(channels, sample_rate).unwrap();
+        let samples = (0..100).map(|sample| sample as f32).collect::<Vec<_>>();
+        pcm.push_samples(&samples);
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let position = Arc::new(AtomicU64::new(0));
+        let mut source = StreamingPcmSource::new(
+            pcm.clone(),
+            0,
+            channels,
+            sample_rate,
+            0,
+            Arc::new(AtomicU32::new(1.0_f32.to_bits())),
+            Arc::clone(&position),
+            event_tx,
+            "session".to_string(),
+            "track".to_string(),
+            10_000,
+        );
+
+        for _ in 0..50 {
+            assert!(source.next().is_some());
+        }
+        pcm.trim_before(7_000, 2_000);
+
+        assert_eq!(source.next(), Some(50.0));
+        assert_eq!(position.load(Ordering::Relaxed), 5_100);
+    }
+
+    #[test]
     fn shared_bytes_wakes_readers_on_cancel() {
         let bytes = SharedBytes::new();
         bytes.cancel();
@@ -2246,6 +2579,48 @@ mod tests {
             2
         );
         assert_eq!(buf, [11, 12]);
+    }
+
+    #[test]
+    fn shared_bytes_retain_window_drops_old_unpinned_chunks() {
+        let bytes = SharedBytes::new();
+        bytes.set_total(Some(2_000));
+        bytes.append(&[1; 100], media_cache::ByteRange::new(0, 99).unwrap());
+        bytes.append(&[2; 100], media_cache::ByteRange::new(500, 599).unwrap());
+        bytes.append(
+            &[3; 100],
+            media_cache::ByteRange::new(1_000, 1_099).unwrap(),
+        );
+
+        bytes.retain_window(450, 650);
+
+        assert_eq!(bytes.in_memory_bytes(), 100);
+        assert_eq!(
+            bytes.first_missing_offset(media_cache::ByteRange::new(500, 700).unwrap()),
+            Some(600)
+        );
+        let mut buf = [0_u8; 2];
+        assert_eq!(
+            bytes.read_at(500, &mut buf, &DecodeToken::new()).unwrap(),
+            2
+        );
+        assert_eq!(buf, [2, 2]);
+    }
+
+    #[test]
+    fn shared_bytes_retain_window_keeps_pinned_metadata_chunks() {
+        let bytes = SharedBytes::new();
+        bytes.set_total(Some(2_000));
+        bytes.pin_ranges(&[media_cache::ByteRange::new(0, 9).unwrap()]);
+        bytes.append(&[1; 100], media_cache::ByteRange::new(0, 99).unwrap());
+        bytes.append(&[2; 100], media_cache::ByteRange::new(500, 599).unwrap());
+
+        bytes.retain_window(450, 650);
+
+        assert_eq!(bytes.in_memory_bytes(), 200);
+        let mut buf = [0_u8; 2];
+        assert_eq!(bytes.read_at(0, &mut buf, &DecodeToken::new()).unwrap(), 2);
+        assert_eq!(buf, [1, 1]);
     }
 
     #[test]
