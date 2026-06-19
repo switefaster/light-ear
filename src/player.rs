@@ -43,6 +43,7 @@ const STREAM_PCM_RETAIN_BEHIND_MS: u64 = media_cache::LOW_WATERMARK_MS;
 const STREAM_PCM_TRIM_GRANULARITY_MS: u64 = 1_000;
 const STREAM_BYTE_RETAIN_BEHIND_BYTES: u64 = media_cache::STREAM_CHUNK_BYTES * 4;
 const STREAM_DOWNLOAD_IDLE_SLEEP_MS: u64 = 250;
+const STREAM_RANGE_FETCH_SPACING_MS: u64 = 100;
 const STREAM_DECODE_IDLE_SLEEP_MS: u64 = 100;
 
 pub struct AudioPlayer {
@@ -960,6 +961,15 @@ fn stream_byte_range_for_window(
         start,
         end_inclusive: end.max(start),
     }
+}
+
+fn stream_fetch_range(start: u64, total_bytes: u64) -> Result<media_cache::ByteRange> {
+    let start = start.min(total_bytes.saturating_sub(1));
+    let end = start
+        .saturating_add(media_cache::STREAM_CHUNK_BYTES)
+        .saturating_sub(1)
+        .min(total_bytes.saturating_sub(1));
+    media_cache::ByteRange::new(start, end)
 }
 
 fn retain_streaming_byte_window(
@@ -1991,12 +2001,9 @@ async fn download_streaming_bytes(
             track.duration_ms,
             total,
         );
-        let (start, end_cap) = if let Some(requested) = shared.take_requested_offset(total) {
+        let start = if let Some(requested) = shared.take_requested_offset(total) {
             prefetch_paused = false;
-            (
-                requested.min(total.saturating_sub(1)),
-                total.saturating_sub(1),
-            )
+            requested.min(total.saturating_sub(1))
         } else {
             if prefetch_paused && shared.covers(resume_window) {
                 tokio::time::sleep(Duration::from_millis(STREAM_DOWNLOAD_IDLE_SLEEP_MS)).await;
@@ -2014,17 +2021,9 @@ async fn download_streaming_bytes(
                 tokio::time::sleep(Duration::from_millis(STREAM_DOWNLOAD_IDLE_SLEEP_MS)).await;
                 continue;
             };
-            (
-                missing.min(total.saturating_sub(1)),
-                target_window.end_inclusive,
-            )
+            missing.min(total.saturating_sub(1))
         };
-        let end = start
-            .saturating_add(media_cache::STREAM_CHUNK_BYTES)
-            .saturating_sub(1)
-            .min(end_cap)
-            .min(total.saturating_sub(1));
-        let range = media_cache::ByteRange::new(start, end)?;
+        let range = stream_fetch_range(start, total)?;
         if shared.covers(range) {
             continue;
         }
@@ -2061,6 +2060,7 @@ async fn download_streaming_bytes(
             .min(track.duration_ms);
         retain_streaming_byte_window(&shared, current_position_ms, track.duration_ms, total);
         let _ = media_cache::evict_cache(&root, media_cache::MAX_CACHE_BYTES);
+        tokio::time::sleep(Duration::from_millis(STREAM_RANGE_FETCH_SPACING_MS)).await;
     }
 }
 
@@ -2371,6 +2371,25 @@ mod tests {
         assert_eq!(volume_percent_to_gain(0), 0.0);
         assert_eq!(volume_percent_to_gain(50), 0.5);
         assert_eq!(volume_percent_to_gain(100), 1.0);
+    }
+
+    #[test]
+    fn stream_fetch_range_uses_full_chunks() {
+        let total = media_cache::STREAM_CHUNK_BYTES * 10;
+        let range = stream_fetch_range(3_622_827, total).unwrap();
+
+        assert_eq!(range.start, 3_622_827);
+        assert_eq!(range.len(), media_cache::STREAM_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn stream_fetch_range_clamps_at_media_end() {
+        let total = media_cache::STREAM_CHUNK_BYTES + 1;
+        let range = stream_fetch_range(media_cache::STREAM_CHUNK_BYTES, total).unwrap();
+
+        assert_eq!(range.start, media_cache::STREAM_CHUNK_BYTES);
+        assert_eq!(range.end_inclusive, media_cache::STREAM_CHUNK_BYTES);
+        assert_eq!(range.len(), 1);
     }
 
     #[test]
