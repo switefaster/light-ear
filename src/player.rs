@@ -43,6 +43,7 @@ const STREAM_PCM_RETAIN_BEHIND_MS: u64 = media_cache::LOW_WATERMARK_MS;
 const STREAM_PCM_TRIM_GRANULARITY_MS: u64 = 1_000;
 const STREAM_BYTE_RETAIN_BEHIND_BYTES: u64 = media_cache::STREAM_CHUNK_BYTES * 4;
 const STREAM_MAX_PENDING_OFFSETS: usize = 6;
+const STREAM_FULL_FETCH_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 const STREAM_DOWNLOAD_IDLE_SLEEP_MS: u64 = 250;
 const STREAM_RANGE_REQUEST_SPACING_MS: u64 = 750;
 const STREAM_THROTTLE_RETRY_DELAY_MS: u64 = 10_000;
@@ -1033,6 +1034,13 @@ fn describe_retry_delay(delay: Duration) -> String {
     } else {
         format!("{}ms", delay.as_millis())
     }
+}
+
+fn should_full_fetch_missing_metadata(
+    metadata_ranges: &[media_cache::ByteRange],
+    total_bytes: u64,
+) -> bool {
+    metadata_ranges.is_empty() && total_bytes > 0 && total_bytes <= STREAM_FULL_FETCH_LIMIT_BYTES
 }
 
 fn retain_streaming_byte_window(
@@ -2097,6 +2105,37 @@ async fn download_streaming_bytes(
 
     let metadata_ranges = media_cache::metadata_ranges(&track, total);
     shared.pin_ranges(&metadata_ranges);
+    if should_full_fetch_missing_metadata(&metadata_ranges, total) {
+        send_download_status(
+            &event_tx,
+            operation_id.as_deref(),
+            &session_id,
+            &track.track_id,
+            format!(
+                "media has no byte metadata; downloading {} in one request",
+                format_byte_size(total)
+            ),
+        );
+        let bytes = fetch_full_media_with_retry(
+            &client,
+            &track,
+            &shared,
+            &mut request_pacer,
+            &event_tx,
+            operation_id.as_deref(),
+            &session_id,
+        )
+        .await?;
+        if bytes.len() as u64 != total {
+            return Err(anyhow!(
+                "full media download returned {} bytes, expected {total}",
+                bytes.len()
+            ));
+        }
+        let full_range = media_cache::ByteRange::new(0, total.saturating_sub(1))?;
+        write_cache_chunk(&media_path, 0, &bytes)?;
+        shared.append(&bytes, full_range);
+    }
     for range in &metadata_ranges {
         shared.request_offset(range.start);
     }
@@ -2175,6 +2214,44 @@ async fn download_streaming_bytes(
             .min(track.duration_ms);
         retain_streaming_byte_window(&shared, current_position_ms, track.duration_ms, total);
         let _ = media_cache::evict_cache(&root, media_cache::MAX_CACHE_BYTES);
+    }
+}
+
+async fn fetch_full_media_with_retry(
+    client: &reqwest::Client,
+    track: &PlaybackTrack,
+    shared: &SharedBytes,
+    request_pacer: &mut StreamRequestPacer,
+    event_tx: &mpsc::UnboundedSender<AudioPlayerEvent>,
+    operation_id: Option<&str>,
+    session_id: &str,
+) -> Result<Vec<u8>> {
+    let mut attempt = 0;
+    loop {
+        if !request_pacer.wait_for_turn(shared).await {
+            return Err(anyhow!("stream canceled"));
+        }
+
+        match media_cache::fetch_full_media_bytes(client, track).await {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                let Some(delay) = media_range_retry_delay(&err, attempt) else {
+                    return Err(anyhow::Error::from(err)).context("failed to download full media");
+                };
+                send_media_retry_status(
+                    event_tx,
+                    operation_id,
+                    session_id,
+                    &track.track_id,
+                    &err,
+                    delay,
+                );
+                if !sleep_streaming_download(shared, delay).await {
+                    return Err(anyhow!("stream canceled"));
+                }
+                attempt += 1;
+            }
+        }
     }
 }
 
@@ -2279,12 +2356,31 @@ fn send_media_retry_status(
         error.range(),
         describe_retry_delay(delay)
     );
+    send_download_status(event_tx, operation_id, session_id, track_id, message);
+}
+
+fn send_download_status(
+    event_tx: &mpsc::UnboundedSender<AudioPlayerEvent>,
+    operation_id: Option<&str>,
+    session_id: &str,
+    track_id: &str,
+    message: String,
+) {
     let _ = event_tx.send(AudioPlayerEvent::DownloadStatus {
         operation_id: operation_id.map(str::to_string),
         session_id: session_id.to_string(),
         track_id: track_id.to_string(),
         message,
     });
+}
+
+fn format_byte_size(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn write_cache_chunk(path: &PathBuf, start: u64, bytes: &[u8]) -> Result<()> {
@@ -2645,6 +2741,23 @@ mod tests {
             Some(Duration::from_millis(STREAM_TRANSIENT_RETRY_BASE_MS * 2))
         );
         assert_eq!(media_range_retry_delay(&err, 2), None);
+    }
+
+    #[test]
+    fn full_fetch_fallback_only_applies_to_small_media_without_metadata() {
+        assert!(should_full_fetch_missing_metadata(
+            &[],
+            STREAM_FULL_FETCH_LIMIT_BYTES
+        ));
+        assert!(!should_full_fetch_missing_metadata(
+            &[],
+            STREAM_FULL_FETCH_LIMIT_BYTES + 1
+        ));
+        assert!(!should_full_fetch_missing_metadata(
+            &[media_cache::ByteRange::new(0, 99).unwrap()],
+            10_000
+        ));
+        assert!(!should_full_fetch_missing_metadata(&[], 0));
     }
 
     #[test]

@@ -428,6 +428,35 @@ pub(crate) async fn fetch_range_bytes(
     Ok((bytes.to_vec(), probe))
 }
 
+pub(crate) async fn fetch_full_media_bytes(
+    client: &reqwest::Client,
+    track: &PlaybackTrack,
+) -> std::result::Result<Vec<u8>, MediaRangeError> {
+    let range = "full media".to_string();
+    let response = client
+        .get(&track.audio_url)
+        .header(ACCEPT, BILIBILI_MEDIA_ACCEPT)
+        .header("referer", track.referer.as_str())
+        .send()
+        .await
+        .map_err(|source| MediaRangeError::Request {
+            range: range.clone(),
+            source,
+        })?;
+    if !response.status().is_success() {
+        return Err(MediaRangeError::HttpStatus {
+            range,
+            status: response.status(),
+        });
+    }
+
+    response
+        .bytes()
+        .await
+        .map(|bytes| bytes.to_vec())
+        .map_err(|source| MediaRangeError::Read { range, source })
+}
+
 fn media_range_request<'a>(
     client: &'a reqwest::Client,
     track: &'a PlaybackTrack,
