@@ -4094,6 +4094,7 @@ async fn handle_audio_player_events(
                 operation_id,
                 session_id,
                 track_id,
+                buffered_from_ms,
                 buffered_until_ms,
             } => {
                 if !stream_event_matches_current(
@@ -4111,6 +4112,7 @@ async fn handle_audio_player_events(
                     session_id: session_id.clone(),
                     track_id,
                     status: PlaybackCacheStatus::Buffering,
+                    buffered_from_ms,
                     buffered_until_ms,
                     duration_ms,
                     error: None,
@@ -4201,6 +4203,7 @@ async fn handle_audio_player_events(
                     session_id: session_id.clone(),
                     track_id: track_id.clone(),
                     status: PlaybackCacheStatus::Failed,
+                    buffered_from_ms: 0,
                     buffered_until_ms: 0,
                     duration_ms: track_duration_for_session(music, &session_id, &track_id)
                         .unwrap_or(0),

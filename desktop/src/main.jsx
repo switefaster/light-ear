@@ -462,12 +462,9 @@ function RoomConsole({ config, room, update, setRoom, callCommand, onInstallUpda
   const progress = playback
     ? Math.min(100, Math.max(0, (playback.position_ms / Math.max(playback.duration_ms || 0, 1)) * 100))
     : 0;
-  const cacheProgress = playback && room.playbackCache?.track_id
-    ? Math.min(
-      100,
-      Math.max(0, (room.playbackCache.buffered_until_ms / Math.max(playback.duration_ms || 0, 1)) * 100),
-    )
-    : 0;
+  const cacheRange = playback && room.playbackCache?.track_id
+    ? cacheRangeForPlayback(room.playbackCache, playback.duration_ms)
+    : null;
   const peerNames = useMemo(
     () => buildPeerNames(room.messages, room.localPeerId, config.name, room.peerNames),
     [room.messages, room.localPeerId, config.name, room.peerNames],
@@ -589,7 +586,7 @@ function RoomConsole({ config, room, update, setRoom, callCommand, onInstallUpda
         cache={room.playbackCache}
         buffer={room.playbackBuffer}
         progress={progress}
-        cacheProgress={cacheProgress}
+        cacheRange={cacheRange}
         volume={volume}
         onCommand={callCommand}
         onSeekRequest={setPendingSeek}
@@ -777,7 +774,7 @@ function PlayerDock({
   cache,
   buffer,
   progress,
-  cacheProgress,
+  cacheRange,
   volume,
   onCommand,
   onSeekRequest,
@@ -815,7 +812,7 @@ function PlayerDock({
         <SeekBar
           playback={playback}
           progress={progress}
-          cacheProgress={cacheProgress}
+          cacheRange={cacheRange}
           onSeekRequest={onSeekRequest}
         />
         <div className="time-row">
@@ -857,7 +854,7 @@ function PlayerDock({
   );
 }
 
-function SeekBar({ playback, progress, cacheProgress, onSeekRequest }) {
+function SeekBar({ playback, progress, cacheRange, onSeekRequest }) {
   const [draftPercent, setDraftPercent] = useState(null);
   const canSeek = Boolean(playback?.duration_ms);
   const displayedProgress = draftPercent ?? progress;
@@ -932,7 +929,12 @@ function SeekBar({ playback, progress, cacheProgress, onSeekRequest }) {
       }}
       onPointerCancel={() => setDraftPercent(null)}
     >
-      <span className="scrubber-cache" style={{ width: `${cacheProgress}%` }}></span>
+      {cacheRange && (
+        <span
+          className="scrubber-cache"
+          style={{ left: `${cacheRange.start}%`, width: `${cacheRange.width}%` }}
+        ></span>
+      )}
       <span className="scrubber-fill" style={{ width: `${displayedProgress}%` }}></span>
       <span className="scrubber-thumb" style={{ left: `${displayedProgress}%` }}></span>
     </div>
@@ -1792,6 +1794,23 @@ function numberOrNull(value) {
 function formatMs(value) {
   const seconds = Math.floor((value || 0) / 1000);
   return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+function cacheRangeForPlayback(cache, durationMs) {
+  const duration = Number(durationMs) || 0;
+  if (!cache || duration <= 0 || cache.status === "failed") return null;
+
+  const fromMs = Math.max(0, Number(cache.buffered_from_ms ?? 0) || 0);
+  const untilMs = Math.max(fromMs, Number(cache.buffered_until_ms ?? 0) || 0);
+  const start = clampPercent((fromMs / duration) * 100);
+  const end = clampPercent((untilMs / duration) * 100);
+  if (end <= start) return null;
+  return { start, width: end - start };
+}
+
+function clampPercent(value) {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(100, Math.max(0, value));
 }
 
 function formatBufferKind(value) {

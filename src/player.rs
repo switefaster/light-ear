@@ -43,7 +43,7 @@ const STREAM_PCM_RETAIN_BEHIND_MS: u64 = media_cache::LOW_WATERMARK_MS;
 const STREAM_PCM_TRIM_GRANULARITY_MS: u64 = 1_000;
 const STREAM_BYTE_RETAIN_BEHIND_BYTES: u64 = media_cache::STREAM_CHUNK_BYTES * 4;
 const STREAM_MAX_PENDING_OFFSETS: usize = 6;
-const STREAM_FULL_FETCH_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+const STREAM_SMALL_FULL_FETCH_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
 const STREAM_DOWNLOAD_IDLE_SLEEP_MS: u64 = 250;
 const STREAM_RANGE_REQUEST_SPACING_MS: u64 = 750;
 const STREAM_THROTTLE_RETRY_DELAY_MS: u64 = 10_000;
@@ -191,6 +191,7 @@ pub enum AudioPlayerEvent {
         operation_id: Option<String>,
         session_id: String,
         track_id: String,
+        buffered_from_ms: u64,
         buffered_until_ms: u64,
     },
     Failed {
@@ -361,7 +362,8 @@ impl AudioPlayer {
             self.playing = false;
             session.position_ms.store(position_ms, Ordering::Relaxed);
 
-            let buffered_until_ms = session.pcm.buffered_until_ms().min(track.duration_ms);
+            let (buffered_from_ms, buffered_until_ms) =
+                stream_pcm_cache_window(&session.pcm, track.duration_ms);
             if stream_pcm_ready_for_position(&session.pcm, position_ms, track.duration_ms) {
                 let _ = self.event_tx.send(AudioPlayerEvent::Prepared {
                     operation_id: operation_id.clone(),
@@ -375,6 +377,7 @@ impl AudioPlayer {
                         session_id,
                         track_id: track.track_id,
                         status: PlaybackCacheStatus::Ready,
+                        buffered_from_ms,
                         buffered_until_ms,
                         duration_ms: track.duration_ms,
                         error: None,
@@ -393,13 +396,15 @@ impl AudioPlayer {
                 );
             }
 
-            let buffered_until_ms = session.pcm.buffered_until_ms().min(track.duration_ms);
+            let (buffered_from_ms, buffered_until_ms) =
+                stream_pcm_cache_window(&session.pcm, track.duration_ms);
             let _ = self.event_tx.send(AudioPlayerEvent::Cache {
                 operation_id,
                 view: PlaybackCacheView {
                     session_id,
                     track_id: track.track_id,
                     status: PlaybackCacheStatus::Buffering,
+                    buffered_from_ms,
                     buffered_until_ms,
                     duration_ms: track.duration_ms,
                     error: None,
@@ -541,11 +546,14 @@ impl AudioPlayer {
                         self.event_tx.clone(),
                     );
                 }
+                let (buffered_from_ms, buffered_until_ms) =
+                    stream_pcm_cache_window(&streaming.pcm, streaming.duration_ms);
                 PlaybackCacheView {
                     session_id: streaming.session_id.clone(),
                     track_id: streaming.track_id.clone(),
                     status: PlaybackCacheStatus::Buffering,
-                    buffered_until_ms: streaming.pcm.buffered_until_ms().min(streaming.duration_ms),
+                    buffered_from_ms,
+                    buffered_until_ms,
                     duration_ms: streaming.duration_ms,
                     error: None,
                 }
@@ -603,16 +611,16 @@ impl AudioPlayer {
                     self.restart_streaming(position_ms, true)?;
                 } else if let Some(session) = &self.streaming {
                     self.playing = false;
+                    let (buffered_from_ms, buffered_until_ms) =
+                        stream_pcm_cache_window(&session.pcm, session.duration_ms);
                     let _ = self.event_tx.send(AudioPlayerEvent::Cache {
                         operation_id: None,
                         view: PlaybackCacheView {
                             session_id: session.session_id.clone(),
                             track_id: session.track_id.clone(),
                             status: PlaybackCacheStatus::Buffering,
-                            buffered_until_ms: session
-                                .pcm
-                                .buffered_until_ms()
-                                .min(session.duration_ms),
+                            buffered_from_ms,
+                            buffered_until_ms,
                             duration_ms: session.duration_ms,
                             error: None,
                         },
@@ -934,6 +942,15 @@ fn stream_pcm_ready_for_position(pcm: &SharedPcm, position_ms: u64, duration_ms:
         )
 }
 
+fn stream_pcm_cache_window(pcm: &SharedPcm, duration_ms: u64) -> (u64, u64) {
+    let buffered_from_ms = pcm.base_position_ms().min(duration_ms);
+    let buffered_until_ms = pcm
+        .buffered_until_ms()
+        .min(duration_ms)
+        .max(buffered_from_ms);
+    (buffered_from_ms, buffered_until_ms)
+}
+
 fn should_emit_stream_cache_event(
     buffered_until_ms: u64,
     last_cache_event_ms: u64,
@@ -1040,7 +1057,50 @@ fn should_full_fetch_missing_metadata(
     metadata_ranges: &[media_cache::ByteRange],
     total_bytes: u64,
 ) -> bool {
-    metadata_ranges.is_empty() && total_bytes > 0 && total_bytes <= STREAM_FULL_FETCH_LIMIT_BYTES
+    metadata_ranges.is_empty()
+        && total_bytes > 0
+        && total_bytes <= STREAM_SMALL_FULL_FETCH_LIMIT_BYTES
+}
+
+fn stream_metadata_prefetch_ranges(
+    metadata_ranges: &[media_cache::ByteRange],
+    total_bytes: u64,
+) -> Result<Vec<media_cache::ByteRange>> {
+    if total_bytes == 0 {
+        return Ok(Vec::new());
+    }
+    if !metadata_ranges.is_empty() {
+        return Ok(metadata_ranges.to_vec());
+    }
+
+    let mut ranges = Vec::with_capacity(3);
+    push_unique_stream_range(&mut ranges, stream_fetch_range(0, total_bytes)?);
+    if total_bytes > media_cache::STREAM_CHUNK_BYTES {
+        let final_chunk_start = align_stream_offset(total_bytes.saturating_sub(1));
+        if final_chunk_start > 0 {
+            push_unique_stream_range(
+                &mut ranges,
+                stream_fetch_range(
+                    final_chunk_start.saturating_sub(media_cache::STREAM_CHUNK_BYTES),
+                    total_bytes,
+                )?,
+            );
+        }
+        push_unique_stream_range(
+            &mut ranges,
+            stream_fetch_range(final_chunk_start, total_bytes)?,
+        );
+    }
+    Ok(ranges)
+}
+
+fn push_unique_stream_range(
+    ranges: &mut Vec<media_cache::ByteRange>,
+    range: media_cache::ByteRange,
+) {
+    if !ranges.contains(&range) {
+        ranges.push(range);
+    }
 }
 
 fn retain_streaming_byte_window(
@@ -1255,12 +1315,13 @@ impl Iterator for StreamingPcmSource {
                         now.saturating_duration_since(last) >= Duration::from_secs(1)
                     }) {
                         self.last_underrun_at = Some(now);
-                        let buffered_until_ms =
-                            self.shared.buffered_until_ms().min(self.duration_ms);
+                        let (buffered_from_ms, buffered_until_ms) =
+                            stream_pcm_cache_window(&self.shared, self.duration_ms);
                         let _ = self.event_tx.send(AudioPlayerEvent::Buffering {
                             operation_id: None,
                             session_id: self.session_id.clone(),
                             track_id: self.track_id.clone(),
+                            buffered_from_ms,
                             buffered_until_ms,
                         });
                     }
@@ -2104,18 +2165,7 @@ async fn download_streaming_bytes(
     shared.set_total(Some(total));
 
     let metadata_ranges = media_cache::metadata_ranges(&track, total);
-    shared.pin_ranges(&metadata_ranges);
     if should_full_fetch_missing_metadata(&metadata_ranges, total) {
-        send_download_status(
-            &event_tx,
-            operation_id.as_deref(),
-            &session_id,
-            &track.track_id,
-            format!(
-                "media has no byte metadata; downloading {} in one request",
-                format_byte_size(total)
-            ),
-        );
         let bytes = fetch_full_media_with_retry(
             &client,
             &track,
@@ -2133,11 +2183,15 @@ async fn download_streaming_bytes(
             ));
         }
         let full_range = media_cache::ByteRange::new(0, total.saturating_sub(1))?;
+        shared.pin_ranges(&[full_range]);
         write_cache_chunk(&media_path, 0, &bytes)?;
         shared.append(&bytes, full_range);
-    }
-    for range in &metadata_ranges {
-        shared.request_offset(range.start);
+    } else {
+        let prefetch_ranges = stream_metadata_prefetch_ranges(&metadata_ranges, total)?;
+        shared.pin_ranges(&prefetch_ranges);
+        for range in &prefetch_ranges {
+            shared.request_offset(range.start);
+        }
     }
     let initial_window = stream_byte_range_for_window(
         position_ms,
@@ -2374,15 +2428,6 @@ fn send_download_status(
     });
 }
 
-fn format_byte_size(bytes: u64) -> String {
-    const MIB: u64 = 1024 * 1024;
-    if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
 fn write_cache_chunk(path: &PathBuf, start: u64, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -2554,7 +2599,8 @@ fn decode_streaming_audio_inner(
                 );
                 decode_errors = 0;
 
-                let buffered_until_ms = pcm.buffered_until_ms().min(track.duration_ms);
+                let (buffered_from_ms, buffered_until_ms) =
+                    stream_pcm_cache_window(&pcm, track.duration_ms);
                 if should_emit_stream_cache_event(
                     buffered_until_ms,
                     last_cache_event_ms,
@@ -2572,6 +2618,7 @@ fn decode_streaming_audio_inner(
                             } else {
                                 PlaybackCacheStatus::Preparing
                             },
+                            buffered_from_ms,
                             buffered_until_ms,
                             duration_ms: track.duration_ms,
                             error: None,
@@ -2593,6 +2640,7 @@ fn decode_streaming_audio_inner(
                             session_id: session_id.clone(),
                             track_id: track.track_id.clone(),
                             status: PlaybackCacheStatus::Ready,
+                            buffered_from_ms,
                             buffered_until_ms,
                             duration_ms: track.duration_ms,
                             error: None,
@@ -2632,7 +2680,7 @@ fn decode_streaming_audio_inner(
     }
 
     pcm.complete();
-    let buffered_until_ms = pcm.buffered_until_ms().min(track.duration_ms);
+    let (buffered_from_ms, buffered_until_ms) = stream_pcm_cache_window(&pcm, track.duration_ms);
     if !ready_sent && buffered_until_ms >= position_ms.min(track.duration_ms) {
         let _ = event_tx.send(AudioPlayerEvent::Prepared {
             operation_id: operation_id.clone(),
@@ -2647,6 +2695,7 @@ fn decode_streaming_audio_inner(
             session_id,
             track_id: track.track_id,
             status: PlaybackCacheStatus::Ready,
+            buffered_from_ms,
             buffered_until_ms,
             duration_ms: track.duration_ms,
             error: None,
@@ -2747,17 +2796,31 @@ mod tests {
     fn full_fetch_fallback_only_applies_to_small_media_without_metadata() {
         assert!(should_full_fetch_missing_metadata(
             &[],
-            STREAM_FULL_FETCH_LIMIT_BYTES
+            STREAM_SMALL_FULL_FETCH_LIMIT_BYTES
         ));
         assert!(!should_full_fetch_missing_metadata(
             &[],
-            STREAM_FULL_FETCH_LIMIT_BYTES + 1
+            STREAM_SMALL_FULL_FETCH_LIMIT_BYTES + 1
         ));
         assert!(!should_full_fetch_missing_metadata(
             &[media_cache::ByteRange::new(0, 99).unwrap()],
             10_000
         ));
         assert!(!should_full_fetch_missing_metadata(&[], 0));
+    }
+
+    #[test]
+    fn missing_metadata_prefetches_head_and_tail_chunks() {
+        let total = media_cache::STREAM_CHUNK_BYTES * 5 + 17;
+        let ranges = stream_metadata_prefetch_ranges(&[], total).unwrap();
+
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(
+            ranges[0],
+            media_cache::ByteRange::new(0, media_cache::STREAM_CHUNK_BYTES - 1).unwrap()
+        );
+        assert!(ranges[2].contains(total - 1));
+        assert!(ranges[1].start >= total.saturating_sub(media_cache::STREAM_CHUNK_BYTES * 3));
     }
 
     #[test]

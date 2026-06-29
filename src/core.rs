@@ -133,6 +133,8 @@ pub struct PlaybackCacheView {
     pub session_id: String,
     pub track_id: String,
     pub status: PlaybackCacheStatus,
+    #[serde(default)]
+    pub buffered_from_ms: u64,
     pub buffered_until_ms: u64,
     pub duration_ms: u64,
     pub error: Option<String>,
