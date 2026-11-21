@@ -74,6 +74,13 @@ guardrail:
   resolve-time decoder probe that can reject otherwise usable tracks because of
   partial Range metadata, missing `moov`, or decoder-specific AAC limitations;
   decode failures belong to streaming prepare and must converge there.
+- Bilibili WBI playurl requests must include the browser client-hint headers and
+  `dm_*` fingerprint fields, with `fnval=4048`, `try_look=1`, and
+  `web_location=1550101`. Filter `!'()*` from values before sorting and
+  form-encoding the entire query for signing; transmit those exact signed
+  bytes. Keep fingerprint screen dimensions stable within a process. Accept
+  API code `-101` only for anonymous nav responses with WBI data; other nonzero
+  API codes must fail even if the response includes data.
 - When Bilibili DASH audio includes `SegmentBase`, preserve the initialization
   and index byte ranges on `PlaybackTrack`. The streaming cache should request
   those metadata ranges before probing or seeking so fragmented MP4 audio can be

@@ -2295,13 +2295,15 @@ name = "light-ear"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "chrono",
  "clap",
  "cpal",
+ "form_urlencoded",
  "futures",
  "libp2p",
  "md5",
- "percent-encoding",
+ "rand 0.10.4",
  "reqwest",
  "rodio",
  "serde",

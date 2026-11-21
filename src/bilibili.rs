@@ -1,7 +1,7 @@
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, sync::OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail};
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use base64::prelude::{BASE64_STANDARD, Engine as _};
 use reqwest::{
     Client, StatusCode, Url,
     header::{
@@ -22,7 +22,18 @@ const MIXIN_KEY_ENC_TAB: [usize; 64] = [
 const BILIBILI_API: &str = "https://api.bilibili.com/x";
 const BILIBILI_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36";
 const BILIBILI_ORIGIN: &str = "https://www.bilibili.com";
+const BILIBILI_HOME: &str = "https://www.bilibili.com/";
 const BILIBILI_API_ACCEPT: &str = "application/json, text/plain, */*";
+const FINGERPRINT_ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ \t\n\r\x0b\x0c";
+const FINGERPRINT_SCREEN_SIZES: &[(u32, u32)] = &[
+    (1920, 1080),
+    (1366, 768),
+    (1536, 864),
+    (1280, 720),
+    (2560, 1440),
+    (1440, 900),
+    (1600, 900),
+];
 const BVID_LEN: usize = 12;
 const BILIBILI_SHORT_LINK_HOSTS: &[&str] = &["b23.tv", "bili2233.cn"];
 
@@ -202,7 +213,16 @@ pub fn client() -> Result<Client> {
     headers.insert(ACCEPT, HeaderValue::from_static(BILIBILI_API_ACCEPT));
     headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("zh-CN,zh;q=0.9"));
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    headers.insert("dnt", HeaderValue::from_static("1"));
     headers.insert(PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(
+        "sec-ch-ua",
+        HeaderValue::from_static(
+            "\"Not A(Brand\";v=\"99\", \"Google Chrome\";v=\"121\", \"Chromium\";v=\"121\"",
+        ),
+    );
+    headers.insert("sec-ch-ua-mobile", HeaderValue::from_static("?0"));
+    headers.insert("sec-ch-ua-platform", HeaderValue::from_static("\"macOS\""));
     headers.insert("origin", HeaderValue::from_static(BILIBILI_ORIGIN));
     headers.insert("sec-fetch-site", HeaderValue::from_static("same-site"));
     headers.insert("sec-fetch-mode", HeaderValue::from_static("cors"));
@@ -337,7 +357,7 @@ async fn resolve_player_info(
     cid: u64,
     referer: &str,
 ) -> Result<BilibiliPlayerInfo> {
-    match resolve_player_info_wbi(client, bvid, cid, referer).await {
+    match resolve_player_info_wbi(client, bvid, cid).await {
         Ok(player) => Ok(player),
         Err(err) if is_http_precondition_failed(&err) => {
             resolve_player_info_legacy(client, bvid, cid, referer)
@@ -356,32 +376,28 @@ async fn resolve_player_info_wbi(
     client: &Client,
     bvid: &str,
     cid: u64,
-    referer: &str,
 ) -> Result<BilibiliPlayerInfo> {
-    let nav = bilibili_api_get(client, format!("{BILIBILI_API}/web-interface/nav"), referer)
-        .send()
-        .await?
-        .read_result::<BilibiliNavInfo>("nav")
-        .await?;
+    let nav = bilibili_api_get(
+        client,
+        format!("{BILIBILI_API}/web-interface/nav"),
+        BILIBILI_HOME,
+    )
+    .send()
+    .await?
+    .read_result::<BilibiliNavInfo>("nav")
+    .await?;
 
-    let wts = chrono::Local::now().timestamp();
-    let query = signed_query(
-        [
-            ("bvid", bvid.to_string()),
-            ("cid", cid.to_string()),
-            ("fnver", "0".to_string()),
-            ("fnval", "16".to_string()),
-            ("fourk", "1".to_string()),
-            ("platform", "html5".to_string()),
-            ("wts", wts.to_string()),
-        ],
+    let query = wbi_playurl_query(
+        bvid,
+        cid,
+        chrono::Utc::now().timestamp(),
         &mixin_key(&nav.wbi_img)?,
     );
 
     bilibili_api_get(
         client,
         format!("{BILIBILI_API}/player/wbi/playurl?{query}"),
-        referer,
+        BILIBILI_HOME,
     )
     .send()
     .await?
@@ -531,27 +547,31 @@ impl BilibiliResponseExt for reqwest::Response {
             .into());
         }
 
-        let result = serde_json::from_str::<BilibiliResult<T>>(&body).with_context(|| {
-            format!(
-                "failed to decode bilibili {endpoint} response: {}",
-                preview_body(&body)
-            )
-        })?;
-
-        if let Some(data) = result.data {
-            return Ok(data);
-        }
-
-        if result.code != 0 {
-            bail!(
-                "bilibili {endpoint} returned code {}: {}",
-                result.code,
-                result.message.as_deref().unwrap_or("unknown error")
-            );
-        }
-
-        bail!("bilibili {endpoint} returned no data")
+        parse_api_result(&body, endpoint)
     }
+}
+
+fn parse_api_result<T: DeserializeOwned>(body: &str, endpoint: &str) -> Result<T> {
+    let result = serde_json::from_str::<BilibiliResult<T>>(body).with_context(|| {
+        format!(
+            "failed to decode bilibili {endpoint} response: {}",
+            preview_body(body)
+        )
+    })?;
+
+    // Anonymous nav responses still contain usable WBI keys with code -101.
+    // Other API errors must not be accepted just because they include data.
+    if result.code != 0 && !(endpoint == "nav" && result.code == -101) {
+        bail!(
+            "bilibili {endpoint} returned code {}: {}",
+            result.code,
+            result.message.as_deref().unwrap_or("unknown error")
+        );
+    }
+
+    result
+        .data
+        .ok_or_else(|| anyhow!("bilibili {endpoint} returned no data"))
 }
 
 fn bilibili_api_get(
@@ -712,21 +732,76 @@ fn url_stem(url: &str) -> Result<String> {
     Ok(file.split('.').next().unwrap_or(file).to_string())
 }
 
-fn signed_query<const N: usize>(params: [(&str, String); N], mixin_key: &str) -> String {
-    let mut params = params;
+fn fingerprint_token(min_length: usize, max_length: usize) -> String {
+    let raw: Vec<u8> = (0..rand::random_range(min_length..=max_length))
+        .map(|_| FINGERPRINT_ALPHABET[rand::random_range(0..FINGERPRINT_ALPHABET.len())])
+        .collect();
+    encode_fingerprint_token(&raw)
+}
+
+fn encode_fingerprint_token(raw: &[u8]) -> String {
+    let mut encoded = BASE64_STANDARD.encode(raw);
+    // Match MusicPlugin.kt's dropLast(2), including when the output has no padding.
+    encoded.truncate(encoded.len().saturating_sub(2));
+    encoded
+}
+
+fn fingerprint_params() -> [(&'static str, String); 4] {
+    // The reference keeps the screen size stable for the lifetime of the client.
+    static SCREEN_SIZE: OnceLock<(u32, u32)> = OnceLock::new();
+    let (width, height) = *SCREEN_SIZE.get_or_init(|| {
+        FINGERPRINT_SCREEN_SIZES[rand::random_range(0..FINGERPRINT_SCREEN_SIZES.len())]
+    });
+    let screen_noise = rand::random_range(0..114);
+    let scroll_top = rand::random_range(0..101);
+    let offset_noise = rand::random_range(0..514);
+    let interaction = format!(
+        "{{\"ds\":[],\"wh\":[{},{},{}],\"of\":[{},{},{}]}}",
+        2 * width + 2 * height + 3 * screen_noise,
+        4 * width - height + screen_noise,
+        screen_noise,
+        3 * scroll_top + offset_noise,
+        4 * scroll_top + 2 * offset_noise,
+        offset_noise,
+    );
+    [
+        ("dm_img_list", "[]".to_string()),
+        ("dm_img_str", fingerprint_token(16, 64)),
+        ("dm_cover_img_str", fingerprint_token(32, 128)),
+        ("dm_img_inter", interaction),
+    ]
+}
+
+fn wbi_playurl_query(bvid: &str, cid: u64, wts: i64, mixin_key: &str) -> String {
+    let params = [
+        ("bvid", bvid.to_string()),
+        ("cid", cid.to_string()),
+        ("fnval", "4048".to_string()),
+        ("try_look", "1".to_string()),
+        ("web_location", "1550101".to_string()),
+        ("wts", wts.to_string()),
+    ];
+    signed_query(params.into_iter().chain(fingerprint_params()), mixin_key)
+}
+
+fn signed_query<'a>(
+    params: impl IntoIterator<Item = (&'a str, String)>,
+    mixin_key: &str,
+) -> String {
+    let mut params: Vec<_> = params
+        .into_iter()
+        .map(|(key, mut value)| {
+            value.retain(|ch| !matches!(ch, '!' | '\'' | '(' | ')' | '*'));
+            (key, value)
+        })
+        .collect();
     params.sort_by_key(|(key, _)| *key);
 
-    let query = params
-        .iter()
-        .map(|(key, value)| {
-            format!(
-                "{}={}",
-                utf8_percent_encode(key, NON_ALPHANUMERIC),
-                utf8_percent_encode(value, NON_ALPHANUMERIC)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("&");
+    // Java URLEncoder parity: preserve underscores, encode spaces as '+', and
+    // sign exactly the same escaped bytes that are sent in the URL.
+    let query = form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(params)
+        .finish();
 
     let w_rid = format!("{:x}", md5::compute(format!("{query}{mixin_key}")));
     format!("{query}&w_rid={w_rid}")
@@ -793,13 +868,13 @@ mod tests {
     }
 
     #[test]
-    fn signed_query_sorts_and_percent_encodes_params() {
+    fn signed_query_sorts_and_form_encodes_params() {
         let mixin = "0123456789abcdef0123456789abcdef";
         let query = signed_query(
             [("b", "two words".to_string()), ("a", "x/y".to_string())],
             mixin,
         );
-        let expected_prefix = "a=x%2Fy&b=two%20words";
+        let expected_prefix = "a=x%2Fy&b=two+words";
         let expected_rid = format!("{:x}", md5::compute(format!("{expected_prefix}{mixin}")));
 
         assert_eq!(query, format!("{expected_prefix}&w_rid={expected_rid}"));
@@ -810,6 +885,169 @@ mod tests {
                 mixin,
             )
         );
+    }
+
+    #[test]
+    fn signed_query_matches_reference_escaping_and_filtering() {
+        let query = signed_query(
+            [
+                ("wts", "1702204169".to_string()),
+                ("foo_bar", "汉字 ~.-_ test".to_string()),
+                ("dm_img_str", "ab+/=!'()*".to_string()),
+            ],
+            "0123456789abcdef0123456789abcdef",
+        );
+        assert_eq!(
+            query,
+            "dm_img_str=ab%2B%2F%3D&foo_bar=%E6%B1%89%E5%AD%97+%7E.-_+test&wts=1702204169&w_rid=3b6685a1a2e391e296b50f83395bcea3"
+        );
+    }
+
+    #[test]
+    fn fingerprint_tokens_drop_two_base64_characters_even_without_padding() {
+        for (raw, expected) in [
+            ("0123456789abcdef", "MDEyMzQ1Njc4OWFiY2RlZg"),
+            ("0123456789abcdefg", "MDEyMzQ1Njc4OWFiY2RlZm"),
+            ("0123456789abcdefgh", "MDEyMzQ1Njc4OWFiY2RlZm"),
+        ] {
+            assert_eq!(encode_fingerprint_token(raw.as_bytes()), expected);
+        }
+    }
+
+    #[test]
+    fn playurl_query_signs_fingerprints_and_keeps_screen_size_stable() {
+        let mixin = "0123456789abcdef0123456789abcdef";
+        let mut previous_screen = None;
+        for _ in 0..32 {
+            let query = wbi_playurl_query("BV196Ex61ES1", 12345, 1702204169, mixin);
+            let (unsigned, signature) = query.rsplit_once("&w_rid=").unwrap();
+            assert_eq!(
+                signature,
+                format!("{:x}", md5::compute(format!("{unsigned}{mixin}")))
+            );
+            let params: std::collections::BTreeMap<_, _> = form_urlencoded::parse(query.as_bytes())
+                .into_owned()
+                .collect();
+            assert_eq!(params.len(), 11);
+            assert_eq!(params["bvid"], "BV196Ex61ES1");
+            assert_eq!(params["cid"], "12345");
+            assert_eq!(params["wts"], "1702204169");
+            assert_eq!(params["fnval"], "4048");
+            assert_eq!(params["try_look"], "1");
+            assert_eq!(params["web_location"], "1550101");
+            assert_eq!(params["dm_img_list"], "[]");
+            for (key, min, max) in [("dm_img_str", 22, 86), ("dm_cover_img_str", 42, 170)] {
+                let token = &params[key];
+                assert!((min..=max).contains(&token.len()));
+                assert!(
+                    token
+                        .bytes()
+                        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'+' | b'/'))
+                );
+            }
+
+            let interaction: serde_json::Value =
+                serde_json::from_str(&params["dm_img_inter"]).unwrap();
+            assert_eq!(interaction["ds"], serde_json::json!([]));
+            let wh: [u32; 3] = serde_json::from_value(interaction["wh"].clone()).unwrap();
+            let offset: [u32; 3] = serde_json::from_value(interaction["of"].clone()).unwrap();
+            assert!(wh[2] < 114);
+            let doubled_dimensions = wh[0] - 3 * wh[2];
+            let skewed_dimensions = wh[1] - wh[2];
+            assert_eq!((doubled_dimensions + 2 * skewed_dimensions) % 10, 0);
+            let width = (doubled_dimensions + 2 * skewed_dimensions) / 10;
+            let height = 4 * width - skewed_dimensions;
+            assert!(FINGERPRINT_SCREEN_SIZES.contains(&(width, height)));
+            if let Some(previous) = previous_screen {
+                assert_eq!(previous, (width, height));
+            }
+            previous_screen = Some((width, height));
+            assert!(offset[2] < 514);
+            assert_eq!((offset[0] - offset[2]) % 3, 0);
+            let scroll_top = (offset[0] - offset[2]) / 3;
+            assert!(scroll_top <= 100);
+            assert_eq!(offset[1], 4 * scroll_top + 2 * offset[2]);
+        }
+    }
+
+    #[test]
+    fn api_errors_with_data_are_rejected_except_anonymous_nav() {
+        let nav = r#"{"code":-101,"message":"not logged in","data":{"wbi_img":{"img_url":"https://example.test/img.png","sub_url":"https://example.test/sub.png"}}}"#;
+        assert!(parse_api_result::<BilibiliNavInfo>(nav, "nav").is_ok());
+        assert!(parse_api_result::<serde_json::Value>(nav, "play url").is_err());
+        for endpoint in ["nav", "video info", "play url", "legacy play url"] {
+            let err = parse_api_result::<serde_json::Value>(
+                r#"{"code":-352,"message":"risk control","data":{}}"#,
+                endpoint,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("returned code -352: risk control"));
+        }
+        assert!(
+            parse_api_result::<BilibiliNavInfo>(r#"{"code":-101,"data":null}"#, "nav").is_err()
+        );
+        assert!(
+            parse_api_result::<serde_json::Value>(r#"{"code":0,"data":null}"#, "play url").is_err()
+        );
+        assert!(
+            parse_api_result::<serde_json::Value>(r#"{"code":0,"data":{}}"#, "play url").is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn api_request_sends_browser_headers_and_exact_signed_query() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            time::Duration,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 2048];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let query = wbi_playurl_query("BV196Ex61ES1", 12345, 1702204169, "test-mixin-key");
+        let response = bilibili_api_get(
+            &client().unwrap(),
+            format!("http://{address}/x/player/wbi/playurl?{query}"),
+            BILIBILI_HOME,
+        )
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap();
+        assert!(response.status().is_success());
+        let request = server.join().unwrap();
+        assert!(request.starts_with(&format!("GET /x/player/wbi/playurl?{query} HTTP/1.1\r\n")));
+        let headers: std::collections::BTreeMap<_, _> = request
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_once(":"))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim()))
+            .collect();
+        assert_eq!(headers["user-agent"], BILIBILI_UA);
+        assert_eq!(headers["accept"], BILIBILI_API_ACCEPT);
+        assert_eq!(headers["referer"], BILIBILI_HOME);
+        assert_eq!(headers["origin"], BILIBILI_ORIGIN);
+        assert_eq!(headers["dnt"], "1");
+        assert_eq!(headers["sec-ch-ua-mobile"], "?0");
+        assert_eq!(headers["sec-ch-ua-platform"], "\"macOS\"");
+        assert!(headers["sec-ch-ua"].contains("\"Chromium\";v=\"121\""));
     }
 
     #[test]

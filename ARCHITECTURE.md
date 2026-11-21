@@ -262,6 +262,15 @@ Current rules:
 
 Playback does not stream audio from peer to peer. Each client resolves and streams audio locally from Bilibili using HTTP Range requests.
 
+Bilibili API requests use matching Chrome user-agent and client-hint headers.
+WBI playurl uses `fnval=4048`, `try_look=1`, `web_location=1550101`, and fresh
+`dm_*` fingerprint fields with screen dimensions retained for the process.
+Signing removes `!'()*` from values, sorts keys, and form-encodes the query
+before hashing; the same encoded query is sent without a second encoding pass.
+Nav and WBI playurl use the homepage Referer, while video metadata and media
+Range requests retain the video Referer. Anonymous nav code `-101` is accepted
+when WBI data is present; other nonzero API codes are errors even with data.
+
 The resolver prefers DASH audio and can fall back to single-file `durl` media. WBI signing and media selection helpers have deterministic unit tests. If a playurl response is HTTP 412 or contains no usable media URL, the backend tries the legacy playurl path before surfacing failure. Resolve does not download a partial media Range to prove decoder support; partial metadata and AAC decoder limits are handled by streaming prepare so a valid queue item is not rejected too early.
 
 Bilibili DASH audio may include `SegmentBase` byte ranges for fragmented MP4

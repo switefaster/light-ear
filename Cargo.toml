@@ -9,13 +9,15 @@ fdk-aac-decoder = ["dep:symphonia-adapter-fdk-aac"]
 
 [dependencies]
 anyhow = "1.0.104"
+base64 = "0.23.1"
 chrono = { version = "0.4.45", features = ["clock"] }
 clap = { version = "4.6.8", features = ["derive"] }
 cpal = "0.17.3"
 futures = "0.3.34"
+form_urlencoded = "1.2.2"
 libp2p = { version = "0.56.0", features = ["dcutr", "dns", "gossipsub", "identify", "json", "macros", "mdns", "noise", "ping", "quic", "relay", "rendezvous", "tcp", "tokio", "yamux"] }
 md5 = "0.8.1"
-percent-encoding = "2.3.2"
+rand = "0.10.4"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "query", "rustls"] }
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "symphonia-aac", "symphonia-isomp4"] }
 serde = { version = "1.0.229", features = ["derive"] }
