@@ -38,6 +38,8 @@ Run a minimal public relay plus rendezvous node on a reachable host:
 cargo run --bin light-ear-relay -- --port 4001 --secret-key-seed 0
 ```
 
+This relay derives its identity from a one-byte seed. Use it for trusted test rooms only.
+
 The relay also serves a small topology dashboard on `127.0.0.1:8080` by default:
 
 ```text

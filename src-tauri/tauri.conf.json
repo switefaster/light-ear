@@ -29,6 +29,9 @@
     "active": true,
     "targets": "all",
     "createUpdaterArtifacts": true,
+    "resources": {
+      "../docs/licenses/FDK-AAC-NOTICE.txt": "licenses/FDK-AAC-NOTICE.txt"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

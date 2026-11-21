@@ -24,6 +24,9 @@ connections when direct addresses become usable so relay traffic stays bounded.
 - `.github/workflows/build.yml`: push-triggered matrix CI build for Windows,
   Linux, and macOS. It runs frontend/Rust checks and builds the relay binary
   plus Tauri desktop bundle, but does not upload artifacts.
+- `.github/workflows/release.yml`: a version tag such as `v0.1.0` prepares a
+  GitHub draft using `docs/releases/<tag>.md`. Platform jobs add installers,
+  relay binaries and signed updater assets before the maintainer publishes it.
 
 ## Useful checks
 

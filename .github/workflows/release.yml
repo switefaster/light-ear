@@ -9,11 +9,54 @@ permissions:
   contents: write
 
 jobs:
+  draft:
+    name: Prepare release draft
+    runs-on: ubuntu-latest
+    outputs:
+      id: ${{ steps.draft.outputs.id }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check tag against package versions
+        shell: python
+        run: |
+          import json
+          import os
+          import tomllib
+          from pathlib import Path
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          versions = {}
+          for name in ("Cargo.toml", "src-tauri/Cargo.toml"):
+              versions[name] = tomllib.loads(Path(name).read_text())["package"]["version"]
+          for name in ("package.json", "src-tauri/tauri.conf.json"):
+              versions[name] = json.loads(Path(name).read_text())["version"]
+          for name, version in versions.items():
+              if tag != f"v{version}":
+                  raise SystemExit(f"{name} declares {version}, but the tag is {tag}")
+          if not Path(f"docs/releases/{tag}.md").is_file():
+              raise SystemExit(f"Missing release notes for {tag}")
+
+      - name: Create draft with release notes
+        id: draft
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "light-ear ${{ github.ref_name }}"
+          body_path: docs/releases/${{ github.ref_name }}.md
+          files: docs/licenses/FDK-AAC-NOTICE.txt
+          fail_on_unmatched_files: true
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
   release:
+    needs: draft
     name: Release ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # Each uploader merges its platform into the same latest.json asset.
+      max-parallel: 1
       matrix:
         include:
           - os: windows-latest
@@ -83,20 +126,16 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
+          releaseId: ${{ needs.draft.outputs.id }}
           tagName: ${{ github.ref_name }}
-          releaseName: "light-ear ${{ github.ref_name }}"
-          releaseBody: "Automated light-ear desktop release."
           releaseDraft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
           uploadUpdaterJson: true
           uploadUpdaterSignatures: true
-          args: --features fdk-aac-decoder
+          args: --features fdk-aac-decoder -- --locked
 
       - name: Upload relay binary
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: "light-ear ${{ github.ref_name }}"
-          draft: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          files: relay-dist/*
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" relay-dist/* --clobber
