@@ -221,3 +221,7 @@ If any peer diverges, save:
 - Desktop peer overview for each participant.
 - Last 20 status log entries from each participant.
 - The exact user action that triggered divergence.
+
+## Adaptive topology and room discovery
+
+Start two groups with separate LAN discovery and a single connection between them. Open the public room browser in each group. Check that a remote room appears within two directory refreshes, join it, then switch rooms and verify the local peer ID stays the same. In the peer overview, record per-neighbor payload byte deltas and worst-receiver p95 before and after adding a second crossing. Use sustained chat traffic for the comparison. Disconnect the first gateway and verify history convergence and voting. Repeat with only the circuit available, restore the peer path, then check that the circuit payload counter stops growing.

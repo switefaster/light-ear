@@ -2,11 +2,8 @@
 
 use std::{
     fs,
-    path::PathBuf,
-    sync::{
-        Mutex as StdMutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::Duration,
 };
@@ -20,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::DialogExt;
-use tauri_plugin_updater::{Update, UpdaterExt};
+use tauri_plugin_updater::{Error as UpdaterError, Update, UpdaterExt};
 use tokio::sync::{Mutex, mpsc};
 
 #[derive(Default)]
@@ -31,8 +28,16 @@ struct BackendState {
 
 #[derive(Default)]
 struct UpdaterState {
-    pending: StdMutex<Option<Update>>,
+    startup: Mutex<StartupUpdate>,
     installing: AtomicBool,
+}
+
+#[derive(Default)]
+enum StartupUpdate {
+    #[default]
+    Unchecked,
+    Ready,
+    Required(Box<Update>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,8 +137,12 @@ impl UpdaterEvent {
 async fn start_backend(
     app: AppHandle,
     state: State<'_, BackendState>,
+    updater: State<'_, UpdaterState>,
     config: DesktopConfig,
 ) -> Result<(), String> {
+    if !tauri::is_dev() && !matches!(*updater.startup.lock().await, StartupUpdate::Ready) {
+        return Err("complete the desktop update check before connecting".into());
+    }
     let mut commands = state.commands.lock().await;
     if commands.is_some() {
         return Ok(());
@@ -179,6 +188,15 @@ async fn start_backend(
     });
 
     Ok(())
+}
+
+#[tauri::command]
+async fn join_room(state: State<'_, BackendState>, topic: String) -> Result<(), String> {
+    send_command(&state, NetworkCommand::JoinRoom(topic)).await
+}
+#[tauri::command]
+async fn leave_room(state: State<'_, BackendState>) -> Result<(), String> {
+    send_command(&state, NetworkCommand::LeaveRoom).await
 }
 
 #[tauri::command]
@@ -310,35 +328,75 @@ async fn check_for_update(
     app: AppHandle,
     state: State<'_, UpdaterState>,
 ) -> Result<Option<UpdateInfo>, String> {
-    let update = app
+    let mut startup = state.startup.lock().await;
+    match &*startup {
+        StartupUpdate::Ready => return Ok(None),
+        StartupUpdate::Required(update) => return Ok(Some(UpdateInfo::from_update(update))),
+        StartupUpdate::Unchecked => {}
+    }
+    let marker = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join(format!("update-required-{}", app.package_info().version));
+    let updater = app
         .updater()
-        .map_err(|err| format!("failed to initialize updater: {err}"))?
-        .check()
-        .await
-        .map_err(|err| format!("failed to check for updates: {err}"))?;
-    let info = update.as_ref().map(UpdateInfo::from_update);
-    *state
-        .pending
-        .lock()
-        .map_err(|_| "updater state lock poisoned".to_string())? = update;
-    Ok(info)
+        .map_err(|err| format!("failed to initialize updater: {err}"))?;
+    let check = tokio::time::timeout(Duration::from_secs(10), updater.check()).await;
+    let failure = match check {
+        Ok(Ok(Some(update))) => {
+            fs::create_dir_all(marker.parent().expect("app data directory"))
+                .and_then(|_| fs::write(&marker, &update.version))
+                .map_err(|e| format!("could not save the required update: {e}"))?;
+            let info = UpdateInfo::from_update(&update);
+            *startup = StartupUpdate::Required(Box::new(update));
+            return Ok(Some(info));
+        }
+        Ok(Ok(None)) => {
+            // An authoritative check can also withdraw a release.
+            match fs::remove_file(marker) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
+                _ => {}
+            }
+            *startup = StartupUpdate::Ready;
+            return Ok(None);
+        }
+        Err(_) => "update check timed out".to_string(),
+        Ok(Err(
+            e @ (UpdaterError::Reqwest(_)
+            | UpdaterError::Network(_)
+            | UpdaterError::ReleaseNotFound),
+        )) => e.to_string(),
+        Ok(Err(e)) => return Err(e.to_string()),
+    };
+    allow_offline_start(&marker, &failure)?;
+    let _ = app.emit(
+        "backend-event",
+        light_ear::core::FrontendEvent::Status(format!("update service unavailable: {failure}")),
+    );
+    *startup = StartupUpdate::Ready;
+    Ok(None)
+}
+
+fn allow_offline_start(marker: &Path, cause: &str) -> Result<(), String> {
+    match fs::read_to_string(marker) {
+        Ok(version) => Err(format!(
+            "Version {version} is required. Reconnect and retry. {cause}"
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("could not read required update: {e}")),
+    }
 }
 
 #[tauri::command]
 async fn install_update(app: AppHandle, state: State<'_, UpdaterState>) -> Result<(), String> {
+    let update = match &*state.startup.lock().await {
+        StartupUpdate::Required(update) => update.clone(),
+        _ => return Err("check for a required update first".into()),
+    };
     if state.installing.swap(true, Ordering::SeqCst) {
         return Err("update installation is already running".to_string());
     }
-
-    let update = state
-        .pending
-        .lock()
-        .map_err(|_| "updater state lock poisoned".to_string())?
-        .take();
-    let Some(update) = update else {
-        state.installing.store(false, Ordering::SeqCst);
-        return Err("no pending update; check for updates first".to_string());
-    };
 
     let version = update.version.clone();
     let _ = app.emit("updater-event", UpdaterEvent::started(version.clone()));
@@ -455,7 +513,18 @@ fn normalize_log_export_path(mut path: PathBuf) -> PathBuf {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{normalize_log_export_path, sanitize_log_filename};
+    use super::{allow_offline_start, normalize_log_export_path, sanitize_log_filename};
+
+    #[test]
+    fn offline_start_respects_a_previously_confirmed_update() {
+        let marker =
+            std::env::temp_dir().join(format!("light-ear-update-test-{}", std::process::id()));
+        assert!(allow_offline_start(&marker, "offline").is_ok());
+        std::fs::write(&marker, "1.2.3").unwrap();
+        let result = allow_offline_start(&marker, "offline");
+        std::fs::remove_file(marker).unwrap();
+        assert!(result.unwrap_err().contains("1.2.3"));
+    }
 
     #[test]
     fn sanitize_log_filename_keeps_safe_jsonl_name() {
@@ -518,6 +587,8 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             start_backend,
+            join_room,
+            leave_room,
             send_chat,
             enqueue_bilibili,
             read_clipboard_text,

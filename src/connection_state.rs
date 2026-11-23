@@ -25,8 +25,6 @@ pub(crate) enum RelayCloseReason {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum ConnectionEffect {
     Status(String),
-    TrackGossipPeer(PeerId),
-    UntrackGossipPeer(PeerId),
     ResetBackoff(PeerId),
     DialDirect {
         peer_id: PeerId,
@@ -188,7 +186,6 @@ pub(crate) struct ConnectionState {
     warmup_completed: HashSet<PeerId>,
     relay_handoffs: HashMap<PeerId, Instant>,
     chat_subscribers: HashSet<PeerId>,
-    gossip_peers: HashSet<PeerId>,
 }
 
 impl ConnectionState {
@@ -202,7 +199,6 @@ impl ConnectionState {
             warmup_completed: HashSet::new(),
             relay_handoffs: HashMap::new(),
             chat_subscribers: HashSet::new(),
-            gossip_peers: HashSet::new(),
         }
     }
 
@@ -285,6 +281,10 @@ impl ConnectionState {
         self.backoffs.entry(peer_id).or_default()
     }
 
+    pub(crate) fn reset_room_subscriptions(&mut self) {
+        self.chat_subscribers.clear();
+        self.relay_handoffs.clear();
+    }
     pub(crate) fn is_chat_subscribed(&self, peer_id: PeerId) -> bool {
         self.chat_subscribers.contains(&peer_id)
     }
@@ -321,11 +321,6 @@ impl ConnectionState {
             .add(connection_id, is_relayed);
 
         let mut effects = Vec::new();
-        if !is_rendezvous_node {
-            effects.extend(
-                self.track_gossip_peer(peer_id, Some(format!("tracking {peer_id} as gossip peer"))),
-            );
-        }
 
         if is_relayed {
             effects.push(ConnectionEffect::Status(format!(
@@ -406,33 +401,8 @@ impl ConnectionState {
             self.warmup_completed.remove(&peer_id);
             self.relay_handoffs.remove(&peer_id);
             effects.push(ConnectionEffect::Status(format!("disconnected {peer_id}")));
-            effects.extend(self.untrack_gossip_peer(peer_id));
         }
         effects
-    }
-
-    pub(crate) fn track_gossip_peer(
-        &mut self,
-        peer_id: PeerId,
-        status: Option<String>,
-    ) -> Vec<ConnectionEffect> {
-        if !self.gossip_peers.insert(peer_id) {
-            return Vec::new();
-        }
-
-        let mut effects = vec![ConnectionEffect::TrackGossipPeer(peer_id)];
-        if let Some(status) = status {
-            effects.push(ConnectionEffect::Status(status));
-        }
-        effects
-    }
-
-    pub(crate) fn untrack_gossip_peer(&mut self, peer_id: PeerId) -> Vec<ConnectionEffect> {
-        if self.gossip_peers.remove(&peer_id) {
-            vec![ConnectionEffect::UntrackGossipPeer(peer_id)]
-        } else {
-            Vec::new()
-        }
     }
 
     pub(crate) fn learn_direct_addresses<I>(
@@ -947,13 +917,7 @@ mod tests {
 
         let effects = state.connection_closed(peer, cid(1), true, 0);
         assert!(!state.routes().contains_key(&peer));
-        assert!(matches!(
-            effects.as_slice(),
-            [
-                ConnectionEffect::Status(_),
-                ConnectionEffect::UntrackGossipPeer(_)
-            ]
-        ));
+        assert!(matches!(effects.as_slice(), [ConnectionEffect::Status(_)]));
     }
 
     #[test]

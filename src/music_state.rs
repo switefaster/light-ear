@@ -607,6 +607,7 @@ impl MusicState {
         eligible_peers: usize,
     ) -> Option<VoteResolution> {
         let vote = self.active_vote.as_ref()?;
+        let (threshold, eligible_peers) = vote.counts(threshold, eligible_peers);
         match vote.terminal_outcome(threshold, eligible_peers) {
             VoteTerminalOutcome::Pending => None,
             VoteTerminalOutcome::Passed
@@ -627,6 +628,7 @@ impl MusicState {
 
     pub(crate) fn ready_vote_waiting_for_queue(&self, threshold: usize) -> Option<VoteProposal> {
         let vote = self.active_vote.as_ref()?;
+        let (threshold, _) = vote.counts(threshold, 0);
         if vote.approval_count() < threshold {
             return None;
         }
@@ -657,16 +659,19 @@ impl MusicState {
         eligible_peers: usize,
         local_peer_id: &str,
     ) -> Option<VoteView> {
-        self.active_vote.as_ref().map(|vote| VoteView {
-            vote_id: vote.proposal.vote_id.clone(),
-            proposer: vote.proposal.proposer.clone(),
-            action_label: describe_vote_action(&vote.proposal.action, &self.queue),
-            approvals: vote.approvals.len(),
-            rejections: vote.rejections.len(),
-            threshold,
-            eligible_peers,
-            pending: vote.pending_count(eligible_peers),
-            local_vote: vote.local_vote(local_peer_id),
+        self.active_vote.as_ref().map(|vote| {
+            let (threshold, eligible_peers) = vote.counts(threshold, eligible_peers);
+            VoteView {
+                vote_id: vote.proposal.vote_id.clone(),
+                proposer: vote.proposal.proposer.clone(),
+                action_label: describe_vote_action(&vote.proposal.action, &self.queue),
+                approvals: vote.approvals.len(),
+                rejections: vote.rejections.len(),
+                threshold,
+                eligible_peers,
+                pending: vote.pending_count(eligible_peers),
+                local_vote: vote.local_vote(local_peer_id),
+            }
         })
     }
 
@@ -980,6 +985,7 @@ mod tests {
 
     fn proposal(proposer: PeerId, action: VoteAction, queue_version: u64) -> VoteProposal {
         VoteProposal {
+            eligible_peers: Default::default(),
             vote_id: "vote-1".to_string(),
             proposer: proposer.to_string(),
             action,
@@ -1368,6 +1374,7 @@ mod tests {
         let mut music = MusicState::new();
         music.start_vote(
             VoteProposal {
+                eligible_peers: Default::default(),
                 vote_id: "vote-a".to_string(),
                 proposer: proposer.to_string(),
                 action: VoteAction::Pause,
@@ -1425,6 +1432,32 @@ mod tests {
         assert!(music.active_vote.is_none());
     }
 
+    #[test]
+    fn vote_uses_proposed_membership_through_room_and_socket_changes() {
+        let alice = peer_id();
+        let bob = peer_id();
+        let carol = peer_id();
+        let outsider = peer_id();
+        let mut p = proposal(alice, VoteAction::Pause, 0);
+        p.eligible_peers = [alice, bob, carol]
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect();
+        let mut state = MusicState::new();
+        state.start_vote(p, Instant::now() + Duration::from_secs(20));
+        assert!(!state.cast_vote_for("vote-1", outsider.to_string(), true));
+        assert!(state.resolve_vote(1, 1).is_none());
+        let view = state.vote_view(8, 15, &bob.to_string()).unwrap();
+        assert_eq!(
+            (view.threshold, view.eligible_peers, view.pending),
+            (2, 3, 2)
+        );
+        assert!(state.cast_vote_for("vote-1", bob.to_string(), true));
+        assert!(matches!(
+            state.resolve_vote(8, 15),
+            Some(VoteResolution::Passed(_))
+        ));
+    }
     #[test]
     fn vote_view_reports_pending_and_local_vote() {
         let proposer = peer_id();

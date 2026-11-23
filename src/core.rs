@@ -102,6 +102,7 @@ pub enum VoteAction {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoteProposal {
+    pub eligible_peers: std::collections::BTreeSet<String>,
     pub vote_id: String,
     pub proposer: String,
     pub action: VoteAction,
@@ -201,9 +202,39 @@ pub struct PeerConnectionView {
     pub direct_promotion_suspended: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologyLink {
+    pub source: String,
+    pub target: String,
+    pub direct: bool,
+    pub lanes: u8,
+    pub rtt_ms: u32,
+    pub degraded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologyView {
+    pub rooms_by_peer: std::collections::BTreeMap<String, Option<String>>,
+    pub links: Vec<TopologyLink>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum FrontendEvent {
+    Topology(TopologyView),
+    NetworkMetrics {
+        received_bytes: BTreeMap<String, [u64; 2]>,
+        circuit_payload_bytes: u64,
+        directory_bytes: u64,
+        published_bytes: [u64; 2],
+        worst_receiver_p95_ms: [Option<u64>; 2],
+        missed_probes: u64,
+        confirmation_neighbors: [BTreeMap<String, String>; 2],
+    },
+    RoomDirectory {
+        active: Option<String>,
+        rooms: BTreeMap<String, usize>,
+    },
     Status(String),
     PeerCount(usize),
     LocalPeerId(String),
@@ -247,6 +278,7 @@ pub enum WireMessage {
         peer_id: String,
         count: usize,
         newest_at: Option<i64>,
+        digest: String,
         #[serde(default)]
         nonce: u64,
     },
@@ -254,6 +286,7 @@ pub enum WireMessage {
         requester: String,
         target: String,
         known_count: usize,
+        known_ids: std::collections::BTreeSet<String>,
         #[serde(default)]
         nonce: u64,
     },
@@ -367,6 +400,14 @@ pub enum WireMessage {
 
 #[derive(Debug)]
 pub enum NetworkCommand {
+    #[cfg(test)]
+    DialTestPeer(libp2p::Multiaddr),
+    #[cfg(test)]
+    LearnTestCandidate(libp2p::Multiaddr),
+    #[cfg(test)]
+    LimitTestTransit(usize),
+    JoinRoom(String),
+    LeaveRoom,
     Chat(String),
     EnqueueBilibili {
         bvid: String,
@@ -441,6 +482,14 @@ impl PendingPlayback {
 }
 
 impl ActiveVote {
+    pub(crate) fn counts(&self, threshold: usize, count: usize) -> (usize, usize) {
+        let n = self.proposal.eligible_peers.len();
+        if n == 0 {
+            (threshold, count)
+        } else {
+            (n / 2 + 1, n)
+        }
+    }
     pub fn new(proposal: VoteProposal, deadline: Instant) -> Self {
         Self {
             proposal,
@@ -451,7 +500,11 @@ impl ActiveVote {
     }
 
     pub fn vote(&mut self, peer_id: String, approve: bool) -> bool {
-        if self.approvals.contains(&peer_id) || self.rejections.contains(&peer_id) {
+        if (!self.proposal.eligible_peers.is_empty()
+            && !self.proposal.eligible_peers.contains(&peer_id))
+            || self.approvals.contains(&peer_id)
+            || self.rejections.contains(&peer_id)
+        {
             return false;
         }
 
@@ -594,6 +647,7 @@ mod tests {
     #[test]
     fn active_vote_accepts_only_one_ballot_per_peer() {
         let proposal = VoteProposal {
+            eligible_peers: Default::default(),
             vote_id: "vote-1".to_string(),
             proposer: "alice".to_string(),
             action: VoteAction::Pause,
@@ -622,6 +676,7 @@ mod tests {
     #[test]
     fn active_vote_terminal_outcome_detects_pass_and_impossible_pass() {
         let proposal = VoteProposal {
+            eligible_peers: Default::default(),
             vote_id: "vote-1".to_string(),
             proposer: "alice".to_string(),
             action: VoteAction::Pause,
@@ -641,6 +696,7 @@ mod tests {
         assert_eq!(vote.terminal_outcome(2, 3), VoteTerminalOutcome::Rejected);
 
         let proposal = VoteProposal {
+            eligible_peers: Default::default(),
             vote_id: "vote-2".to_string(),
             proposer: "alice".to_string(),
             action: VoteAction::Pause,

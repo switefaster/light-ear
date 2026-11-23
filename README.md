@@ -17,7 +17,7 @@ Run the desktop app in development with the Tauri CLI:
 npx --yes @tauri-apps/cli@^2 dev
 ```
 
-The setup screen accepts display name, topic, listen multiaddrs, explicit peer multiaddrs, relay multiaddrs, and the mDNS toggle. Peers on the same LAN can use mDNS. Remote peers usually meet through a relay/rendezvous node.
+Connect with a display name, optional peer or relay addresses, and mDNS on or off. The public room browser lists rooms in your connected network. Select a room or enter a name to create one. Use the room selector or Leave room to switch without reconnecting.
 
 Build the desktop bundle:
 
@@ -25,12 +25,14 @@ Build the desktop bundle:
 npx --yes @tauri-apps/cli@^2 build
 ```
 
+Packaged desktop clients check for updates on startup. When a newer release is available, select **Install and restart** before connecting. If installation fails, the same screen allows a retry. Clients remember a required update across offline restarts. LAN use remains available during an update-service outage when this installation has no known pending update.
+
 Release builds are signed for the Tauri updater. The public updater key is in
 `src-tauri/tauri.conf.json`; keep `.tauri/light-ear-updater.key` private and set
 its contents as the GitHub secret `TAURI_SIGNING_PRIVATE_KEY`. If the key is
 password-protected, set `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` as well.
 
-The relay address is also used as a rendezvous server. Each client registers under the current topic, periodically discovers other peers in that topic, dials their relayed addresses, and then tries to upgrade relay-only peers to direct P2P connections when possible.
+Clients register with rendezvous under the shared light-ear.network.v2 namespace. Signed room advertisements also travel between ordinary peers. A LAN group can discover a remote group through one connected member. Clients then try to establish other direct paths. Upgrade all room clients together.
 
 Run a minimal public relay plus rendezvous node on a reachable host:
 
@@ -70,7 +72,7 @@ Client setup fields:
 
 ```text
 Name                       Display name in chat
-Topic                      Gossipsub topic, default light-ear.chat.v1
+Public rooms               Browse, join, create or switch after connecting
 Listen                     Add listen multiaddrs
 Peers                      Dial explicit peer multiaddrs
 Relay                      Dial and reserve through relay multiaddrs
@@ -112,7 +114,7 @@ Clients announce their `peer_id`, display name, and join timestamp to the chat t
 
 ## History sync
 
-Clients publish a lightweight history summary when a peer connects, when a peer subscribes to the chat topic, and then periodically afterwards. Connection/subscription events also schedule a short burst of follow-up summaries so peers do not have to wait for the periodic sync window. If a client sees another peer with more messages, it requests that peer's history. The peer replies with its retained chat records, and every client merges the response by message ID, keeping the newest `300` messages locally.
+Clients publish a lightweight history summary when a peer connects, when a peer subscribes to the chat topic, and then periodically afterwards. Connection/subscription events also schedule a short burst of follow-up summaries so peers do not have to wait for the periodic sync window. If retained message IDs differ, a client sends its known IDs. The peer replies with missing records in bounded pages, and every client merges the response by message ID, keeping the newest `300` messages locally.
 
 Message timestamps use microsecond precision for ordering. Duplicate history records are expected during sync and are silently ignored.
 
@@ -121,7 +123,7 @@ Message timestamps use microsecond precision for ordering. Duplicate history rec
 Relay-backed routes are kept during a short direct-connection handoff window. If
 the direct route drops during that window, the relay route stays available for
 chat, sync, playback, and vote messages. Once direct is settled and chat
-subscription is ready, relay links may close for that peer.
+a delivery probe confirms the replacement path, relay links may close for that peer.
 
 ## Music sync
 

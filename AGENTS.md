@@ -14,6 +14,7 @@ connections when direct addresses become usable so relay traffic stays bounded.
 
 - `src/backend.rs`: main libp2p runtime, protocol message handling, history sync,
   queue sync, voting, playback state sync, relay-to-direct promotion.
+- `src/directory.rs`, `src/topology.rs`, `src/overlay.rs`, `src/observed_gossip.rs`: signed discovery, bridge detection, room forwarding trees and connection-level delivery observations.
 - `src/core.rs`: shared protocol and UI-facing data types plus small utilities.
 - `src/bin/light-ear-relay.rs`: public relay/rendezvous node plus topology
   dashboard.
@@ -49,7 +50,15 @@ guardrail:
 
 - `cargo test --lib local_loopback_smoke_syncs_chat_history_between_two_backends`
 
+For adaptive topology changes, run the full library suite with loopback TCP access. The four-peer crossing test measures payload distribution, the foreign-room bridge test checks isolation and the circuit fixture exercises the relay.
+
 ## Current collaboration rules
+
+- Packaged desktop clients check for an update before starting the swarm. A confirmed
+  update survives a failed install and offline restarts of that version. Keep offline
+  LAN startup available when the updater is unreachable and no update is known.
+- The v2 directory is network-wide. Keep memberships and vote electorates independent of transport neighbors and transient forwarding subscriptions. Directory request-response carries discovery records only. Room data and probes use the two gossipsub trees. Keep browse, join and leave on the same swarm identity.
+- Keep relay reservations independent of measured room payload. Require delivery evidence and the handoff grace before releasing a live fallback circuit.
 
 - Enqueue always appends to the queue and does not require a vote. Keep the
   Tauri command's `position` field compatible, but do not give it behavior
@@ -203,10 +212,10 @@ guardrail:
   chat/playback sessions. In libp2p-relay 0.21, `max_circuit_bytes = 0`
   disables the byte cap, but `max_circuit_duration = 0` would time out
   immediately; use a long positive duration instead.
-- The peer overview UI is a diagnostic snapshot of local connection state. Keep
-  it UI-facing only: route type, direct/relay link counts, known direct address
-  count, chat subscription readiness, and direct promotion counters must not be
-  added to the P2P wire schema.
+- The client's topology dialog combines reciprocal directory reports with local
+  socket diagnostics. Keep the snapshot UI-facing. Route type, direct/relay
+  link counts, known direct address count, chat subscription readiness, and
+  direct promotion counters belong to the local peer inspector.
 - Targeted history/queue sync requests still use existing `target` fields, but
   they are broadcast over gossipsub and ignored by non-target peers. Do not set
   request cooldowns when publish fails because no peers are subscribed.

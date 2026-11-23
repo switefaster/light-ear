@@ -24,22 +24,25 @@ import {
   X,
 } from "lucide-react";
 import "./styles.css";
+import TopologyDialog from "./TopologyDialog.jsx";
 
 const tauri = window.__TAURI__;
 const isPreview = !tauri?.core?.invoke;
+const checkUpdatesAtStartup = !isPreview && !import.meta.env.DEV;
 const invoke = tauri?.core?.invoke ?? previewInvoke;
 const listen = tauri?.event?.listen ?? previewListen;
 const previewListeners = new Map();
 
 const initialConfig = {
   name: "light-ear",
-  topic: "light-ear.chat.v1",
   peers: "",
   relays: "",
   noMdns: false,
 };
 
 const initialRoom = {
+  active: null,
+  rooms: {},
   messages: [],
   statuses: [],
   logs: [],
@@ -53,6 +56,8 @@ const initialRoom = {
   queue: null,
   vote: null,
   peers: [],
+  topology: null,
+  networkMetrics: null,
   peerNames: [],
   hadPeers: false,
   peerDropAlert: false,
@@ -68,10 +73,18 @@ const initialUpdate = {
 function App() {
   const [config, setConfig] = useState(initialConfig);
   const [room, setRoom] = useState(initialRoom);
-  const [update, setUpdate] = useState(initialUpdate);
+  const [update, setUpdate] = useState(() => ({
+    ...initialUpdate, status: checkUpdatesAtStartup ? "checking" : "idle",
+  }));
+  const [checkAttempt, setCheckAttempt] = useState(0);
+  const installInFlight = useRef(false);
   const [logOpen, setLogOpen] = useState(false);
+  const [topologyOpen, setTopologyOpen] = useState(false);
   const updateProgressBucket = useRef(-1);
   const isConnected = room.backendRunning && Boolean(room.localPeerId);
+  const peerNames = useMemo(() => buildPeerNames(room.messages, room.localPeerId, config.name, room.peerNames),
+    [room.messages, room.localPeerId, config.name, room.peerNames]);
+  const displayName = (id, explicit) => peerDisplayName(id, peerNames, explicit);
 
   useEffect(() => {
     if (import.meta.env.DEV) return undefined;
@@ -204,7 +217,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (isPreview || import.meta.env.DEV) return undefined;
+    if (!checkUpdatesAtStartup) return undefined;
     let canceled = false;
     setUpdate((current) => ({ ...current, status: "checking", message: "" }));
     invoke("check_for_update")
@@ -231,7 +244,7 @@ function App() {
     return () => {
       canceled = true;
     };
-  }, []);
+  }, [checkAttempt]);
 
   async function callCommand(command, args = {}, options = {}) {
     const requiresBackend = options.requiresBackend ?? true;
@@ -261,7 +274,7 @@ function App() {
     const started = await callCommand("start_backend", {
       config: {
         name: config.name.trim() || "light-ear",
-        topic: config.topic.trim() || "light-ear.chat.v1",
+        topic: "",
         listen: [],
         peer: lines(config.peers),
         relay: lines(config.relays),
@@ -286,10 +299,11 @@ function App() {
   }
 
   async function installAvailableUpdate() {
-    if (!update.info || update.status === "installing" || update.status === "restarting") {
+    if (!update.info || installInFlight.current || update.status === "restarting") {
       return;
     }
 
+    installInFlight.current = true;
     updateProgressBucket.current = -1;
     setUpdate((current) => ({
       ...current,
@@ -306,6 +320,7 @@ function App() {
       }));
     } catch (error) {
       const message = `update install failed: ${formatError(error)}`;
+      installInFlight.current = false;
       setUpdate((current) => ({
         ...current,
         status: "failed",
@@ -315,30 +330,37 @@ function App() {
     }
   }
 
+  if (update.status !== "idle") {
+    return <RequiredUpdate update={update} onInstall={installAvailableUpdate}
+      onRetryCheck={() => setCheckAttempt(attempt => attempt + 1)} />;
+  }
+
   return (
     <>
       {!isConnected ? (
         <SetupPage
           config={config}
           room={room}
-          update={update}
           setConfig={setConfig}
           onSubmit={startBackend}
-          onInstallUpdate={installAvailableUpdate}
           onOpenLog={() => setLogOpen(true)}
         />
+      ) : !room.active ? (
+        <RoomBrowser room={room} onOpenPeers={() => setTopologyOpen(true)} onJoin={(topic) => callCommand("join_room", {topic})} />
       ) : (
-        <RoomConsole
-          config={config}
+        <RoomConsole key={room.active}
+          displayName={displayName}
           room={room}
-          update={update}
           setRoom={setRoom}
           callCommand={callCommand}
-          onInstallUpdate={installAvailableUpdate}
           onOpenLog={() => setLogOpen(true)}
+          onOpenPeers={() => setTopologyOpen(true)}
         />
       )}
 
+      {isConnected && topologyOpen && <TopologyDialog room={room}
+        displayName={displayName}
+        onClose={() => setTopologyOpen(false)} />}
       {logOpen && (
         <StatusLogModal
           statuses={room.statuses}
@@ -351,7 +373,24 @@ function App() {
   );
 }
 
-function SetupPage({ config, room, update, setConfig, onSubmit, onInstallUpdate, onOpenLog }) {
+function RoomBrowser({ room, onJoin, onOpenPeers }) {
+  const [name, setName] = useState("");
+  return <main className="setup-page"><section className="setup-card directory-card">
+    <div className="panel-head split"><h1>Public rooms</h1>
+      <button type="button" className="btn subtle" onClick={onOpenPeers}><Signal size={16} />Topology</button>
+    </div>
+    <ul>{Object.entries(room.rooms).map(([topic, count]) => <li key={topic}>
+      <button type="button" onClick={() => onJoin(topic)}><strong>{topic}</strong><span>{count} online</span></button>
+    </li>)}</ul>
+    {!Object.keys(room.rooms).length && <p>No active rooms discovered yet.</p>}
+    <form onSubmit={(event) => {event.preventDefault(); if(name.trim()) onJoin(name.trim());}}>
+      <Field label="Room name"><input value={name} maxLength={128} onChange={(e) => setName(e.target.value)} /></Field>
+      <button className="btn primary" disabled={!name.trim()}>Join or create</button>
+    </form>
+  </section></main>;
+}
+
+function SetupPage({ config, room, setConfig, onSubmit, onOpenLog }) {
   const statusText = room.backendStarting ? "starting" : "offline";
   const [showPeerSettings, setShowPeerSettings] = useState(false);
 
@@ -382,13 +421,7 @@ function SetupPage({ config, room, update, setConfig, onSubmit, onInstallUpdate,
               />
             </Field>
 
-            <Field label="Topic">
-              <input
-                value={config.topic}
-                autoComplete="off"
-                onChange={(event) => setConfigValue(setConfig, "topic", event.target.value)}
-              />
-            </Field>
+
           </div>
 
           <Field label="Relay / Rendezvous">
@@ -432,7 +465,6 @@ function SetupPage({ config, room, update, setConfig, onSubmit, onInstallUpdate,
               <span className="toggle-box" aria-hidden="true"></span>
               <span>mDNS off</span>
             </label>
-            <UpdateButton update={update} onInstallUpdate={onInstallUpdate} />
             <button className="btn primary" type="submit" disabled={room.backendStarting}>
               <Radio size={18} aria-hidden="true" />
               {room.backendStarting ? "Starting" : "Connect"}
@@ -448,11 +480,10 @@ function SetupPage({ config, room, update, setConfig, onSubmit, onInstallUpdate,
   );
 }
 
-function RoomConsole({ config, room, update, setRoom, callCommand, onInstallUpdate, onOpenLog }) {
+function RoomConsole({ room, setRoom, callCommand, onOpenLog, onOpenPeers, displayName }) {
   const [chatText, setChatText] = useState("");
   const [chatComposing, setChatComposing] = useState(false);
   const [queueOpen, setQueueOpen] = useState(false);
-  const [peerOverviewOpen, setPeerOverviewOpen] = useState(false);
   const [pendingMove, setPendingMove] = useState(null);
   const [pendingSeek, setPendingSeek] = useState(null);
   const [volume, setVolume] = useState(100);
@@ -465,11 +496,6 @@ function RoomConsole({ config, room, update, setRoom, callCommand, onInstallUpda
   const cacheRange = playback && room.playbackCache?.track_id
     ? cacheRangeForPlayback(room.playbackCache, playback.duration_ms)
     : null;
-  const peerNames = useMemo(
-    () => buildPeerNames(room.messages, room.localPeerId, config.name, room.peerNames),
-    [room.messages, room.localPeerId, config.name, room.peerNames],
-  );
-  const displayName = (peerId, explicitName) => peerDisplayName(peerId, peerNames, explicitName);
 
   async function sendChat(event) {
     event.preventDefault();
@@ -523,15 +549,14 @@ function RoomConsole({ config, room, update, setRoom, callCommand, onInstallUpda
   return (
     <main className="console-page" data-backend="running">
       <RoomNavBar
-        config={config}
+        onLeave={() => callCommand("leave_room")}
+        onJoin={(topic) => callCommand("join_room", {topic})}
         room={room}
         queueCount={queueCount}
         onBack={previewBackToSetup}
         onQueue={openQueue}
-        onOpenPeers={() => setPeerOverviewOpen(true)}
+        onOpenPeers={onOpenPeers}
         onOpenLog={onOpenLog}
-        update={update}
-        onInstallUpdate={onInstallUpdate}
         displayName={displayName}
       />
 
@@ -540,7 +565,7 @@ function RoomConsole({ config, room, update, setRoom, callCommand, onInstallUpda
         aria-label="light-ear room chat"
       >
         {peersDisconnected && (
-          <ConnectionAlert onOpenPeers={() => setPeerOverviewOpen(true)} />
+          <ConnectionAlert onOpenPeers={onOpenPeers} />
         )}
         <section className="panel chat-panel room-chat-panel">
           <div className="chat-head">
@@ -619,15 +644,6 @@ function RoomConsole({ config, room, update, setRoom, callCommand, onInstallUpda
         />
       )}
 
-      {peerOverviewOpen && (
-        <PeerOverviewModal
-          peers={room.peers}
-          peerCount={room.peerCount}
-          displayName={displayName}
-          onClose={() => setPeerOverviewOpen(false)}
-        />
-      )}
-
       {room.vote && (
         <VoteModal
           vote={room.vote}
@@ -640,38 +656,34 @@ function RoomConsole({ config, room, update, setRoom, callCommand, onInstallUpda
   );
 }
 
-function UpdateButton({ update, onInstallUpdate, compact = false }) {
-  if (!update || !["available", "installing", "restarting"].includes(update.status)) {
-    return null;
-  }
-
-  const percent = update.progress?.contentLength
-    ? Math.min(99, Math.floor((update.progress.downloaded / update.progress.contentLength) * 100))
-    : null;
-  const version = update.info?.version;
-  const label = update.status === "available"
-    ? compact ? "Update" : `Install ${version || "update"}`
-    : update.status === "restarting"
-      ? "Restarting"
-      : percent
-        ? `Updating ${percent}%`
-        : "Updating";
-  const title = update.status === "available" && version
-    ? `Install update ${version}`
-    : label;
+function RequiredUpdate({ update, onInstall, onRetryCheck }) {
+  const { info, status, progress, message } = update;
+  const checking = status === "checking";
+  const installing = status === "installing";
+  const restarting = status === "restarting";
+  const busy = checking || installing || restarting;
+  const percent = progress?.contentLength > 0
+    ? Math.min(100, Math.floor(100 * progress.downloaded / progress.contentLength))
+    : undefined;
+  let heading = info ? "Update required" : "Update check failed";
+  if (checking) heading = "Checking for updates";
+  if (installing) heading = message === "download finished" ? "Installing update" : "Downloading update";
+  if (restarting) heading = "Restarting light-ear";
 
   return (
-    <button
-      className={`btn ${compact ? "ghost update-nav-button" : "subtle update-button"}`}
-      type="button"
-      title={title}
-      aria-label={title}
-      disabled={update.status !== "available"}
-      onClick={onInstallUpdate}
-    >
-      <Download size={16} aria-hidden="true" />
-      {label}
-    </button>
+    <main className="setup-page">
+      <section className="setup-card required-update" aria-labelledby="update-heading">
+        <div aria-live="polite">
+          <h1 id="update-heading">{heading}</h1>
+          {info && <p>Install light-ear {info.version} to connect.</p>}
+          {status === "failed" && <p role="alert">{message}</p>}
+        </div>
+        {busy ? <progress aria-label={heading} max={100} value={installing ? percent : undefined} /> :
+          <button type="button" className="btn primary" onClick={info ? onInstall : onRetryCheck}>
+            {info ? (status === "failed" ? "Retry installation" : "Install and restart") : "Retry update check"}
+          </button>}
+      </section>
+    </main>
   );
 }
 
@@ -693,15 +705,13 @@ function ConnectionAlert({ onOpenPeers }) {
 }
 
 function RoomNavBar({
-  config,
+  onLeave, onJoin,
   room,
   queueCount,
   onBack,
   onQueue,
   onOpenPeers,
   onOpenLog,
-  update,
-  onInstallUpdate,
   displayName,
 }) {
   const latestStatus = room.statuses.at(-1) ?? "quiet";
@@ -712,8 +722,8 @@ function RoomNavBar({
   const peerCountLabel = `${room.peerCount} peer${room.peerCount === 1 ? "" : "s"}`;
   const peerLabel = peerDropAlert ? "disconnected" : hasRoomPeers ? peerCountLabel : "solo";
   const peerAriaLabel = peerDropAlert
-    ? "Open peer overview: room peers disconnected"
-    : `Open peer overview: ${peerCountLabel}`;
+    ? "Open network topology: room peers disconnected"
+    : `Open network topology: ${peerCountLabel}`;
   const PeerIcon = peerDropAlert ? WifiOff : Signal;
 
   return (
@@ -739,11 +749,15 @@ function RoomNavBar({
           type="button"
           onClick={onOpenPeers}
           aria-label={peerAriaLabel}
+          title="Network topology"
         >
           <PeerIcon size={14} aria-hidden="true" />
           {peerLabel}
         </button>
-        <span className="nav-chip topic-chip" title={config.topic}>{config.topic}</span>
+        <select className="nav-chip topic-chip" aria-label="Switch room" value={room.active} onChange={e => onJoin(e.target.value)}>
+          {Object.keys(room.rooms).map(topic => <option key={topic}>{topic}</option>)}
+        </select>
+        <button className="btn ghost" onClick={onLeave}>Leave room</button>
       </div>
 
       <button
@@ -758,7 +772,6 @@ function RoomNavBar({
       </button>
 
       <div className="nav-actions">
-        <UpdateButton update={update} onInstallUpdate={onInstallUpdate} compact />
         <button className="btn ghost queue-nav-button" type="button" onClick={onQueue}>
           <ListMusic size={17} aria-hidden="true" />
           Queue
@@ -1429,115 +1442,6 @@ function StatusLogModal({ statuses, logs, onExportLog, onClose }) {
   );
 }
 
-function PeerOverviewModal({ peers, peerCount, displayName, onClose }) {
-  useEffect(() => {
-    function closeOnEscape(event) {
-      if (event.key === "Escape") {
-        onClose();
-      }
-    }
-
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [onClose]);
-
-  const roomPeers = peers.filter((peer) => peer.kind !== "rendezvous");
-  const infraPeers = peers.filter((peer) => peer.kind === "rendezvous");
-
-  return (
-    <div
-      className="modal-scrim peer-scrim"
-      role="dialog"
-      aria-modal="true"
-      aria-label="Peer overview"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) {
-          onClose();
-        }
-      }}
-    >
-      <section className="modal-card peer-modal">
-        <div className="panel-head split">
-          <div>
-            <p className="overline">Network</p>
-            <h2>{peerCount} peers</h2>
-          </div>
-          <IconButton label="Close peer overview" onClick={onClose}>
-            <X size={18} aria-hidden="true" />
-          </IconButton>
-        </div>
-
-        <PeerGroup
-          title="Room"
-          peers={roomPeers}
-          empty="no connected room peers"
-          displayName={displayName}
-        />
-        {infraPeers.length > 0 && (
-          <PeerGroup
-            title="Infrastructure"
-            peers={infraPeers}
-            empty=""
-            displayName={displayName}
-          />
-        )}
-      </section>
-    </div>
-  );
-}
-
-function PeerGroup({ title, peers, empty, displayName }) {
-  return (
-    <section className="peer-group">
-      <div className="peer-group-head">
-        <h3>{title}</h3>
-        <span>{peers.length}</span>
-      </div>
-
-      {peers.length === 0 ? (
-        <div className="empty-state">{empty}</div>
-      ) : (
-        <div className="peer-list">
-          {peers.map((peer) => (
-            <article className="peer-row" key={peer.peer_id}>
-              <div className="peer-row-main">
-                <strong title={peer.peer_id}>{displayName(peer.peer_id)}</strong>
-                <span>{shortPeer(peer.peer_id)}</span>
-              </div>
-              <span className={`route-pill route-${routeClass(peer.route)}`}>{peer.route}</span>
-              <dl className="peer-stats">
-                <div>
-                  <dt>links</dt>
-                  <dd>{peer.direct_connections}d / {peer.relayed_connections}r</dd>
-                </div>
-                <div>
-                  <dt>addr</dt>
-                  <dd>{peer.direct_address_count}</dd>
-                </div>
-                <div>
-                  <dt>chat</dt>
-                  <dd>{peer.chat_subscribed ? "ready" : "wait"}</dd>
-                </div>
-                <div>
-                  <dt>direct</dt>
-                  <dd>
-                    {peer.direct_promotion_attempts}/{peer.direct_promotion_failures}
-                    {peer.direct_promotion_in_flight ? " now" : ""}
-                    {peer.direct_promotion_suspended ? " hold" : ""}
-                  </dd>
-                </div>
-              </dl>
-            </article>
-          ))}
-        </div>
-      )}
-    </section>
-  );
-}
-
-function routeClass(route) {
-  return String(route || "known").replace(/[^a-z0-9]+/gi, "-").toLowerCase();
-}
 
 function Brand({ localPeerId }) {
   return (
@@ -1681,6 +1585,13 @@ function StatusFeed({ statuses, compact = false, maxLines = 1, onOpenLog }) {
 
 function applyBackendEvent(current, event) {
   switch (event.type) {
+    case "topology": return {...current, topology: event.payload};
+    case "network_metrics": return {...current, networkMetrics:event.payload};
+    case "room_directory": {
+      const {active, rooms} = event.payload;
+      if (active === current.active) return {...current, rooms};
+      return {...current, active, rooms, networkMetrics: null, messages: [], peerNames: [], playback: null, playbackCache: null, playbackBuffer: null, queue: null, vote: null, peerCount: 0, hadPeers: false, peerDropAlert: false};
+    }
     case "status":
       return appendStatus(current, event.payload);
     case "peer_count": {
@@ -1970,8 +1881,19 @@ async function previewInvoke(command, args = {}) {
   switch (command) {
     case "start_backend":
       emitPreview("backend-event", { type: "local_peer_id", payload: "12D3KooW-local-preview" });
+      emitPreview("backend-event", { type: "topology", payload: previewTopology(null) });
+      emitPreview("backend-event", { type: "peers", payload: previewPeers() });
+      emitPreview("backend-event", { type: "room_directory", payload: {active: null, rooms: {"light-ear.chat.v1": 3}} });
+      return;
+    case "leave_room":
+      emitPreview("backend-event", { type: "topology", payload: previewTopology(null) });
+      emitPreview("backend-event", {type:"room_directory",payload:{active:null,rooms:{"light-ear.chat.v1":3}}});
+      return;
+    case "join_room":
+      emitPreview("backend-event", { type: "topology", payload: previewTopology(args.topic) });
+      emitPreview("backend-event", {type:"room_directory",payload:{active:args.topic,rooms:{[args.topic]:4}}});
       emitPreview("backend-event", { type: "peer_count", payload: 3 });
-      emitPreview("backend-event", { type: "status", payload: `joined topic ${args.config.topic}` });
+      emitPreview("backend-event", { type: "status", payload: `joined topic ${args.topic}` });
       emitPreview("backend-event", { type: "history", payload: previewMessages() });
       emitPreview("backend-event", { type: "playback", payload: previewPlayback() });
       emitPreview("backend-event", { type: "queue", payload: previewQueue() });
@@ -2096,6 +2018,7 @@ function previewPeerNames() {
   return [
     { peer_id: "12D3KooW-alice", name: "alice" },
     { peer_id: "12D3KooW-bob", name: "bob" },
+    { peer_id: "12D3KooW-east", name: "east" },
   ];
 }
 
@@ -2107,6 +2030,20 @@ function previewPlayback() {
     duration_ms: 244_000,
     leader_peer_id: "12D3KooW-leader-preview",
     leader_name: "alice",
+  };
+}
+
+function previewTopology(room) {
+  const local = "12D3KooW-local-preview", alice = "12D3KooW-alice", bob = "12D3KooW-bob", east = "12D3KooW-east";
+  const topic = room ?? "light-ear.chat.v1";
+  return {
+    rooms_by_peer: { [local]: room, [alice]: topic, [bob]: topic, [east]: topic },
+    links: [
+      { source: local, target: alice, direct: true, lanes: 1, rtt_ms: 12 },
+      { source: local, target: bob, direct: false, lanes: 2, rtt_ms: 78 },
+      { source: alice, target: east, direct: true, lanes: 1, rtt_ms: 21 },
+      { source: bob, target: east, direct: true, lanes: 2, rtt_ms: 14 },
+    ],
   };
 }
 
@@ -2141,9 +2078,9 @@ function previewPeers() {
     {
       peer_id: "12D3KooW-rendezvous",
       kind: "rendezvous",
-      route: "relay",
-      direct_connections: 0,
-      relayed_connections: 1,
+      route: "direct",
+      direct_connections: 1,
+      relayed_connections: 0,
       direct_address_count: 0,
       chat_subscribed: false,
       direct_promotion_attempts: 0,

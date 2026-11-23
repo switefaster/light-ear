@@ -75,3 +75,7 @@ stabilization effort complete until a real run confirms chat, history sync,
 queue/vote convergence, playback readiness, direct-promotion failure fallback,
 peer overview, gossipsub readiness errors, status log filtering, duplicate
 names, and IME input.
+
+## Adaptive routing evidence
+
+The library suite includes real TCP loopback tests for browsing and switching through a foreign-room helper, automatic repair after learning a second dial candidate, byte distribution across two gateways, congestion recovery, and circuit retirement and reacquisition. The four-peer test prints the received payload bytes per crossing and the observed p95 acknowledgement time. A 256-peer graph test checks cut detection and forwarding coverage. The manual smoke test covers multicast discovery and NAT behavior on separate hosts.

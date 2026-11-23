@@ -7,3 +7,6 @@ mod media_cache;
 mod music_state;
 mod playback_health;
 pub mod player;
+
+mod directory;
+mod topology;

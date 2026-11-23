@@ -1,3 +1,10 @@
+#[path = "observed_gossip.rs"]
+mod observed_gossip;
+use observed_gossip::Observed;
+#[path = "overlay.rs"]
+mod overlay;
+use crate::directory;
+use overlay::Network;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
@@ -96,7 +103,9 @@ pub struct BackendConfig {
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
-    gossipsub: gossipsub::Behaviour,
+    directory: overlay::Exchange,
+    alternate: Observed,
+    gossipsub: Observed,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     relay: relay::client::Behaviour,
@@ -261,7 +270,14 @@ pub async fn run_network(
     mut commands: mpsc::Receiver<NetworkCommand>,
     ui: mpsc::Sender<UiEvent>,
 ) -> Result<()> {
-    let topic = gossipsub::IdentTopic::new(config.topic.clone());
+    let initial_room = (!config.topic.is_empty()).then(|| config.topic.clone());
+    if initial_room
+        .as_deref()
+        .is_some_and(|r| !directory::valid_room(r))
+    {
+        return Err(anyhow!("invalid room name"));
+    }
+    let mut topic = directory::room_topic(&config.topic);
     let mut seen_messages = HashSet::new();
     let mut history = Vec::new();
     let mut message_seq = 0_u64;
@@ -273,7 +289,7 @@ pub async fn run_network(
     let mut rendezvous_cookies = HashMap::new();
     let relay_addrs = prioritize_multiaddrs(config.relay.clone());
     let mut zero_peer_recovery = ZeroPeerRecovery::default();
-    let rendezvous_namespace = rendezvous::Namespace::new(config.topic.clone())
+    let rendezvous_namespace = rendezvous::Namespace::new(directory::NAMESPACE.into())
         .map_err(|err| anyhow!("invalid rendezvous namespace '{}': {err}", config.topic))?;
     let mut music = MusicState::new();
     let http_client = bilibili::client()?;
@@ -308,7 +324,8 @@ pub async fn run_network(
     let mut zero_peer_recovery_tick = time::interval(ZERO_PEER_RECOVERY_TICK);
     zero_peer_recovery_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-    let mut swarm = SwarmBuilder::with_new_identity()
+    let key = libp2p::identity::Keypair::generate_ed25519();
+    let swarm = SwarmBuilder::with_existing_identity(key.clone())
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
@@ -321,7 +338,7 @@ pub async fn run_network(
         .with_behaviour(
             |key, relay| -> Result<Behaviour, Box<dyn std::error::Error + Send + Sync>> {
                 let peer_id = key.public().to_peer_id();
-                let gossipsub = build_gossipsub(key)?;
+                let gossipsub = build_gossipsub(key, "/light-ear/tree-a/2")?;
                 let identify = identify::Behaviour::new(identify::Config::new(
                     "/light-ear/0.1.0".to_string(),
                     key.public(),
@@ -336,7 +353,15 @@ pub async fn run_network(
                 };
 
                 Ok(Behaviour {
-                    gossipsub,
+                    directory: overlay::Exchange::new(
+                        [(
+                            libp2p::StreamProtocol::new("/light-ear/directory/2"),
+                            libp2p::request_response::ProtocolSupport::Full,
+                        )],
+                        Default::default(),
+                    ),
+                    alternate: Observed::new(build_gossipsub(key, "/light-ear/tree-b/2")?),
+                    gossipsub: Observed::new(gossipsub),
                     identify,
                     ping: ping::Behaviour::default(),
                     relay,
@@ -349,14 +374,19 @@ pub async fn run_network(
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(SWARM_IDLE_CONNECTION_TIMEOUT))
         .build();
 
+    let mut swarm = Network::new(swarm, key, initial_room);
+    for addr in &config.peer {
+        swarm.remember_seed(addr.clone());
+    }
+    let mut overlay_tick = time::interval(Duration::from_millis(500));
     let local_peer_id = *swarm.local_peer_id();
     let mut connections = ConnectionState::new(local_peer_id);
-    let local_joined_at = current_timestamp_micros();
+    let mut local_joined_at = current_timestamp_micros();
     let _ = ui
         .send(UiEvent::LocalPeerId(local_peer_id.to_string()))
         .await;
     send_queue_view(&ui, local_peer_id, &music).await;
-    swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+    swarm.tick(&ui).await;
 
     let listen_addrs = if config.listen.is_empty() {
         vec![
@@ -416,7 +446,68 @@ pub async fn run_network(
 
     loop {
         tokio::select! {
+            _ = overlay_tick.tick() => {
+                swarm.tick(&ui).await;
+                if std::mem::take(&mut swarm.room_routes_changed) && swarm.room.is_some() { schedule_sync_burst(&mut sync_announcements); }
+                if let Some(operation) = buffer_coordinator.active() {
+                    let departed = operation.expected_peers.iter()
+                        .filter(|peer| swarm.lost_member(peer)).cloned().collect::<Vec<_>>();
+                    for peer in departed {
+                        music.remove_pending_peer(&peer);
+                        buffer_coordinator.remove_expected_peer(&peer, Instant::now());
+                    }
+                }
+            },
             command = commands.recv() => match command {
+                #[cfg(test)]
+                Some(NetworkCommand::DialTestPeer(addr))=>{let _=swarm.dial(addr);}
+                #[cfg(test)]
+                Some(NetworkCommand::LearnTestCandidate(addr)) => swarm.remember_seed(addr),
+                #[cfg(test)]
+                Some(NetworkCommand::LimitTestTransit(bytes)) => swarm.transit_rate=bytes,
+                Some(command @ (NetworkCommand::JoinRoom(_) | NetworkCommand::LeaveRoom)) => {
+                    let next = match command {
+                        NetworkCommand::JoinRoom(room) if directory::valid_room(&room) => Some(room),
+                        NetworkCommand::JoinRoom(_) => {
+                            send_status(&ui, "invalid room name".into()).await;
+                            continue;
+                        }
+                        _ => None,
+                    };
+                    if swarm.room == next { continue; }
+                    if let Some(player) = audio_player.as_mut() {
+                        player.stop();
+                        player.drain_events();
+                    }
+                    music = MusicState::new();
+                    buffer_coordinator = BufferCoordinator::new();
+                    playback_health = PlaybackHealth::new();
+                    local_media = LocalMediaResolver::default();
+                    failed_audio_sessions.clear();
+                    history.clear();
+                    seen_messages.clear();
+                    peer_names.clear();
+                    history_request_times.clear();
+                    queue_request_times.clear();
+                    sync_announcements = SyncAnnouncementState::default();
+                    local_joined_at = current_timestamp_micros();
+                    topic = directory::room_topic(next.as_deref().unwrap_or(""));
+                    swarm.change_room(next);
+                    swarm.tick(&ui).await;
+                    connections.reset_room_subscriptions();
+                    let subscribers = swarm.behaviour().gossipsub.all_peers()
+                        .filter(|(_, topics)| topics.contains(&&topic.hash()))
+                        .map(|(peer, _)| *peer).collect::<Vec<_>>();
+                    for peer in subscribers {
+                        let effects = connections.chat_subscribed(peer, Instant::now());
+                        apply_connection_effects(&mut swarm, &mut connections, &ui, &rendezvous_nodes, effects).await;
+                    }
+                    send_queue_view(&ui, local_peer_id, &music).await;
+                    schedule_sync_burst(&mut sync_announcements);
+                }
+                Some(ref cmd) if swarm.room.is_none() && !matches!(cmd, NetworkCommand::Shutdown | NetworkCommand::SetVolume(_)) => {
+                    send_status(&ui, "join a room first".into()).await;
+                }
                 Some(NetworkCommand::Chat(text)) => {
                     let sent_at = current_timestamp_micros();
                     let causal_frontier = history_frontier(&history);
@@ -522,7 +613,7 @@ pub async fn run_network(
                             rendezvous_nodes: &rendezvous_nodes,
                         };
                         let room_peer_total =
-                            room_peer_count(&swarm, &rendezvous_nodes, local_peer_id);
+                            swarm.member_count();
                         propose_or_execute_vote(
                             VoteAction::Pause,
                             &mut music,
@@ -550,7 +641,7 @@ pub async fn run_network(
                             rendezvous_nodes: &rendezvous_nodes,
                         };
                         let room_peer_total =
-                            room_peer_count(&swarm, &rendezvous_nodes, local_peer_id);
+                            swarm.member_count();
                         propose_or_execute_vote(
                             VoteAction::Resume,
                             &mut music,
@@ -579,7 +670,7 @@ pub async fn run_network(
                             rendezvous_nodes: &rendezvous_nodes,
                         };
                         let room_peer_total =
-                            room_peer_count(&swarm, &rendezvous_nodes, local_peer_id);
+                            swarm.member_count();
                         if music
                             .playback_state()
                             .is_some_and(|state| can_control_playback(state, local_peer_id))
@@ -650,7 +741,7 @@ pub async fn run_network(
                             rendezvous_nodes: &rendezvous_nodes,
                         };
                         let room_peer_total =
-                            room_peer_count(&swarm, &rendezvous_nodes, local_peer_id);
+                            swarm.member_count();
                         propose_or_execute_vote(
                             VoteAction::Skip,
                             &mut music,
@@ -694,7 +785,7 @@ pub async fn run_network(
                                 rendezvous_nodes: &rendezvous_nodes,
                             };
                             let room_peer_total =
-                                room_peer_count(&swarm, &rendezvous_nodes, local_peer_id);
+                                swarm.member_count();
                             propose_or_execute_vote(
                                 VoteAction::Remove {
                                     item_id: item.item_id.clone(),
@@ -725,7 +816,7 @@ pub async fn run_network(
                                 rendezvous_nodes: &rendezvous_nodes,
                             };
                             let room_peer_total =
-                                room_peer_count(&swarm, &rendezvous_nodes, local_peer_id);
+                                swarm.member_count();
                             propose_or_execute_vote(
                                 VoteAction::Move {
                                     item_id: item.item_id.clone(),
@@ -754,7 +845,7 @@ pub async fn run_network(
                     let targets = PublishTargets {
                         rendezvous_nodes: &rendezvous_nodes,
                     };
-                    let room_peer_total = room_peer_count(&swarm, &rendezvous_nodes, local_peer_id);
+                    let room_peer_total = swarm.member_count();
                     cast_vote(
                         approve,
                         &mut music,
@@ -830,7 +921,7 @@ pub async fn run_network(
                 let targets = PublishTargets {
                     rendezvous_nodes: &rendezvous_nodes,
                 };
-                let room_peer_total = room_peer_count(&swarm, &rendezvous_nodes, local_peer_id);
+                let room_peer_total = swarm.member_count();
                 let player_events = audio_player
                     .as_mut()
                     .map_or_else(Vec::new, player::AudioPlayer::drain_events);
@@ -1071,7 +1162,7 @@ pub async fn run_network(
                     }
                 }
             },
-            _ = history_sync.tick() => {
+            _ = history_sync.tick(), if swarm.room.is_some() => {
                 let targets = PublishTargets {
                     rendezvous_nodes: &rendezvous_nodes,
                 };
@@ -1090,7 +1181,7 @@ pub async fn run_network(
                     send_status(&ui, format!("sync summary failed: {err}")).await;
                 }
             },
-            _ = history_sync_burst.tick() => {
+            _ = history_sync_burst.tick(), if swarm.room.is_some() => {
                 let targets = PublishTargets {
                     rendezvous_nodes: &rendezvous_nodes,
                 };
@@ -1226,14 +1317,28 @@ pub async fn run_network(
 
 fn build_gossipsub(
     key: &libp2p::identity::Keypair,
+    prefix: &'static str,
 ) -> Result<gossipsub::Behaviour, Box<dyn std::error::Error + Send + Sync>> {
     let message_id_fn = |message: &gossipsub::Message| {
         let mut hasher = DefaultHasher::new();
+        message.topic.hash(&mut hasher);
+        message.source.hash(&mut hasher);
         message.data.hash(&mut hasher);
         gossipsub::MessageId::from(hasher.finish().to_string())
     };
 
     let config = gossipsub::ConfigBuilder::default()
+        .protocol_id_prefix(prefix)
+        .mesh_n(0)
+        .mesh_n_low(0)
+        .mesh_n_high(0)
+        .mesh_outbound_min(0)
+        .retain_scores(0)
+        .gossip_lazy(0)
+        .gossip_factor(0.0)
+        .gossip_retransimission(0)
+        .flood_publish(false)
+        .validate_messages()
         .heartbeat_interval(Duration::from_secs(1))
         .validation_mode(gossipsub::ValidationMode::Strict)
         .message_id_fn(message_id_fn)
@@ -1267,7 +1372,7 @@ struct HistoryContext<'a> {
 }
 
 async fn apply_connection_effects(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     connections: &mut ConnectionState,
     ui: &mpsc::Sender<UiEvent>,
     rendezvous_nodes: &HashSet<PeerId>,
@@ -1278,15 +1383,6 @@ async fn apply_connection_effects(
     while let Some(effect) = pending.pop_front() {
         match effect {
             ConnectionEffect::Status(status) => send_status(ui, status).await,
-            ConnectionEffect::TrackGossipPeer(peer_id) => {
-                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-            }
-            ConnectionEffect::UntrackGossipPeer(peer_id) => {
-                swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .remove_explicit_peer(&peer_id);
-            }
             ConnectionEffect::ResetBackoff(_) => {}
             ConnectionEffect::DialDirect { peer_id, addresses } => {
                 let dial_opts = DialOpts::peer_id(peer_id)
@@ -1306,9 +1402,12 @@ async fn apply_connection_effects(
                 connection_ids,
                 reason,
             } => {
+                swarm.request_handoff(peer_id);
                 let closed_relays = connection_ids
                     .into_iter()
-                    .filter(|connection_id| swarm.close_connection(*connection_id))
+                    .filter(|connection_id| {
+                        swarm.handoff_ready(peer_id) && swarm.close_connection(*connection_id)
+                    })
                     .count();
                 if closed_relays > 0 {
                     let status = match reason {
@@ -1352,7 +1451,7 @@ async fn apply_connection_effects(
 
 async fn handle_swarm_event(
     event: SwarmEvent<BehaviourEvent>,
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     ui: &mpsc::Sender<UiEvent>,
     connections: &mut ConnectionState,
     rendezvous_nodes: &HashSet<PeerId>,
@@ -1383,6 +1482,9 @@ async fn handle_swarm_event(
         } => {
             let is_relayed =
                 endpoint.is_relayed() || is_relay_address(endpoint.get_remote_address());
+            if !rendezvous_nodes.contains(&peer_id) {
+                swarm.link(peer_id, connection_id, Some(!is_relayed));
+            }
             let effects = connections.connection_established(
                 peer_id,
                 connection_id,
@@ -1406,7 +1508,7 @@ async fn handle_swarm_event(
 
             let targets = PublishTargets { rendezvous_nodes };
             let count = connected_room_peer_count(swarm, rendezvous_nodes);
-            let _ = ui.send(UiEvent::PeerCount(count)).await;
+
             if count > 0 && !rendezvous_nodes.contains(&peer_id) && zero_peer_recovery.finish() {
                 schedule_sync_burst(ctx.sync_announcements);
                 send_status(
@@ -1438,6 +1540,7 @@ async fn handle_swarm_event(
         } => {
             let was_relayed =
                 endpoint.is_relayed() || is_relay_address(endpoint.get_remote_address());
+            swarm.link(peer_id, connection_id, None);
             let effects =
                 connections.connection_closed(peer_id, connection_id, was_relayed, num_established);
             apply_connection_effects(swarm, connections, ui, rendezvous_nodes, effects).await;
@@ -1447,7 +1550,7 @@ async fn handle_swarm_event(
                     send_peer_names(ui, &*ctx.peer_names).await;
                 }
                 let count = connected_room_peer_count(swarm, rendezvous_nodes);
-                let _ = ui.send(UiEvent::PeerCount(count)).await;
+
                 if count == 0
                     && !rendezvous_nodes.contains(&peer_id)
                     && zero_peer_recovery.start(Instant::now())
@@ -1459,20 +1562,39 @@ async fn handle_swarm_event(
                     .await;
                 }
                 let peer_id = peer_id.to_string();
-                ctx.music.remove_pending_peer(&peer_id);
-                let targets = PublishTargets { rendezvous_nodes };
-                if ctx
-                    .buffer_coordinator
-                    .remove_expected_peer(&peer_id, Instant::now())
-                    .is_some()
+                if !swarm
+                    .room
+                    .as_ref()
+                    .is_some_and(|r| swarm.directory.members(r).contains(&peer_id))
                 {
-                    if let Err(err) = resolve_buffer_operation(
-                        ctx.buffer_coordinator,
+                    ctx.music.remove_pending_peer(&peer_id);
+                    let targets = PublishTargets { rendezvous_nodes };
+                    if ctx
+                        .buffer_coordinator
+                        .remove_expected_peer(&peer_id, Instant::now())
+                        .is_some()
+                    {
+                        if let Err(err) = resolve_buffer_operation(
+                            ctx.buffer_coordinator,
+                            ctx.music,
+                            &mut *ctx.audio_player,
+                            ctx.http_client,
+                            ctx.local_media,
+                            ctx.failed_audio_sessions,
+                            swarm,
+                            ctx.topic,
+                            &targets,
+                            ctx.local_peer_id,
+                            ui,
+                        )
+                        .await
+                        {
+                            send_status(ui, format!("buffer operation failed: {err:#}")).await;
+                        }
+                        send_buffer_view(ui, ctx.buffer_coordinator, ctx.local_peer_id).await;
+                    }
+                    if let Err(err) = maybe_start_pending_playback(
                         ctx.music,
-                        &mut *ctx.audio_player,
-                        ctx.http_client,
-                        ctx.local_media,
-                        ctx.failed_audio_sessions,
                         swarm,
                         ctx.topic,
                         &targets,
@@ -1481,21 +1603,8 @@ async fn handle_swarm_event(
                     )
                     .await
                     {
-                        send_status(ui, format!("buffer operation failed: {err:#}")).await;
+                        send_status(ui, format!("playback start failed: {err:#}")).await;
                     }
-                    send_buffer_view(ui, ctx.buffer_coordinator, ctx.local_peer_id).await;
-                }
-                if let Err(err) = maybe_start_pending_playback(
-                    ctx.music,
-                    swarm,
-                    ctx.topic,
-                    &targets,
-                    ctx.local_peer_id,
-                    ui,
-                )
-                .await
-                {
-                    send_status(ui, format!("playback start failed: {err:#}")).await;
                 }
             }
         }
@@ -1503,12 +1612,9 @@ async fn handle_swarm_event(
             let mut discovered = false;
             for (peer_id, address) in list {
                 discovered = true;
-                let mut effects = connections.track_gossip_peer(peer_id, None);
-                effects.extend(connections.learn_direct_addresses(
-                    peer_id,
-                    [address],
-                    Instant::now(),
-                ));
+                swarm.bootstrap_dial(peer_id, vec![address.clone()]);
+                let effects =
+                    connections.learn_direct_addresses(peer_id, [address], Instant::now());
                 apply_connection_effects(swarm, connections, ui, rendezvous_nodes, effects).await;
                 send_status(ui, format!("mDNS discovered {peer_id}")).await;
             }
@@ -1537,11 +1643,7 @@ async fn handle_swarm_event(
                 if forget_peer_name(peer_id, &mut *ctx.peer_names) {
                     send_peer_names(ui, &*ctx.peer_names).await;
                 }
-                if !is_peer_connected(swarm, peer_id) {
-                    let effects = connections.untrack_gossip_peer(peer_id);
-                    apply_connection_effects(swarm, connections, ui, rendezvous_nodes, effects)
-                        .await;
-                }
+
                 send_status(ui, format!("mDNS expired {peer_id}")).await;
             }
         }
@@ -1665,15 +1767,22 @@ async fn handle_swarm_event(
             )
             .await;
         }
-        SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::SlowPeer {
-            peer_id,
-            failed_messages,
-        })) => {
+        SwarmEvent::Behaviour(
+            BehaviourEvent::Gossipsub(gossipsub::Event::SlowPeer {
+                peer_id,
+                failed_messages,
+            })
+            | BehaviourEvent::Alternate(gossipsub::Event::SlowPeer {
+                peer_id,
+                failed_messages,
+            }),
+        ) => {
             send_status(
                 ui,
                 format!("gossipsub slow peer {peer_id}: {failed_messages:?}"),
             )
             .await;
+            swarm.congestion(peer_id);
             let targets = PublishTargets { rendezvous_nodes };
             if ctx
                 .buffer_coordinator
@@ -1705,18 +1814,30 @@ async fn handle_swarm_event(
                 send_buffer_view(ui, ctx.buffer_coordinator, ctx.local_peer_id).await;
             }
         }
-        SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
-            propagation_source,
-            message,
-            ..
-        })) => match serde_json::from_slice::<WireMessage>(&message.data) {
-            Ok(wire) => {
-                let source_peer_id = message.source.unwrap_or(propagation_source);
-                apply_wire_message(source_peer_id, wire, swarm, rendezvous_nodes, ui, &mut ctx)
-                    .await;
+        SwarmEvent::Behaviour(BehaviourEvent::Directory(e)) => swarm.exchange(e),
+        SwarmEvent::Behaviour(BehaviourEvent::Ping(e)) => swarm.ping(e),
+        SwarmEvent::Behaviour(
+            event @ (BehaviourEvent::Alternate(gossipsub::Event::Message { .. })
+            | BehaviourEvent::Gossipsub(gossipsub::Event::Message { .. })),
+        ) => {
+            let (i, event) = match event {
+                BehaviourEvent::Gossipsub(e) => (0, e),
+                BehaviourEvent::Alternate(e) => (1, e),
+                _ => unreachable!(),
+            };
+            if let gossipsub::Event::Message {
+                propagation_source,
+                message_id,
+                message,
+            } = event
+            {
+                if let Some((peer, wire)) =
+                    swarm.receive(i, propagation_source, message_id, message)
+                {
+                    apply_wire_message(peer, wire, swarm, rendezvous_nodes, ui, &mut ctx).await;
+                }
             }
-            Err(err) => send_status(ui, format!("ignored invalid message: {err}")).await,
-        },
+        }
         SwarmEvent::Behaviour(BehaviourEvent::Relay(event)) => {
             send_status(ui, format!("relay event: {event:?}")).await;
         }
@@ -1756,7 +1877,7 @@ async fn handle_swarm_event(
 }
 
 async fn retry_direct_promotions(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     connections: &mut ConnectionState,
     ui: &mpsc::Sender<UiEvent>,
     rendezvous_nodes: &HashSet<PeerId>,
@@ -1766,7 +1887,7 @@ async fn retry_direct_promotions(
 }
 
 async fn retry_gossip_warmup_promotions(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     connections: &mut ConnectionState,
     ui: &mpsc::Sender<UiEvent>,
     rendezvous_nodes: &HashSet<PeerId>,
@@ -1776,7 +1897,7 @@ async fn retry_gossip_warmup_promotions(
 }
 
 async fn run_zero_peer_recovery(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     relay_addrs: &[Multiaddr],
     rendezvous_nodes: &HashSet<PeerId>,
     namespace: &rendezvous::Namespace,
@@ -1799,7 +1920,7 @@ async fn run_zero_peer_recovery(
 }
 
 async fn ensure_rendezvous_connections(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     relay_addrs: &[Multiaddr],
     rendezvous_nodes: &HashSet<PeerId>,
     ui: &mpsc::Sender<UiEvent>,
@@ -1832,7 +1953,7 @@ async fn ensure_rendezvous_connections(
 }
 
 async fn register_with_rendezvous_nodes(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     rendezvous_nodes: &HashSet<PeerId>,
     namespace: &rendezvous::Namespace,
     ui: &mpsc::Sender<UiEvent>,
@@ -1845,7 +1966,7 @@ async fn register_with_rendezvous_nodes(
 }
 
 async fn register_with_rendezvous_node(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     rendezvous_node: PeerId,
     namespace: &rendezvous::Namespace,
     ui: &mpsc::Sender<UiEvent>,
@@ -1884,7 +2005,7 @@ async fn register_with_rendezvous_node(
 }
 
 async fn unregister_from_rendezvous_nodes(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     rendezvous_nodes: &HashSet<PeerId>,
     namespace: &rendezvous::Namespace,
     ui: &mpsc::Sender<UiEvent>,
@@ -1894,10 +2015,8 @@ async fn unregister_from_rendezvous_nodes(
         .copied()
         .filter(|peer_id| is_peer_connected(swarm, *peer_id))
         .collect::<Vec<_>>();
-    if connected_nodes.is_empty() {
-        return;
-    }
-
+    swarm.change_room(None);
+    swarm.tick(ui).await;
     for rendezvous_node in connected_nodes {
         swarm
             .behaviour_mut()
@@ -1916,16 +2035,14 @@ async fn unregister_from_rendezvous_nodes(
         tokio::select! {
             _ = &mut grace => break,
             event = swarm.select_next_some() => {
-                if let SwarmEvent::Behaviour(BehaviourEvent::Rendezvous(event)) = event {
-                    send_status(ui, format!("rendezvous shutdown event: {event:?}")).await;
-                }
+                match event { SwarmEvent::Behaviour(BehaviourEvent::Directory(e))=>swarm.exchange(e),SwarmEvent::Behaviour(BehaviourEvent::Rendezvous(event))=>send_status(ui, format!("rendezvous shutdown event: {event:?}")).await,_=>{} }
             }
         }
     }
 }
 
 async fn discover_rendezvous_peers(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     rendezvous_nodes: &HashSet<PeerId>,
     namespace: &rendezvous::Namespace,
     rendezvous_cookies: &HashMap<PeerId, rendezvous::Cookie>,
@@ -1958,7 +2075,7 @@ fn rendezvous_cookie_for_mode<'a>(
 }
 
 async fn discover_rendezvous_node(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     rendezvous_node: PeerId,
     namespace: &rendezvous::Namespace,
     cookie: Option<&rendezvous::Cookie>,
@@ -1978,7 +2095,7 @@ async fn discover_rendezvous_node(
 }
 
 async fn dial_rendezvous_registrations(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     connections: &mut ConnectionState,
     local_peer_id: PeerId,
     registrations: Vec<rendezvous::Registration>,
@@ -2004,18 +2121,29 @@ async fn dial_rendezvous_registrations(
         discovered += 1;
 
         if is_peer_connected(swarm, peer_id) {
-            let mut effects = connections.track_gossip_peer(
-                peer_id,
-                Some(format!("tracking {peer_id} as rendezvous gossip peer")),
-            );
-            effects.extend(connections.learn_direct_addresses(peer_id, addresses, Instant::now()));
+            let effects = connections.learn_direct_addresses(peer_id, addresses, Instant::now());
             apply_connection_effects(swarm, connections, ui, rendezvous_nodes, effects).await;
             continue;
         }
 
+        if swarm.reachable_without_seed(peer_id) {
+            continue;
+        }
+        if swarm.at_bootstrap_budget()
+            && (swarm.directory.records.contains_key(&peer_id.to_string())
+                || swarm
+                    .network_info()
+                    .connection_counters()
+                    .num_pending_outgoing()
+                    >= 4)
+        {
+            continue;
+        }
         let address_count = addresses.len();
+        let mut addresses = prioritize_multiaddrs(addresses);
+        addresses.sort_by_key(is_relay_address);
         let dial_opts = DialOpts::peer_id(peer_id)
-            .addresses(prioritize_multiaddrs(addresses))
+            .addresses(addresses)
             .condition(PeerCondition::Disconnected)
             .build();
         match swarm.dial(dial_opts) {
@@ -2041,64 +2169,25 @@ async fn dial_rendezvous_registrations(
     discovered
 }
 
-fn is_peer_connected(swarm: &libp2p::Swarm<Behaviour>, peer_id: PeerId) -> bool {
+fn is_peer_connected(swarm: &Network, peer_id: PeerId) -> bool {
     swarm
         .connected_peers()
         .any(|connected| *connected == peer_id)
 }
 
-fn room_peer_ids(
-    swarm: &libp2p::Swarm<Behaviour>,
-    rendezvous_nodes: &HashSet<PeerId>,
-    local_peer_id: PeerId,
-) -> HashSet<PeerId> {
-    room_peer_ids_from_connected(
-        local_peer_id,
-        swarm.connected_peers().copied(),
-        rendezvous_nodes,
-    )
-}
-
-fn room_peer_count(
-    swarm: &libp2p::Swarm<Behaviour>,
-    rendezvous_nodes: &HashSet<PeerId>,
-    local_peer_id: PeerId,
-) -> usize {
-    room_peer_ids(swarm, rendezvous_nodes, local_peer_id).len()
-}
-
-fn connected_room_peer_count(
-    swarm: &libp2p::Swarm<Behaviour>,
-    rendezvous_nodes: &HashSet<PeerId>,
-) -> usize {
+fn connected_room_peer_count(swarm: &Network, rendezvous_nodes: &HashSet<PeerId>) -> usize {
     swarm
         .connected_peers()
         .filter(|peer_id| !rendezvous_nodes.contains(peer_id))
         .count()
 }
 
-fn room_peer_ids_from_connected<I>(
-    local_peer_id: PeerId,
-    connected_peers: I,
-    rendezvous_nodes: &HashSet<PeerId>,
-) -> HashSet<PeerId>
-where
-    I: IntoIterator<Item = PeerId>,
-{
-    let mut peers = connected_peers
-        .into_iter()
-        .filter(|peer_id| !rendezvous_nodes.contains(peer_id))
-        .collect::<HashSet<_>>();
-    peers.insert(local_peer_id);
-    peers
-}
-
-fn has_external_addresses(swarm: &libp2p::Swarm<Behaviour>) -> bool {
+fn has_external_addresses(swarm: &Network) -> bool {
     swarm.external_addresses().next().is_some()
 }
 
 fn publish_history_summary(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -2107,6 +2196,7 @@ fn publish_history_summary(
     let summary = WireMessage::HistorySummary {
         peer_id: local_peer_id.to_string(),
         count: history.len(),
+        digest: history_digest(history),
         newest_at: history
             .last()
             .map(|record| normalize_timestamp_micros(record.sent_at)),
@@ -2116,7 +2206,7 @@ fn publish_history_summary(
 }
 
 fn publish_name_claim(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -2133,7 +2223,7 @@ fn publish_name_claim(
 }
 
 fn publish_presence_and_history(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -2153,7 +2243,7 @@ fn publish_presence_and_history(
 }
 
 fn publish_queue_summary(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -2176,7 +2266,7 @@ fn publish_queue_summary(
 }
 
 fn publish_sync_summary(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -2208,7 +2298,7 @@ fn publish_sync_summary(
 }
 
 fn trigger_sync(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     targets: &PublishTargets<'_>,
     ctx: &mut HistoryContext<'_>,
 ) -> Result<()> {
@@ -2254,7 +2344,7 @@ fn schedule_sync_burst(state: &mut SyncAnnouncementState) {
 
 fn publish_pending_sync_summaries(
     state: &mut SyncAnnouncementState,
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -2292,7 +2382,7 @@ fn publish_pending_sync_summaries(
 async fn apply_wire_message(
     source_peer_id: PeerId,
     message: WireMessage,
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     rendezvous_nodes: &HashSet<PeerId>,
     ui: &mpsc::Sender<UiEvent>,
     ctx: &mut HistoryContext<'_>,
@@ -2362,17 +2452,20 @@ async fn apply_wire_message(
             peer_id,
             count,
             newest_at,
+            digest,
             ..
         } => {
             let local_peer_id = ctx.local_peer_id.to_string();
             if peer_id != local_peer_id
-                && history_summary_is_newer(ctx.history, count, newest_at)
+                && (history_summary_is_newer(ctx.history, count, newest_at)
+                    || (count > 0 && digest != history_digest(ctx.history)))
                 && should_request_history(ctx.history_request_times, &peer_id)
             {
                 let request = WireMessage::HistoryRequest {
                     requester: local_peer_id,
                     target: peer_id.clone(),
                     known_count: ctx.history.len(),
+                    known_ids: ctx.history.iter().map(|r| r.id.clone()).collect(),
                     nonce: new_nonce(ctx.local_peer_id),
                 };
 
@@ -2410,45 +2503,44 @@ async fn apply_wire_message(
         WireMessage::HistoryRequest {
             requester,
             target,
-            known_count,
+            known_ids,
             ..
         } => {
             let local_peer_id = ctx.local_peer_id.to_string();
             if target == local_peer_id
                 && requester != local_peer_id
-                && ctx.history.len() > known_count
+                && known_ids.len() <= MAX_MESSAGES
             {
-                let response = WireMessage::HistoryResponse {
-                    target: Some(requester.clone()),
-                    messages: ctx.history.clone(),
-                    nonce: new_nonce(ctx.local_peer_id),
-                };
-
-                match publish_room_wire_with_outcome(swarm, ctx.topic, &response) {
-                    Ok(RoomPublishOutcome::Published) => {
-                        send_status(ui, format!("sent {} history messages", ctx.history.len()))
+                for messages in history_pages(ctx.history, &known_ids) {
+                    let response = WireMessage::HistoryResponse {
+                        target: Some(requester.clone()),
+                        messages,
+                        nonce: new_nonce(ctx.local_peer_id),
+                    };
+                    match publish_room_wire_with_outcome(swarm, ctx.topic, &response) {
+                        Ok(RoomPublishOutcome::Published) => {}
+                        Ok(RoomPublishOutcome::NoSubscribers) => {
+                            send_status(
+                                ui,
+                                format!("history response to {requester} deferred: no subscribers"),
+                            )
                             .await;
-                    }
-                    Ok(RoomPublishOutcome::NoSubscribers) => {
-                        send_status(
-                            ui,
-                            format!(
-                                "history response to {requester} not sent: no gossipsub subscribers"
-                            ),
-                        )
-                        .await;
-                    }
-                    Ok(RoomPublishOutcome::Congested) => {
-                        send_status(
-                            ui,
-                            format!(
-                                "history response to {requester} delayed: gossipsub queues are full"
-                            ),
-                        )
-                        .await;
-                    }
-                    Err(err) => {
-                        send_status(ui, format!("history response failed: {err}")).await;
+                            break;
+                        }
+                        Ok(RoomPublishOutcome::Congested) => {
+                            send_status(
+                                ui,
+                                format!(
+                                    "history response to {requester} deferred: queues are full"
+                                ),
+                            )
+                            .await;
+                            break;
+                        }
+                        Err(err) => {
+                            send_status(ui, format!("history response failed: {err}")).await;
+                            break;
+                        }
                     }
                 }
             }
@@ -2608,14 +2700,8 @@ async fn apply_wire_message(
         WireMessage::QueueResponse { target, state, .. } => {
             if target == ctx.local_peer_id.to_string() {
                 if apply_remote_queue_state(ui, ctx, state, "synced queue").await {
-                    if let Err(err) = resolve_active_vote_after_queue_apply(
-                        ctx,
-                        swarm,
-                        rendezvous_nodes,
-                        &targets,
-                        ui,
-                    )
-                    .await
+                    if let Err(err) =
+                        resolve_active_vote_after_queue_apply(ctx, swarm, &targets, ui).await
                     {
                         send_status(ui, format!("vote execution failed: {err:#}")).await;
                     }
@@ -3111,14 +3197,8 @@ async fn apply_wire_message(
         }
         WireMessage::QueueState { state, .. } => {
             if apply_remote_queue_state(ui, ctx, state, "queue updated").await {
-                if let Err(err) = resolve_active_vote_after_queue_apply(
-                    ctx,
-                    swarm,
-                    rendezvous_nodes,
-                    &targets,
-                    ui,
-                )
-                .await
+                if let Err(err) =
+                    resolve_active_vote_after_queue_apply(ctx, swarm, &targets, ui).await
                 {
                     send_status(ui, format!("vote execution failed: {err:#}")).await;
                 }
@@ -3126,6 +3206,16 @@ async fn apply_wire_message(
             true
         }
         WireMessage::VoteProposal { proposal, .. } => {
+            if proposal.eligible_peers.is_empty()
+                || proposal.eligible_peers.len() > directory::MAX_PEERS
+                || proposal
+                    .eligible_peers
+                    .iter()
+                    .any(|id| id.parse::<PeerId>().is_err())
+                || !proposal.eligible_peers.contains(&proposal.proposer)
+            {
+                return true;
+            }
             if proposal.proposer == ctx.local_peer_id.to_string() {
                 return true;
             }
@@ -3136,8 +3226,7 @@ async fn apply_wire_message(
                 Ok(()) => {
                     let known_version = ctx.music.queue_version;
                     let known_updated_at_micros = ctx.music.queue_updated_at;
-                    let room_peer_total =
-                        room_peer_count(swarm, rendezvous_nodes, ctx.local_peer_id);
+                    let room_peer_total = swarm.member_count();
                     send_vote_view(
                         ui,
                         ctx.music,
@@ -3191,7 +3280,7 @@ async fn apply_wire_message(
             approve,
             ..
         } => {
-            let room_peer_total = room_peer_count(swarm, rendezvous_nodes, ctx.local_peer_id);
+            let room_peer_total = swarm.member_count();
             let threshold = majority_threshold(room_peer_total);
             let mut changed_vote = false;
             if ctx.music.cast_vote_for(&vote_id, peer_id.clone(), approve) {
@@ -3431,12 +3520,11 @@ async fn apply_remote_queue_state(
 
 async fn resolve_active_vote_after_queue_apply(
     ctx: &mut HistoryContext<'_>,
-    swarm: &mut libp2p::Swarm<Behaviour>,
-    rendezvous_nodes: &HashSet<PeerId>,
+    swarm: &mut Network,
     targets: &PublishTargets<'_>,
     ui: &mpsc::Sender<UiEvent>,
 ) -> Result<()> {
-    let room_peer_total = room_peer_count(swarm, rendezvous_nodes, ctx.local_peer_id);
+    let room_peer_total = swarm.member_count();
     resolve_active_vote(
         ctx.music,
         ctx.audio_player,
@@ -3546,7 +3634,7 @@ async fn request_queue_for_vote_context(
     known_version: u64,
     known_updated_at_micros: i64,
     queue_request_times: &mut HashMap<String, Instant>,
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     _targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -3703,6 +3791,41 @@ fn should_request_queue(queue_request_times: &HashMap<String, Instant>, peer_id:
         .is_none_or(|last_request| last_request.elapsed() >= QUEUE_REQUEST_COOLDOWN)
 }
 
+fn history_digest(history: &[ChatRecord]) -> String {
+    let mut ids = history.iter().map(|r| r.id.as_str()).collect::<Vec<_>>();
+    ids.sort_unstable();
+    format!(
+        "{:x}",
+        md5::compute(serde_json::to_vec(&ids).expect("serializable message IDs"))
+    )
+}
+
+fn history_pages(
+    history: &[ChatRecord],
+    known: &std::collections::BTreeSet<String>,
+) -> Vec<Vec<ChatRecord>> {
+    // Leave space for the target, packet envelope and gossipsub signature.
+    const PAGE_BYTES: usize = 48 * 1024;
+    let mut pages = Vec::new();
+    let mut page = Vec::new();
+    let mut bytes = 0;
+    for record in history.iter().rev().filter(|r| !known.contains(&r.id)) {
+        let size = serde_json::to_vec(record)
+            .expect("serializable chat record")
+            .len()
+            + 1;
+        if !page.is_empty() && bytes + size > PAGE_BYTES {
+            pages.push(std::mem::take(&mut page));
+            bytes = 0;
+        }
+        page.push(record.clone());
+        bytes += size;
+    }
+    if !page.is_empty() {
+        pages.push(page);
+    }
+    pages
+}
 fn history_summary_is_newer(
     history: &[ChatRecord],
     remote_count: usize,
@@ -3730,7 +3853,7 @@ fn history_newest_at(history: &[ChatRecord]) -> Option<i64> {
 }
 
 fn publish_chat_wire(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     _targets: &PublishTargets<'_>,
     message: &WireMessage,
@@ -3748,24 +3871,15 @@ fn classify_room_publish_error(error: &gossipsub::PublishError) -> RoomPublishPl
 }
 
 fn publish_room_wire_with_outcome(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     message: &WireMessage,
 ) -> Result<RoomPublishOutcome> {
-    let data = serde_json::to_vec(message)?;
-    match swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
-        Ok(_) => Ok(RoomPublishOutcome::Published),
-        Err(err) => match classify_room_publish_error(&err) {
-            RoomPublishPlan::Published => Ok(RoomPublishOutcome::Published),
-            RoomPublishPlan::NoSubscribers => Ok(RoomPublishOutcome::NoSubscribers),
-            RoomPublishPlan::Congested => Ok(RoomPublishOutcome::Congested),
-            RoomPublishPlan::Failed => Err(anyhow!(err)),
-        },
-    }
+    swarm.publish_room(topic, message)
 }
 
 fn publish_room_wire(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     _targets: &PublishTargets<'_>,
     message: &WireMessage,
@@ -3774,7 +3888,7 @@ fn publish_room_wire(
 }
 
 fn publish_queue_state(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     music: &mut MusicState,
@@ -3785,7 +3899,7 @@ fn publish_queue_state(
 }
 
 fn publish_queue_snapshot(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -3809,7 +3923,7 @@ fn publish_queue_snapshot(
 }
 
 fn publish_music_snapshot(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -3828,7 +3942,7 @@ fn publish_music_snapshot(
 
 fn publish_music_snapshot_if_due(
     sync: &mut SyncAnnouncementState,
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -3929,7 +4043,7 @@ async fn handle_audio_player_events(
     failed_audio_sessions: &mut HashSet<String>,
     buffer: &mut BufferCoordinator,
     playback_health: &mut PlaybackHealth,
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -4481,7 +4595,7 @@ async fn maybe_pause_for_buffer_health_loss(
     failed_audio_sessions: &mut HashSet<String>,
     buffer: &mut BufferCoordinator,
     playback_health: &mut PlaybackHealth,
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     rendezvous_nodes: &HashSet<PeerId>,
@@ -4501,7 +4615,7 @@ async fn maybe_pause_for_buffer_health_loss(
         return Ok(());
     }
 
-    let expected = expected_playback_peers(swarm, rendezvous_nodes, local_peer_id);
+    let expected = playback_members(swarm, rendezvous_nodes);
     let position_ms = playback_position_ms(&current, current_timestamp_micros());
     match playback_health.evaluate(
         &current.session_id,
@@ -4556,7 +4670,7 @@ async fn handle_local_leader_audio_failure(
     music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
     failed_audio_sessions: &mut HashSet<String>,
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -4601,7 +4715,7 @@ async fn handle_buffer_prepare_failure(
     audio_player: &mut Option<player::AudioPlayer>,
     music: &mut MusicState,
     failed_audio_sessions: &mut HashSet<String>,
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -4700,7 +4814,7 @@ async fn resolve_buffer_operation(
     client: &reqwest::Client,
     local_media: &mut LocalMediaResolver,
     failed_audio_sessions: &mut HashSet<String>,
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -4981,7 +5095,7 @@ async fn commit_buffer_operation(
     audio_player: &mut Option<player::AudioPlayer>,
     client: &reqwest::Client,
     local_media: &mut LocalMediaResolver,
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -5188,7 +5302,7 @@ async fn start_next_if_idle(
     local_media: &mut LocalMediaResolver,
     failed_audio_sessions: &mut HashSet<String>,
     buffer: &mut BufferCoordinator,
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -5233,7 +5347,7 @@ async fn begin_buffer_operation(
     client: &reqwest::Client,
     local_media: &mut LocalMediaResolver,
     failed_audio_sessions: &mut HashSet<String>,
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -5255,7 +5369,7 @@ async fn begin_buffer_operation(
             .map(|state| state.session_id.clone())
             .unwrap_or_else(|| format!("{local_peer_id}:{now}:{}", item.track.track_id)),
     };
-    let expected_peers = expected_playback_peers(swarm, targets.rendezvous_nodes, local_peer_id);
+    let expected_peers = playback_members(swarm, targets.rendezvous_nodes);
     let state = PlaybackState {
         session_id,
         leader_peer_id: local_peer_id.to_string(),
@@ -5367,7 +5481,7 @@ async fn begin_buffer_operation(
 async fn stop_current_playback(
     music: &mut MusicState,
     audio_player: &mut Option<player::AudioPlayer>,
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -5403,7 +5517,7 @@ async fn propose_or_execute_vote(
     local_media: &mut LocalMediaResolver,
     failed_audio_sessions: &mut HashSet<String>,
     buffer_coordinator: &mut BufferCoordinator,
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -5418,6 +5532,11 @@ async fn propose_or_execute_vote(
 
     let now = current_timestamp_micros();
     let proposal = VoteProposal {
+        eligible_peers: swarm
+            .room
+            .as_deref()
+            .map(|r| swarm.directory.members(r))
+            .unwrap_or_default(),
         vote_id: new_vote_id(local_peer_id, now),
         proposer: local_peer_id.to_string(),
         action,
@@ -5483,7 +5602,7 @@ async fn cast_vote(
     local_media: &mut LocalMediaResolver,
     failed_audio_sessions: &mut HashSet<String>,
     buffer_coordinator: &mut BufferCoordinator,
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -5491,6 +5610,14 @@ async fn cast_vote(
     queue_request_times: &mut HashMap<String, Instant>,
     ui: &mpsc::Sender<UiEvent>,
 ) -> Result<()> {
+    if music.active_vote.as_ref().is_some_and(|v| {
+        !v.proposal
+            .eligible_peers
+            .contains(&local_peer_id.to_string())
+    }) {
+        send_status(ui, "you joined after this vote opened".into()).await;
+        return Ok(());
+    }
     let Some(vote_outcome) = music.cast_vote(local_peer_id.to_string(), approve) else {
         send_status(ui, "no active vote".to_string()).await;
         return Ok(());
@@ -5543,7 +5670,7 @@ async fn resolve_active_vote(
     local_media: &mut LocalMediaResolver,
     failed_audio_sessions: &mut HashSet<String>,
     buffer_coordinator: &mut BufferCoordinator,
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -5632,7 +5759,7 @@ async fn execute_vote_action(
     local_media: &mut LocalMediaResolver,
     failed_audio_sessions: &mut HashSet<String>,
     buffer_coordinator: &mut BufferCoordinator,
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -5809,7 +5936,7 @@ async fn execute_vote_action(
 }
 
 fn publish_vote_proposal(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     proposal: &VoteProposal,
@@ -5827,7 +5954,7 @@ fn publish_vote_proposal(
 }
 
 fn publish_vote_ballot(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     vote_id: &str,
@@ -5885,7 +6012,7 @@ fn short_peer(peer_id: &str) -> String {
 }
 
 fn publish_playback_state(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     state: &PlaybackState,
@@ -5907,7 +6034,7 @@ fn publish_playback_state(
 }
 
 fn publish_playback_state_if_local_source(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     state: &PlaybackState,
@@ -5920,7 +6047,7 @@ fn publish_playback_state_if_local_source(
 }
 
 fn publish_playback_ready(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     session_id: &str,
@@ -5939,7 +6066,7 @@ fn publish_playback_ready(
 }
 
 fn publish_playback_cancel(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     session_id: &str,
@@ -5960,7 +6087,7 @@ fn publish_playback_cancel(
 }
 
 fn publish_playback_buffer_prepare(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     _targets: &PublishTargets<'_>,
     operation: &BufferOperation,
@@ -5988,7 +6115,7 @@ fn publish_playback_buffer_prepare(
 }
 
 fn publish_playback_buffer_status(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     _targets: &PublishTargets<'_>,
     operation_id: &str,
@@ -6031,7 +6158,7 @@ fn describe_buffer_publish_result(
 
 fn publish_local_buffer_health(
     playback_health: &mut PlaybackHealth,
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -6063,7 +6190,7 @@ fn publish_local_buffer_health(
 }
 
 fn publish_playback_buffer_health(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     session_id: &str,
@@ -6086,7 +6213,7 @@ fn publish_playback_buffer_health(
 }
 
 fn publish_playback_buffer_cancel(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     operation_id: &str,
@@ -6110,7 +6237,7 @@ fn publish_playback_buffer_cancel(
 
 async fn abandon_local_buffer_operation(
     buffer: &mut BufferCoordinator,
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -6138,7 +6265,7 @@ async fn abandon_local_buffer_operation(
 
 fn cancel_local_pending_playback(
     music: &mut MusicState,
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -6158,7 +6285,7 @@ fn cancel_local_pending_playback(
 
 async fn maybe_start_pending_playback(
     music: &mut MusicState,
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    swarm: &mut Network,
     topic: &gossipsub::IdentTopic,
     targets: &PublishTargets<'_>,
     local_peer_id: PeerId,
@@ -6320,14 +6447,14 @@ fn finished_playback_role(
     }
 }
 
-fn expected_playback_peers(
-    swarm: &libp2p::Swarm<Behaviour>,
-    rendezvous_nodes: &HashSet<PeerId>,
-    local_peer_id: PeerId,
-) -> HashSet<String> {
-    room_peer_ids(swarm, rendezvous_nodes, local_peer_id)
+fn playback_members(swarm: &Network, infrastructure: &HashSet<PeerId>) -> HashSet<String> {
+    swarm
+        .members()
         .into_iter()
-        .map(|peer_id| peer_id.to_string())
+        .filter(|id| {
+            id.parse::<PeerId>()
+                .is_ok_and(|p| !infrastructure.contains(&p))
+        })
         .collect()
 }
 
@@ -6738,8 +6865,6 @@ mod tests {
         listen: Vec<Multiaddr>,
         peer: Vec<Multiaddr>,
     ) -> TestBackend {
-        let (commands, command_rx) = mpsc::channel(32);
-        let (ui_tx, events) = mpsc::channel(128);
         let config = BackendConfig {
             name: name.to_string(),
             topic: topic.to_string(),
@@ -6748,6 +6873,11 @@ mod tests {
             relay: Vec::new(),
             no_mdns: true,
         };
+        test_network(config)
+    }
+    fn test_network(config: BackendConfig) -> TestBackend {
+        let (commands, command_rx) = mpsc::channel(32);
+        let (ui_tx, events) = mpsc::channel(128);
         let task = tokio::spawn(run_network(config, command_rx, ui_tx));
         TestBackend {
             commands,
@@ -6926,19 +7056,350 @@ mod tests {
         assert!(normalize_direct_peer_address(peer, relay_addr).is_none());
     }
 
-    #[test]
-    fn room_peer_set_excludes_rendezvous_nodes_and_includes_local() {
-        let local = peer_id();
-        let room_peer = peer_id();
-        let rendezvous = peer_id();
-        let rendezvous_nodes = HashSet::from([rendezvous]);
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn circuit_handoff_and_recovery_across_a_peer_bridge() {
+        let mut relay = SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                noise::Config::new,
+                yamux::Config::default,
+            )
+            .unwrap()
+            .with_behaviour(|key| {
+                relay::Behaviour::new(key.public().to_peer_id(), Default::default())
+            })
+            .unwrap()
+            .build();
+        relay
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let endpoint = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = relay.select_next_some().await {
+                relay.add_external_address(address.clone());
+                break address.with(libp2p::multiaddr::Protocol::P2p(*relay.local_peer_id()));
+            }
+        };
+        let server = tokio::spawn(async move {
+            loop {
+                let _ = relay.select_next_some().await;
+            }
+        });
+        // Only the relay is a listener. Both endpoints can dial out.
+        let config = |name: &str, relays, peer| BackendConfig {
+            name: name.into(),
+            topic: "circuit-room".into(),
+            listen: vec!["/memory/1".parse().unwrap()],
+            peer,
+            relay: relays,
+            no_mdns: true,
+        };
+        let mut west = test_network(config("west", vec![endpoint.clone()], vec![]));
+        let id = wait_for_local_peer(&mut west).await;
+        west.recv_matching(Duration::from_secs(12),|e|matches!(e,UiEvent::Status(s) if s.starts_with("listening on") && s.contains("p2p-circuit")).then_some(())).await;
+        let target = endpoint
+            .with(libp2p::multiaddr::Protocol::P2pCircuit)
+            .with(libp2p::multiaddr::Protocol::P2p(id));
+        let mut east = test_network(config("east", vec![], vec![target]));
+        wait_for_peer_count(&mut west, 1).await;
+        west.commands
+            .send(NetworkCommand::Chat("over circuit".into()))
+            .await
+            .unwrap();
+        wait_for_history_text(&mut east, "over circuit").await;
+        east.recv_matching(Duration::from_secs(12), |e| {
+            matches!(e,UiEvent::NetworkMetrics{circuit_payload_bytes,..} if circuit_payload_bytes>0)
+                .then_some(())
+        })
+        .await;
+        let (helper, _, helper_addr) = listen_test_peer("helper", "another room", vec![]).await;
+        west.commands
+            .send(NetworkCommand::DialTestPeer(helper_addr.clone()))
+            .await
+            .unwrap();
+        east.commands
+            .send(NetworkCommand::DialTestPeer(helper_addr))
+            .await
+            .unwrap();
+        tokio::spawn(async move { while west.events.recv().await.is_some() {} });
+        let mut helper_events = helper.events;
+        tokio::spawn(async move { while helper_events.recv().await.is_some() {} });
+        let west_disconnected = format!("disconnected {id}");
+        east.recv_matching(Duration::from_secs(110), |e| {
+            matches!(e,UiEvent::Status(s) if s==west_disconnected).then_some(())
+        })
+        .await;
+        west.commands
+            .send(NetworkCommand::Chat("over repaired peer path".into()))
+            .await
+            .unwrap();
+        wait_for_history_text(&mut east, "over repaired peer path").await;
+        helper.task.abort();
+        // This seed is the only available transport once the helper exits.
+        east.recv_matching(Duration::from_secs(45),|e|matches!(e,UiEvent::Status(s) if s.contains(" via relay") && s.contains(&id.to_string())).then_some(())).await;
+        west.commands
+            .send(NetworkCommand::Chat("back on circuit".into()))
+            .await
+            .unwrap();
+        wait_for_history_text(&mut east, "back on circuit").await;
+        west.task.abort();
+        east.abort();
+        server.abort();
+    }
 
-        let peers = room_peer_ids_from_connected(local, [room_peer, rendezvous], &rendezvous_nodes);
+    async fn listen_test_peer(
+        name: &str,
+        room: &str,
+        seed: Vec<Multiaddr>,
+    ) -> (TestBackend, PeerId, Multiaddr) {
+        let mut backend = spawn_test_backend(
+            name,
+            room,
+            vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+            seed,
+        );
+        let id = wait_for_local_peer(&mut backend).await;
+        let address = wait_for_tcp_listen_addr(&mut backend)
+            .await
+            .with(libp2p::multiaddr::Protocol::P2p(id));
+        (backend, id, address)
+    }
 
-        assert!(peers.contains(&local));
-        assert!(peers.contains(&room_peer));
-        assert!(!peers.contains(&rendezvous));
-        assert_eq!(majority_threshold(peers.len()), 2);
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn directory_and_room_transit_across_a_foreign_bridge() {
+        let (mut west, _, wa) = listen_test_peer("west", "west-room", vec![]).await;
+        let (mut helper, _, ha) = listen_test_peer("helper", "helper-room", vec![wa]).await;
+        let (mut east, id, _) = listen_test_peer("east", "", vec![ha]).await;
+        east.recv_matching(Duration::from_secs(12), |e| match e {
+            UiEvent::RoomDirectory {
+                active: None,
+                rooms,
+            } if rooms.len() == 2 => Some(()),
+            _ => None,
+        })
+        .await;
+        east.commands
+            .send(NetworkCommand::JoinRoom("west-room".into()))
+            .await
+            .unwrap();
+        wait_for_peer_count(&mut west, 1).await;
+        west.commands
+            .send(NetworkCommand::Chat("across the bridge".into()))
+            .await
+            .unwrap();
+        wait_for_history_text(&mut east, "across the bridge").await;
+        east.commands.send(NetworkCommand::LeaveRoom).await.unwrap();
+        east.recv_matching(Duration::from_secs(5), |e| {
+            matches!(e, UiEvent::RoomDirectory { active: None, .. }).then_some(())
+        })
+        .await;
+        east.commands
+            .send(NetworkCommand::JoinRoom("helper-room".into()))
+            .await
+            .unwrap();
+        east.commands
+            .send(NetworkCommand::Chat("same identity".into()))
+            .await
+            .unwrap();
+        let author = helper
+            .recv_matching(Duration::from_secs(15), |e| match e {
+                UiEvent::History(records) => {
+                    assert!(records.iter().all(|r| r.text != "across the bridge"));
+                    records
+                        .into_iter()
+                        .find(|r| r.text == "same identity")
+                        .map(|r| r.peer_id)
+                }
+                _ => None,
+            })
+            .await;
+        assert_eq!(author, id.to_string());
+        west.abort();
+        east.abort();
+        helper.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_crossings_share_payload_and_survive_bridge_loss() {
+        let (mut west, west_id, wa) = listen_test_peer("west", "music", vec![]).await;
+        let (mut first, aid, aa) = listen_test_peer("first", "other", vec![wa.clone()]).await;
+        let (mut second, bid, ba) = listen_test_peer("second", "other", vec![wa]).await;
+        let (mut east, east_id, _) = listen_test_peer("east", "music", vec![aa]).await;
+        // The public directory excludes loopback addresses. Supply the missing
+        // candidate locally and leave the decision to dial to bridge detection.
+        wait_for_peer_count(&mut east, 1).await;
+        east.commands
+            .send(NetworkCommand::LearnTestCandidate(ba))
+            .await
+            .unwrap();
+        // Drain inactive UI consumers as a desktop would.
+        tokio::spawn(async move { while first.events.recv().await.is_some() {} });
+        tokio::spawn(async move { while second.events.recv().await.is_some() {} });
+        let a = aid.to_string();
+        let b = bid.to_string();
+        west.recv_matching(Duration::from_secs(100), |e| match e {
+            UiEvent::NetworkMetrics {
+                worst_receiver_p95_ms: [Some(_), Some(_)],
+                confirmation_neighbors,
+                ..
+            } if confirmation_neighbors[0]
+                .get(&east_id.to_string())
+                .zip(confirmation_neighbors[1].get(&east_id.to_string()))
+                .is_some_and(|(first, second)| first != second) =>
+            {
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+        let (crossing_tx, mut west_crossings) = tokio::sync::watch::channel([0u64; 2]);
+        let (batch_tx, batch_received) = tokio::sync::oneshot::channel();
+        let gateways = [a.clone(), b.clone()];
+        tokio::spawn(async move {
+            let mut batch = Some(batch_tx);
+            while let Some(event) = west.events.recv().await {
+                match event {
+                    UiEvent::NetworkMetrics { received_bytes, .. } => {
+                        crossing_tx.send_replace(std::array::from_fn(|i| {
+                            received_bytes.get(&gateways[i]).into_iter().flatten().sum()
+                        }));
+                    }
+                    UiEvent::History(records)
+                        if batch.is_some()
+                            && records
+                                .iter()
+                                .filter(|r| r.text.starts_with("congested-"))
+                                .count()
+                                == 32 =>
+                    {
+                        batch.take().unwrap().send(()).ok();
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let before = east
+            .recv_matching(Duration::from_secs(110), |e| match e {
+                UiEvent::NetworkMetrics {
+                    received_bytes,
+                    confirmation_neighbors,
+                    ..
+                } if confirmation_neighbors[0]
+                    .get(&west_id.to_string())
+                    .zip(confirmation_neighbors[1].get(&west_id.to_string()))
+                    .is_some_and(|(first, second)| first != second) =>
+                {
+                    Some(received_bytes)
+                }
+                _ => None,
+            })
+            .await;
+        for i in 0..80 {
+            west.commands
+                .send(NetworkCommand::Chat(format!(
+                    "burst-{i}-{}",
+                    "x".repeat(900)
+                )))
+                .await
+                .unwrap();
+            time::sleep(Duration::from_millis(20)).await;
+        }
+        let (bytes, p95, misses_before) = east
+            .recv_matching(Duration::from_secs(25), |e| match e {
+                UiEvent::NetworkMetrics {
+                    received_bytes,
+                    circuit_payload_bytes,
+                    worst_receiver_p95_ms,
+                    missed_probes,
+                    ..
+                } => {
+                    assert_eq!(circuit_payload_bytes, 0);
+                    let delta = |p: &String| {
+                        received_bytes
+                            .get(p)
+                            .copied()
+                            .unwrap_or_default()
+                            .iter()
+                            .sum::<u64>()
+                            - before
+                                .get(p)
+                                .copied()
+                                .unwrap_or_default()
+                                .iter()
+                                .sum::<u64>()
+                    };
+                    let x = [delta(&a), delta(&b)];
+                    (x[0] + x[1] > 75_000 && worst_receiver_p95_ms.iter().all(Option::is_some))
+                        .then_some((x, worst_receiver_p95_ms, missed_probes))
+                }
+                _ => None,
+            })
+            .await;
+        let share = bytes[0] as f64 / (bytes[0] + bytes[1]) as f64;
+        eprintln!("received room payload per crossing {bytes:?} bytes; receiver p95 {p95:?} ms");
+        assert!((0.35..=0.65).contains(&share), "crossing share {share}");
+        first
+            .commands
+            .send(NetworkCommand::LimitTestTransit(0))
+            .await
+            .unwrap();
+        east.recv_matching(Duration::from_secs(50), |e| match e {
+            UiEvent::NetworkMetrics {
+                worst_receiver_p95_ms,
+                confirmation_neighbors,
+                missed_probes,
+                ..
+            } => {
+                let healthy = worst_receiver_p95_ms.iter().position(Option::is_some)?;
+                (missed_probes >= misses_before + 2
+                    && worst_receiver_p95_ms[1 - healthy].is_none()
+                    && confirmation_neighbors[healthy].get(&west_id.to_string()) == Some(&b))
+                .then_some(())
+            }
+            _ => None,
+        })
+        .await;
+        // Start the measurement at a fresh receiver snapshot after degradation.
+        west_crossings.borrow_and_update();
+        time::timeout(Duration::from_secs(10), west_crossings.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let baseline = *west_crossings.borrow_and_update();
+        for i in 0..32 {
+            east.commands
+                .send(NetworkCommand::Chat(format!(
+                    "congested-{i}-{}",
+                    "x".repeat(700)
+                )))
+                .await
+                .unwrap();
+        }
+        time::timeout(Duration::from_secs(25), batch_received)
+            .await
+            .expect("west should receive all 32 publications after congestion")
+            .unwrap();
+        let observed = time::timeout(
+            Duration::from_secs(10),
+            west_crossings.wait_for(|bytes| bytes[1] - baseline[1] > 20_000),
+        )
+        .await
+        .expect("healthy gateway should carry the batch")
+        .unwrap();
+        assert_eq!(
+            observed[0], baseline[0],
+            "exhausted gateway carried room payload"
+        );
+        drop(observed);
+        first.task.abort();
+        west.commands
+            .send(NetworkCommand::Chat("after gateway loss".into()))
+            .await
+            .unwrap();
+        wait_for_history_text(&mut east, "after gateway loss").await;
+        east.abort();
+        west.task.abort();
+        second.task.abort();
     }
 
     #[tokio::test]
@@ -7335,6 +7796,23 @@ mod tests {
     }
 
     #[test]
+    fn history_repair_pages_include_only_missing_records_and_fit_gossip_frames() {
+        let mut history = Vec::new();
+        for i in 0..140 {
+            let mut r = record(&format!("id-{i}"), i);
+            r.text = "x".repeat(1000);
+            history.push(r);
+        }
+        let known = history.iter().take(15).map(|r| r.id.clone()).collect();
+        let pages = history_pages(&history, &known);
+        assert!(pages.len() > 1);
+        assert_eq!(pages.iter().map(Vec::len).sum::<usize>(), 125);
+        for page in pages {
+            assert!(page.iter().all(|r| !known.contains(&r.id)));
+            assert!(serde_json::to_vec(&page).unwrap().len() < 50 * 1024);
+        }
+    }
+    #[test]
     fn history_summary_newer_uses_count_or_newest_timestamp() {
         let mut history = vec![
             record("newer", 1_700_000_000_500_000),
@@ -7371,6 +7849,7 @@ mod tests {
     fn queue_vote_sync_is_needed_only_for_future_queue_versions() {
         let proposer = peer_id();
         let future = VoteProposal {
+            eligible_peers: Default::default(),
             vote_id: "vote".to_string(),
             proposer: proposer.to_string(),
             action: VoteAction::Move {
@@ -7401,6 +7880,7 @@ mod tests {
     fn wire_source_validation_accepts_matching_actor_messages() {
         let source = peer_id();
         let proposal = VoteProposal {
+            eligible_peers: Default::default(),
             vote_id: "vote".to_string(),
             proposer: source.to_string(),
             action: VoteAction::Skip,
@@ -7507,6 +7987,7 @@ mod tests {
         let source = peer_id();
         let other = peer_id();
         let proposal = VoteProposal {
+            eligible_peers: Default::default(),
             vote_id: "vote".to_string(),
             proposer: other.to_string(),
             action: VoteAction::Skip,

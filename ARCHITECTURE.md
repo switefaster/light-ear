@@ -30,7 +30,8 @@ The desktop path is the primary product path. The legacy terminal UI has been re
   - Translates Tauri commands into `NetworkCommand`.
   - Emits backend `FrontendEvent` values to the webview as `backend-event`.
 - Desktop UI: `desktop/src/main.jsx`
-  - Renders setup, chat, player, queue drawer, vote modal, peer overview, and status log.
+  - Renders setup, chat, player, queue drawer, vote modal, network topology, and status log.
+  - The room browser and in-room peer indicator open the same topology graph. Its desktop event contains public room membership and reciprocal peer links. The client adds locally observed sockets, including infrastructure connections, and exposes their diagnostics when a node is selected.
   - Does not own protocol truth; it reflects backend events and invokes backend commands.
 - Relay/rendezvous server: `src/bin/light-ear-relay.rs`
   - Provides circuit relay and rendezvous server behaviours.
@@ -87,7 +88,7 @@ The event loop should stay responsive. Bilibili Range fetch and Symphonia decode
 
 ## Wire Messages And Source Validation
 
-Room protocol messages are `WireMessage` values serialized as JSON. They flow over the room gossipsub topic only.
+Room protocol messages are JSON `WireMessage` values inside a room-scoped packet. Both v2 forwarding trees carry the same public room topic over separate gossipsub protocol IDs. The signed publisher and packet ID identify a publication across retries.
 
 `HistoryRequest`, `HistoryResponse`, `QueueRequest`, and `QueueResponse` keep their `target` fields, but they are still broadcast over gossipsub and ignored by non-target peers. If gossipsub reports `NoPeersSubscribedToTopic`, the backend reports a status error and does not attempt direct request-response fallback.
 
@@ -96,6 +97,8 @@ low-noise status where the caller has UI context, but it must not unwind
 `run_network` or abort playback/queue/vote state machines. Authoritative state
 can converge through the normal periodic state and summary republish paths
 after gossipsub queues recover.
+
+Forwarding-tree changes schedule a history and queue sync burst. History summaries include a digest of retained IDs. The response sends missing records in pages targeting 48 KiB of records per gossipsub publication.
 
 Event-triggered sync is coalesced. Connection, subscription, and mDNS discovery
 events can arrive in bursts for the same peer through multiple addresses, so
@@ -124,7 +127,14 @@ Peers can meet in three ways:
 - mDNS on LAN, unless disabled;
 - relay/rendezvous discovery.
 
-The relay address is also treated as a rendezvous node. Clients register under the current room topic, discover other registrations, dial discovered peers, then try to promote relay-only routes to direct routes when usable direct addresses appear.
+Clients bootstrap through the shared `light-ear.network.v2` rendezvous namespace. A desktop can browse before joining. Changing rooms keeps the identity and swarm and resets local chat, queue, audio and voting state. Clients require a coordinated upgrade. The relay can continue providing standard libp2p circuit and rendezvous services.
+
+- `src/directory.rs` signs per-origin membership and reachability records. Directory peers compare sequence summaries over an authenticated request-response protocol. Pages contain up to eight records. The directory supports 512 participants. Records refresh at 30 seconds and expire 90 seconds after issuance, with five seconds of future clock tolerance. Only public IP candidates are shared globally.
+- `src/topology.rs` builds the graph from reciprocal link reports. A depth-first search identifies single-peer cuts. The primary forwarding tree uses path costs. The alternate penalizes reusing central edges of the primary. Both normally prefer an all-direct path. Each room needs only the branches joining its members. Ordinary peers may take up to eight foreign-room subscriptions. Renewed directory records maintain those subscriptions.
+- `src/overlay.rs` drives repair dials, directory exchange, tree subscriptions and delivery probes. Each protocol instance peers explicitly with its assigned neighbors. Mesh expansion and flood publishing are disabled. Foreign-room forwarding admits publications against a shared 256 KiB/s payload budget divided among helper rooms and charged for potential outgoing copies. Only a room member dispatches room messages into application state.
+- Per-tree probes measure round-trip delivery on the sender’s clock. A sender stripes by bytes after both trees have confirmed coverage. Its slowest receiver influences the traffic split. The peer overview counts current-room payload received from each neighbor on each tree and resets those counts on a room change. Circuit payload and directory bytes are counted across the lifetime of the swarm. The p95 value on each tree is the worst confirmed receiver in the current room. The counters exclude transport framing and music fetched from the media provider.
+- A proposal freezes its eligible room member IDs. Buffer preparation snapshots live room members. A temporary loss of a neighboring socket can leave the same member reachable over another branch.
+
 
 Important current timings:
 
@@ -147,7 +157,6 @@ On graceful shutdown, clients attempt to unregister from connected rendezvous no
 - `DialDirect`
 - `CloseRelayConnections`
 - `CloseEarlyDirectConnection`
-- `TrackGossipPeer` / `UntrackGossipPeer`
 - `ResetBackoff`
 - low-noise status strings
 
@@ -158,7 +167,7 @@ Current rules:
 - Relay-only peers wait for chat subscription readiness or gossipsub warmup timeout before direct promotion.
 - Direct dial failure and DCUtR failure update the same backoff.
 - Direct failure must not close relay routes.
-- A newly established direct route does not immediately close relay. Relay closes only after the handoff grace, only while a direct route still exists and chat subscription is ready.
+- A newly established direct route does not immediately close relay. Circuit retirement requires a verified alternative. The overlay observes the underlying connection for inbound gossipsub deliveries and probes for a replacement path.
 - If direct drops during handoff grace, the relay route remains the reliability path.
 - Early direct connections before warmup readiness may be closed directly, but this should close only that direct connection, not the relay route.
 
