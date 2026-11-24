@@ -52,6 +52,9 @@ guardrail:
 
 For adaptive topology changes, run the full library suite with loopback TCP access. The four-peer crossing test measures payload distribution, the foreign-room bridge test checks isolation and the circuit fixture exercises the relay.
 
+The loopback networking fixtures run peers without opening a system audio device.
+Keep their real libp2p transports and run the full suite with both decoder configurations.
+
 ## Current collaboration rules
 
 - Packaged desktop clients check for an update before starting the swarm. A confirmed

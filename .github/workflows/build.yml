@@ -61,17 +61,10 @@ jobs:
         run: npm run build
 
       - name: Run Rust library tests
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          cargo test --lib --locked
-          cargo test --lib --locked --features fdk-aac-decoder
+        run: cargo test --lib --locked
 
-      - name: Run Windows library tests
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          ./.github/scripts/windows-test-runner.ps1
+      - name: Run Rust library tests with FDK AAC
+        run: cargo test --lib --locked --features fdk-aac-decoder
 
       - name: Check Rust crates
         run: |
