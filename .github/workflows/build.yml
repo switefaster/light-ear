@@ -61,13 +61,17 @@ jobs:
         run: npm run build
 
       - name: Run Rust library tests
+        if: runner.os != 'Windows'
         shell: bash
         run: |
-          if [[ "$RUNNER_OS" == Windows ]]; then
-            export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER="pwsh -NoProfile -File .github/scripts/windows-test-runner.ps1"
-          fi
           cargo test --lib --locked
           cargo test --lib --locked --features fdk-aac-decoder
+
+      - name: Run Windows library tests
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./.github/scripts/windows-test-runner.ps1
 
       - name: Check Rust crates
         run: |
