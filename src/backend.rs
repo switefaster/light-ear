@@ -267,8 +267,17 @@ impl ZeroPeerRecovery {
 
 pub async fn run_network(
     config: BackendConfig,
+    commands: mpsc::Receiver<NetworkCommand>,
+    ui: mpsc::Sender<UiEvent>,
+) -> Result<()> {
+    run_network_with_output(config, commands, ui, Some(player::AudioPlayer::new)).await
+}
+
+async fn run_network_with_output(
+    config: BackendConfig,
     mut commands: mpsc::Receiver<NetworkCommand>,
     ui: mpsc::Sender<UiEvent>,
+    open_output: Option<fn() -> Result<player::AudioPlayer>>,
 ) -> Result<()> {
     let initial_room = (!config.topic.is_empty()).then(|| config.topic.clone());
     if initial_room
@@ -297,13 +306,21 @@ pub async fn run_network(
     let mut failed_audio_sessions = HashSet::new();
     let mut buffer_coordinator = BufferCoordinator::new();
     let mut playback_health = PlaybackHealth::new();
-    let mut audio_player = match player::AudioPlayer::new() {
-        Ok(player) => Some(player),
+    #[cfg(test)]
+    if std::env::var_os("LIGHT_EAR_CI_AUDIO_CONTROL").is_some() {
+        eprintln!("{}: opening system audio output", config.name);
+    }
+    let mut audio_player = match open_output.map(|open| open()).transpose() {
+        Ok(player) => player,
         Err(err) => {
             send_status(&ui, format!("audio output unavailable: {err:#}")).await;
             None
         }
     };
+    #[cfg(test)]
+    if std::env::var_os("LIGHT_EAR_CI_AUDIO_CONTROL").is_some() {
+        eprintln!("{}: system audio initialization returned", config.name);
+    }
     let mut next_audio_output_retry = Instant::now() + AUDIO_OUTPUT_RETRY_INTERVAL;
     let mut history_sync = time::interval(HISTORY_SYNC_INTERVAL);
     history_sync.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -6878,7 +6895,16 @@ mod tests {
     fn test_network(config: BackendConfig) -> TestBackend {
         let (commands, command_rx) = mpsc::channel(32);
         let (ui_tx, events) = mpsc::channel(128);
-        let task = tokio::spawn(run_network(config, command_rx, ui_tx));
+        // Network-only peers have no playback device. They still use the same
+        // swarm, timers, subscriptions and message handlers as the desktop.
+        let open_output: Option<fn() -> Result<player::AudioPlayer>> =
+            std::env::var_os("LIGHT_EAR_CI_AUDIO_CONTROL").map(|_| player::AudioPlayer::new as _);
+        let task = tokio::spawn(run_network_with_output(
+            config,
+            command_rx,
+            ui_tx,
+            open_output,
+        ));
         TestBackend {
             commands,
             events,

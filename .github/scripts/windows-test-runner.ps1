@@ -14,6 +14,19 @@ foreach ($mode in 'default', 'fdk-aac-decoder') {
         $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.executable -and $_.target.name -eq 'light_ear'
     }).executable
     if (!$test) { throw "Could not locate the $mode library test executable" }
+    if ($mode -eq 'default') {
+        $env:LIGHT_EAR_CI_AUDIO_CONTROL = '1'
+        $start = Get-Date
+        $control = & $test --test-threads=1 --nocapture backend::tests::circuit_handoff_and_recovery_across_a_peer_bridge backend::tests::directory_and_room_transit_across_a_foreign_bridge 2>&1
+        $controlCode = $LASTEXITCODE
+        Remove-Item Env:LIGHT_EAR_CI_AUDIO_CONTROL
+        $tail = ($control | Select-Object -Last 24) -join "`n"
+        Write-Host $tail
+        $fault = Get-WinEvent -FilterHashtable @{LogName='Application';Id=1000;StartTime=$start} -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -like '*light_ear*' } | Select-Object -First 1 -ExpandProperty Message
+        $detail = "With system audio: $controlCode`n$tail`n$fault".Replace('%','%25').Replace("`r",'%0D').Replace("`n",'%0A')
+        Write-Host "::notice title=System audio control::$detail"
+    }
     & $test
     $code = $LASTEXITCODE
     if ($code -eq 0) { continue }
