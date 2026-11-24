@@ -1,9 +1,7 @@
 use std::{
     collections::VecDeque,
-    fs::{self, OpenOptions},
-    io::{Cursor, Read, Seek, SeekFrom, Write},
+    io::{Cursor, Read, Seek, SeekFrom},
     num::{NonZeroU16, NonZeroU32},
-    path::PathBuf,
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -120,6 +118,8 @@ struct StreamingBytesState {
     ranges: media_cache::RangeIndex,
     pinned_ranges: Vec<media_cache::ByteRange>,
     requested_offsets: VecDeque<u64>,
+    decoder_offset: Option<u64>,
+    prepared_once: bool,
 }
 
 #[derive(Clone)]
@@ -145,6 +145,7 @@ struct StreamingPcmState {
 }
 
 struct StreamingSession {
+    decoder_operation: Option<String>,
     session_id: String,
     track_id: String,
     track: PlaybackTrack,
@@ -250,6 +251,10 @@ impl AudioPlayer {
             .or(self.track_id.as_deref())
     }
 
+    pub(crate) fn decoder_operation(&self) -> Option<&str> {
+        self.streaming.as_ref()?.decoder_operation.as_deref()
+    }
+
     pub fn current_session_id(&self) -> Option<&str> {
         self.streaming
             .as_ref()
@@ -351,6 +356,19 @@ impl AudioPlayer {
         track: PlaybackTrack,
         position_ms: u64,
     ) -> Result<()> {
+        let media = std::future::ready(Ok(track.clone()));
+        self.prepare_resolved_stream(client, operation_id, session_id, track, position_ms, media)
+    }
+
+    pub(crate) fn prepare_resolved_stream(
+        &mut self,
+        client: &reqwest::Client,
+        operation_id: Option<String>,
+        session_id: String,
+        track: PlaybackTrack,
+        position_ms: u64,
+        media: impl std::future::Future<Output = Result<PlaybackTrack>> + Send + 'static,
+    ) -> Result<()> {
         let position_ms = position_ms.min(track.duration_ms);
         if let Some(session) = self.streaming.as_mut().filter(|session| {
             session.session_id == session_id && session.track_id == track.track_id
@@ -386,7 +404,10 @@ impl AudioPlayer {
                 return Ok(());
             }
 
-            if position_ms < session.pcm.base_position_ms() || position_ms > buffered_until_ms {
+            if session.decoder_operation != operation_id
+                || position_ms < session.pcm.base_position_ms()
+                || position_ms > buffered_until_ms
+            {
                 session.restart_decoder(
                     operation_id.clone(),
                     session_id.clone(),
@@ -432,6 +453,7 @@ impl AudioPlayer {
         let decoder = DecodeToken::new();
         let position = Arc::new(AtomicU64::new(self.position_ms));
         let session = StreamingSession {
+            decoder_operation: operation_id.clone(),
             session_id: session_id.clone(),
             track_id: track.track_id.clone(),
             track: track.clone(),
@@ -453,18 +475,25 @@ impl AudioPlayer {
         let download_position_ms = position_ms;
         let download_position = Arc::clone(&position);
         tokio::spawn(async move {
-            if let Err(err) = download_streaming_bytes(
-                download_client,
-                download_track.clone(),
-                download_position_ms,
-                download_position,
-                download_bytes,
-                event_tx.clone(),
-                download_operation_id.clone(),
-                download_session_id.clone(),
-            )
-            .await
-            {
+            let result = async {
+                let playable = media.await?;
+                if download_bytes.is_canceled() {
+                    return Ok(());
+                }
+                download_streaming_bytes(
+                    download_client,
+                    playable,
+                    download_position_ms,
+                    download_position,
+                    download_bytes,
+                    event_tx.clone(),
+                    download_operation_id.clone(),
+                    download_session_id.clone(),
+                )
+                .await
+            }
+            .await;
+            if let Err(err) = result {
                 if download_fail_bytes.is_canceled() {
                     return;
                 }
@@ -990,6 +1019,7 @@ fn stream_byte_range_for_window(
     let end_position_ms = position_ms.saturating_add(window_ms).min(duration_ms);
     let end = stream_byte_offset_for_position(end_position_ms, duration_ms, total_bytes)
         .saturating_add(256 * 1024)
+        .min(start.saturating_add(4 * media_cache::STREAM_CHUNK_BYTES - 1))
         .min(total_bytes.saturating_sub(1));
     media_cache::ByteRange {
         start,
@@ -1555,6 +1585,8 @@ impl SharedBytes {
                     ranges: media_cache::RangeIndex::default(),
                     pinned_ranges: Vec::new(),
                     requested_offsets: VecDeque::new(),
+                    decoder_offset: None,
+                    prepared_once: false,
                 }),
                 Condvar::new(),
             )),
@@ -1609,8 +1641,10 @@ impl SharedBytes {
             end_inclusive: retain_end.max(retain_start),
         };
         let pinned_ranges = state.pinned_ranges.clone();
+        let decoder_offset = state.decoder_offset;
         state.chunks.retain(|chunk| {
-            ranges_overlap(chunk.range, window)
+            decoder_offset.is_some_and(|offset| chunk.range.contains(offset))
+                || ranges_overlap(chunk.range, window)
                 || pinned_ranges
                     .iter()
                     .any(|pinned| ranges_overlap(chunk.range, *pinned))
@@ -1640,6 +1674,22 @@ impl SharedBytes {
     fn is_canceled(&self) -> bool {
         let (lock, _) = &*self.inner;
         lock.lock().expect("streaming bytes lock poisoned").canceled
+    }
+
+    fn prepared_once(&self) -> bool {
+        self.inner
+            .0
+            .lock()
+            .expect("streaming bytes lock poisoned")
+            .prepared_once
+    }
+
+    fn mark_prepared(&self) {
+        self.inner
+            .0
+            .lock()
+            .expect("streaming bytes lock poisoned")
+            .prepared_once = true;
     }
 
     fn total_bytes(&self) -> Option<u64> {
@@ -1746,6 +1796,7 @@ impl SharedBytes {
 
         let (lock, condvar) = &*self.inner;
         let mut state = lock.lock().expect("streaming bytes lock poisoned");
+        state.decoder_offset = Some(offset);
         loop {
             if state.canceled || decoder.is_canceled() {
                 return Err(std::io::Error::new(
@@ -2002,6 +2053,7 @@ impl StreamingSession {
         self.duration_ms = track.duration_ms;
         self.pcm = pcm.clone();
         self.decoder = decoder.clone();
+        self.decoder_operation = operation_id.clone();
         self.position_ms.store(position_ms, Ordering::Relaxed);
         if let Some(total) = self.bytes.total_bytes() {
             let seek_window = media_cache::range_for_window(position_ms, track.duration_ms, total);
@@ -2143,11 +2195,6 @@ async fn download_streaming_bytes(
     operation_id: Option<String>,
     session_id: String,
 ) -> Result<()> {
-    let root = media_cache::cache_root();
-    fs::create_dir_all(root.join(media_cache::cache_key(&track)))
-        .context("failed to create media cache directory")?;
-    let media_path = media_cache::media_file_path(&root, &track);
-
     let mut request_pacer = StreamRequestPacer::new();
     let probe = probe_stream_range_with_retry(
         &client,
@@ -2169,6 +2216,7 @@ async fn download_streaming_bytes(
         let bytes = fetch_full_media_with_retry(
             &client,
             &track,
+            total,
             &shared,
             &mut request_pacer,
             &event_tx,
@@ -2184,7 +2232,6 @@ async fn download_streaming_bytes(
         }
         let full_range = media_cache::ByteRange::new(0, total.saturating_sub(1))?;
         shared.pin_ranges(&[full_range]);
-        write_cache_chunk(&media_path, 0, &bytes)?;
         shared.append(&bytes, full_range);
     } else {
         let prefetch_ranges = stream_metadata_prefetch_ranges(&metadata_ranges, total)?;
@@ -2201,6 +2248,7 @@ async fn download_streaming_bytes(
     );
     shared.prioritize_offset(initial_window.start);
 
+    let mut downloaded = 0u64;
     let mut prefetch_paused = false;
     loop {
         if shared.is_canceled() {
@@ -2250,6 +2298,14 @@ async fn download_streaming_bytes(
         if shared.covers(range) {
             continue;
         }
+        if track.media_is_progressive
+            && downloaded + range.len() > 32 * 1024 * 1024
+            && !shared.prepared_once()
+        {
+            bail!(
+                "Bilibili supplied combined video and audio; the first playback window exceeded 32 MiB"
+            );
+        }
         let (bytes, _) = fetch_stream_range_with_retry(
             &client,
             &track,
@@ -2261,19 +2317,19 @@ async fn download_streaming_bytes(
             &session_id,
         )
         .await?;
-        write_cache_chunk(&media_path, range.start, &bytes)?;
+        downloaded += bytes.len() as u64;
         shared.append(&bytes, range);
         let current_position_ms = playback_position
             .load(Ordering::Relaxed)
             .min(track.duration_ms);
         retain_streaming_byte_window(&shared, current_position_ms, track.duration_ms, total);
-        let _ = media_cache::evict_cache(&root, media_cache::MAX_CACHE_BYTES);
     }
 }
 
 async fn fetch_full_media_with_retry(
     client: &reqwest::Client,
     track: &PlaybackTrack,
+    total: u64,
     shared: &SharedBytes,
     request_pacer: &mut StreamRequestPacer,
     event_tx: &mpsc::UnboundedSender<AudioPlayerEvent>,
@@ -2286,7 +2342,7 @@ async fn fetch_full_media_with_retry(
             return Err(anyhow!("stream canceled"));
         }
 
-        match media_cache::fetch_full_media_bytes(client, track).await {
+        match media_cache::fetch_full_media_bytes(client, track, total).await {
             Ok(result) => return Ok(result),
             Err(err) => {
                 let Some(delay) = media_range_retry_delay(&err, attempt) else {
@@ -2428,16 +2484,6 @@ fn send_download_status(
     });
 }
 
-fn write_cache_chunk(path: &PathBuf, start: u64, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = OpenOptions::new().create(true).write(true).open(path)?;
-    file.seek(SeekFrom::Start(start))?;
-    file.write_all(bytes)?;
-    Ok(())
-}
-
 fn throttle_streaming_decode(
     pcm: &SharedPcm,
     playback_position: &AtomicU64,
@@ -2518,7 +2564,7 @@ fn decode_streaming_audio_inner(
     position_ms: u64,
     playback_position: Arc<AtomicU64>,
 ) -> Result<()> {
-    let source = StreamingMediaSource::new(bytes, decoder_token.clone());
+    let source = StreamingMediaSource::new(bytes.clone(), decoder_token.clone());
     let mss = MediaSourceStream::new(Box::new(source), Default::default());
 
     let mut hint = Hint::new();
@@ -2628,6 +2674,7 @@ fn decode_streaming_audio_inner(
 
                 if !ready_sent && buffered_until_ms >= ready_until {
                     ready_sent = true;
+                    bytes.mark_prepared();
                     let _ = event_tx.send(AudioPlayerEvent::Prepared {
                         operation_id: operation_id.clone(),
                         session_id: session_id.clone(),
@@ -2681,7 +2728,11 @@ fn decode_streaming_audio_inner(
 
     pcm.complete();
     let (buffered_from_ms, buffered_until_ms) = stream_pcm_cache_window(&pcm, track.duration_ms);
-    if !ready_sent && buffered_until_ms >= position_ms.min(track.duration_ms) {
+    if !ready_sent {
+        if !stream_pcm_ready_for_position(&pcm, position_ms, track.duration_ms) {
+            bail!("audio ended before the requested playback window");
+        }
+        bytes.mark_prepared();
         let _ = event_tx.send(AudioPlayerEvent::Prepared {
             operation_id: operation_id.clone(),
             session_id: session_id.clone(),
@@ -2733,6 +2784,70 @@ fn time_from_millis(position_ms: u64) -> Time {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "reads a public Bilibili audio stream"]
+    async fn live_bilibili_prepares_playable_audio_window() -> Result<()> {
+        let client = crate::bilibili::client()?;
+        let bvid = std::env::var("LIGHT_EAR_TEST_BVID").unwrap_or_else(|_| "BV1xx411c7mD".into());
+        let track = crate::bilibili::resolve_track(&client, &bvid, 0).await?;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let bytes = SharedBytes::new();
+        let decoder = DecodeToken::new();
+        let position = Arc::new(AtomicU64::new(0));
+        let download = download_streaming_bytes(
+            client,
+            track.clone(),
+            0,
+            position.clone(),
+            bytes.clone(),
+            tx.clone(),
+            None,
+            "live".into(),
+        );
+        let input = bytes.clone();
+        let token = decoder.clone();
+        let duration = track.duration_ms;
+        let progressive = track.media_is_progressive;
+        let decode = tokio::task::spawn_blocking(move || {
+            decode_streaming_audio(
+                input,
+                SharedPcm::new(),
+                token,
+                tx,
+                None,
+                "live".into(),
+                track,
+                0,
+                position,
+            )
+        });
+        let started = Instant::now();
+        let result = tokio::select! {
+            r = download => r.and_then(|_| Err(anyhow!("download stopped before readiness"))),
+            _ = tokio::time::sleep(Duration::from_secs(75)) => Err(anyhow!("audio prepare timed out")),
+            result = async {
+                while let Some(event) = rx.recv().await {
+                    match event {
+                        AudioPlayerEvent::Prepared { buffered_until_ms, .. } => return Ok(buffered_until_ms),
+                        AudioPlayerEvent::Failed { error, .. } => bail!("{error}"),
+                        _ => {}
+                    }
+                }
+                bail!("decoder closed before readiness")
+            } => result,
+        };
+        decoder.cancel();
+        bytes.cancel();
+        decode.await?;
+        let ready = result?;
+        eprintln!(
+            "{bvid}: {duration} ms track, progressive {progressive}, {ready} ms ready in {:?}",
+            started.elapsed()
+        );
+        assert!(ready >= media_cache::READY_WINDOW_MS.min(duration));
+        Ok(())
+    }
 
     #[test]
     fn volume_percent_to_gain_maps_ui_range() {
@@ -2989,6 +3104,25 @@ mod tests {
 
         assert_eq!(source.next(), Some(50.0));
         assert_eq!(position.load(Ordering::Relaxed), 5_100);
+    }
+
+    #[test]
+    fn decoder_demand_survives_eviction_outside_estimated_time_window() {
+        let bytes = SharedBytes::new();
+        let offset = 50_000_000;
+        let range = media_cache::ByteRange::new(offset, offset).unwrap();
+        bytes.append(&[7], range);
+        assert_eq!(
+            bytes
+                .read_at(offset, &mut [0], &DecodeToken::new())
+                .unwrap(),
+            1
+        );
+        bytes.retain_window(0, 10_000);
+        assert!(bytes.covers(range));
+        assert!(
+            stream_byte_range_for_window(0, 30000, 120000, 4_000_000_000).len() <= 8 * 1024 * 1024
+        );
     }
 
     #[test]

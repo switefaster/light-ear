@@ -132,7 +132,7 @@ Clients bootstrap through the shared `light-ear.network.v2` rendezvous namespace
 - `src/directory.rs` signs per-origin membership and reachability records. Directory peers compare sequence summaries over an authenticated request-response protocol. Pages contain up to eight records. The directory supports 512 participants. Records refresh at 30 seconds and expire 90 seconds after issuance, with five seconds of future clock tolerance. Only public IP candidates are shared globally.
 - `src/topology.rs` builds the graph from reciprocal link reports. A depth-first search identifies single-peer cuts. The primary forwarding tree uses path costs. The alternate penalizes reusing central edges of the primary. Both normally prefer an all-direct path. Each room needs only the branches joining its members. Ordinary peers may take up to eight foreign-room subscriptions. Renewed directory records maintain those subscriptions.
 - `src/overlay.rs` drives repair dials, directory exchange, tree subscriptions and delivery probes. Each protocol instance peers explicitly with its assigned neighbors. Mesh expansion and flood publishing are disabled. Foreign-room forwarding admits publications against a shared 256 KiB/s payload budget divided among helper rooms and charged for potential outgoing copies. Only a room member dispatches room messages into application state.
-- Per-tree probes measure round-trip delivery on the sender’s clock. A sender stripes by bytes after both trees have confirmed coverage. Its slowest receiver influences the traffic split. The peer overview counts current-room payload received from each neighbor on each tree and resets those counts on a room change. Circuit payload and directory bytes are counted across the lifetime of the swarm. The p95 value on each tree is the worst confirmed receiver in the current room. The counters exclude transport framing and music fetched from the media provider.
+- Per-tree probes measure round-trip delivery on the sender’s clock. After both trees confirm coverage, each successfully published byte receives a scheduling charge of 100 to 150 units. A worst-receiver p95 difference up to 50 ms gives both trees equal weight. Larger differences can shift sustained traffic toward the faster tree up to a 60:40 preference while both remain confirmed. A single confirmed tree takes priority immediately. The peer overview counts current-room payload received from each neighbor on each tree and resets those counts on a room change. Circuit payload and directory bytes are counted across the lifetime of the swarm. The p95 value on each tree is the worst confirmed receiver in the current room. The counters exclude transport framing and music fetched from the media provider.
 - A proposal freezes its eligible room member IDs. Buffer preparation snapshots live room members. A temporary loss of a neighboring socket can leave the same member reachable over another branch.
 
 
@@ -199,7 +199,7 @@ Current rules:
 
 ### Playback Rules
 
-- The peer that starts the next queue item becomes the prepare/playback leader.
+- The queue head’s requester leads its start while present. If the requester leaves, the first remaining member in peer-ID order takes over.
 - The expected ready set includes real room peers only: local peer included, relay/rendezvous infrastructure excluded.
 - New start, seek, and resume paths use `PlaybackBufferPrepare`,
   `PlaybackBufferStatus`, and `PlaybackBufferCancel` as temporary coordination
@@ -215,9 +215,7 @@ Current rules:
 - `PlaybackState` remains the only authoritative room playback state. Buffer
   operations and health messages are short-lived and should be cleared or
   superseded by ready, cancel, timeout, impossible quorum, or session changes.
-- Buffer quorum is a strict majority of real room peers. Start removes the queue
-  item only after quorum succeeds; seek/resume publish their target playback
-  state only after quorum succeeds.
+- Buffer quorum is a strict majority of real room peers. Prepare reserves the exact queue item and moves its title into the desktop player. A successful start or terminal failure consumes the reservation. Supersession releases it. The leader allows up to 90 seconds for each preparation. The readiness display shows ready members, total eligible members and the required majority.
 - During a current buffer operation, peer disconnects and libp2p gossipsub
   `SlowPeer` reports remove that peer from the expected set and recompute quorum.
   Temporary prepare/status publish failures are visible status events, not
@@ -280,7 +278,7 @@ Nav and WBI playurl use the homepage Referer, while video metadata and media
 Range requests retain the video Referer. Anonymous nav code `-101` is accepted
 when WBI data is present; other nonzero API codes are errors even with data.
 
-The resolver prefers DASH audio and can fall back to single-file `durl` media. WBI signing and media selection helpers have deterministic unit tests. If a playurl response is HTTP 412 or contains no usable media URL, the backend tries the legacy playurl path before surfacing failure. Resolve does not download a partial media Range to prove decoder support; partial metadata and AAC decoder limits are handled by streaming prepare so a valid queue item is not rejected too early.
+A progressive-only WBI result, missing supported media or HTTP 412 triggers a second DASH lookup on the legacy endpoint. If both endpoints offer only combined media, the player uses a single-file progressive stream with a 32 MiB startup budget. The stream worker resolves local media and performs range reads asynchronously. Enqueue lookups complete in submission order and are canceled when switching rooms.
 
 Bilibili DASH audio may include `SegmentBase` byte ranges for fragmented MP4
 initialization and index metadata. These ranges are carried as optional media
@@ -294,12 +292,7 @@ AAC decoding is feature-gated. Default local builds use Symphonia's native AAC d
 
 Range fetch and decode run outside the main swarm event loop. Skip/cancel/vote messages can arrive while media work is in flight. Player events must be checked against the current session id, operation id, and track id before changing quorum or playback state.
 
-For long media, the player downloads sequential HTTP ranges into a local cache
-and decodes into a PCM stream while playback waits only for the requested ready
-window. The cache defaults are a 12-second ready window, 5-second low watermark,
-15-second high watermark, and 2 GiB maximum cache size. HTTP Range unsupported,
-expired, or forbidden media should fail the local buffer operation instead of
-silently falling back to a full in-memory download.
+Long media uses a rolling in-memory byte cache and PCM window. Decoder-requested offsets and initialization metadata survive eviction outside the estimated playback window. The downloader caps speculative lookahead at 8 MiB and validates the status, byte span and body size for every partial response. The ready window is 12 seconds, with low and high watermarks at 5 and 15 seconds.
 
 Audio output device errors are local recoverable events. When the rodio/cpal
 stream reports an error, the backend reopens the current default output device

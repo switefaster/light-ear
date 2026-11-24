@@ -145,6 +145,7 @@ export default function TopologyDialog({ room, displayName, onClose }) {
         {stats && <p>Local sockets {stats.direct_connections} direct / {stats.relayed_connections} circuit · {stats.direct_address_count} direct addresses
           {!selected.infrastructure && <> · Chat {stats.chat_subscribed ? "ready" : "waiting"} · Direct attempts {stats.direct_promotion_attempts} / {stats.direct_promotion_failures} failed
             {stats.direct_promotion_in_flight && " · Attempt in progress"}{stats.direct_promotion_suspended && " · Attempts suspended"}</>}</p>}
+        {stats?.direct_connections > 0 && stats?.relayed_connections > 0 && <p>The circuit stays available during handoff while the client verifies delivery over a peer path.</p>}
         {received && <p>Room payload via this peer · {received.map(bytes => bytes.toLocaleString() + " B").join(" / ")}</p>}
       </section>
       {metrics && <div className="topology-delivery">

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -30,6 +30,7 @@ pub(crate) struct BufferPeerStatus {
 #[derive(Debug, Default)]
 pub(crate) struct BufferCoordinator {
     active: Option<BufferOperation>,
+    retired: VecDeque<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +71,21 @@ impl BufferCoordinator {
         self.active.as_ref()
     }
 
+    pub(crate) fn is_retired(&self, leader: &str, id: &str) -> bool {
+        self.retired
+            .iter()
+            .any(|(peer, op)| peer == leader && op == id)
+    }
+
+    pub(crate) fn retire(&mut self, leader: String, id: String) {
+        if !self.is_retired(&leader, &id) {
+            if self.retired.len() == 64 {
+                self.retired.pop_front();
+            }
+            self.retired.push_back((leader, id));
+        }
+    }
+
     pub(crate) fn is_active(&self) -> bool {
         self.active.is_some()
     }
@@ -83,6 +99,7 @@ impl BufferCoordinator {
         expected_peers: HashSet<String>,
         deadline: Instant,
     ) -> &BufferOperation {
+        self.clear();
         self.active = Some(BufferOperation {
             operation_id,
             state,
@@ -99,6 +116,7 @@ impl BufferCoordinator {
     pub(crate) fn receive_remote_operation(
         &mut self,
         operation_id: String,
+        queue_item_id: Option<String>,
         state: PlaybackState,
         kind: PlaybackBufferOperationKind,
         expected_peers: HashSet<String>,
@@ -111,11 +129,12 @@ impl BufferCoordinator {
             return self.active.as_ref().expect("operation exists");
         }
 
+        self.clear();
         self.active = Some(BufferOperation {
             operation_id,
             state,
             kind,
-            queue_item_id: None,
+            queue_item_id,
             expected_peers,
             statuses: HashMap::new(),
             deadline: now + timeout,
@@ -151,12 +170,6 @@ impl BufferCoordinator {
         }
 
         operation.statuses.get(peer_id) == Some(status)
-    }
-
-    pub(crate) fn extend_active_deadline(&mut self, deadline: Instant) -> Option<BufferOperation> {
-        let operation = self.active.as_mut()?;
-        operation.deadline = deadline;
-        Some(operation.clone())
     }
 
     pub(crate) fn remove_expected_peer(
@@ -244,14 +257,16 @@ impl BufferCoordinator {
             .as_ref()
             .is_some_and(|operation| operation.operation_id == operation_id)
         {
-            self.active.take()
+            self.clear()
         } else {
             None
         }
     }
 
     pub(crate) fn clear(&mut self) -> Option<BufferOperation> {
-        self.active.take()
+        let op = self.active.take()?;
+        self.retire(op.state.leader_peer_id.clone(), op.operation_id.clone());
+        Some(op)
     }
 
     pub(crate) fn clear_if_local_leader(&mut self, local_peer_id: &str) -> Option<BufferOperation> {
@@ -260,7 +275,7 @@ impl BufferCoordinator {
             .as_ref()
             .is_some_and(|operation| operation.state.leader_peer_id == local_peer_id)
         {
-            self.active.take()
+            self.clear()
         } else {
             None
         }
@@ -275,7 +290,7 @@ impl BufferCoordinator {
             .as_ref()
             .is_some_and(|operation| operation.is_resolved_by_playback_state(state))
         {
-            self.active.take()
+            self.clear()
         } else {
             None
         }
@@ -306,11 +321,11 @@ impl BufferOperation {
         let failed = self.count(PlaybackBufferStatusKind::Failed);
         let threshold = majority_threshold(self.expected_peers.len());
 
-        if ready >= threshold {
-            return BufferQuorum::Ready { ready, threshold };
-        }
         if now >= self.deadline {
             return BufferQuorum::TimedOut { ready, threshold };
+        }
+        if ready >= threshold {
+            return BufferQuorum::Ready { ready, threshold };
         }
 
         let remaining = self.expected_peers.len().saturating_sub(ready + failed);
@@ -343,6 +358,13 @@ impl BufferOperation {
         };
 
         PlaybackBufferView {
+            queue_item_id: self.queue_item_id.clone(),
+            title: self
+                .state
+                .track
+                .as_ref()
+                .map(|track| track.title.clone())
+                .unwrap_or_default(),
             operation_id: self.operation_id.clone(),
             session_id: self.state.session_id.clone(),
             track_id: self
@@ -405,6 +427,7 @@ mod tests {
                 referer: "https://www.bilibili.com/video/BV1234567890".to_string(),
                 media_init_range: None,
                 media_index_range: None,
+                media_is_progressive: false,
             }),
             playing,
             ..state(session_id)
@@ -432,10 +455,13 @@ mod tests {
 
         let cleared = coordinator.clear_if_local_leader("local").unwrap();
         assert_eq!(cleared.operation_id, "local-op");
+        assert!(coordinator.is_retired("local", "local-op"));
+        assert!(!coordinator.is_retired("other", "local-op"));
         assert!(!coordinator.is_active());
 
         coordinator.receive_remote_operation(
             "remote-op".to_string(),
+            None,
             state("remote-session"),
             PlaybackBufferOperationKind::Resume,
             peers(["local", "remote"]),
@@ -718,6 +744,7 @@ mod tests {
         let mut coordinator = BufferCoordinator::new();
         coordinator.receive_remote_operation(
             "op".to_string(),
+            None,
             state("session"),
             PlaybackBufferOperationKind::Seek,
             peers(["local", "leader"]),
@@ -736,6 +763,7 @@ mod tests {
 
         coordinator.receive_remote_operation(
             "op".to_string(),
+            None,
             state("session"),
             PlaybackBufferOperationKind::Seek,
             peers(["local", "leader"]),
@@ -757,6 +785,7 @@ mod tests {
         let mut coordinator = BufferCoordinator::new();
         coordinator.receive_remote_operation(
             "op".to_string(),
+            None,
             state("session"),
             PlaybackBufferOperationKind::Resume,
             peers(["local", "leader"]),
@@ -792,46 +821,39 @@ mod tests {
     }
 
     #[test]
-    fn extending_deadline_keeps_slow_local_buffer_waiting() {
+    fn deadline_bounds_prepare_even_when_a_remote_majority_is_ready() {
         let now = Instant::now();
-        let mut coordinator = BufferCoordinator::new();
-        coordinator.start_leader_operation(
-            "op".to_string(),
-            state("session"),
-            PlaybackBufferOperationKind::Seek,
-            None,
-            peers(["local", "remote"]),
-            now + Duration::from_secs(1),
+        let mut buffer = BufferCoordinator::new();
+        buffer.start_leader_operation(
+            "op".into(),
+            state("s"),
+            PlaybackBufferOperationKind::Start,
+            Some("item".into()),
+            peers(["a", "b", "local"]),
+            now + Duration::from_secs(90),
         );
-        coordinator.mark_status(
-            "op",
-            "session",
-            "local",
-            PlaybackBufferStatusKind::Buffering,
-            Some(4_000),
-            None,
-            now,
-        );
-
+        for peer in ["a", "b"] {
+            buffer.mark_status(
+                "op",
+                "s",
+                peer,
+                PlaybackBufferStatusKind::Ready,
+                None,
+                None,
+                now,
+            );
+        }
         assert!(matches!(
-            coordinator.quorum(now + Duration::from_secs(2)),
+            buffer.quorum(now),
+            Some(BufferQuorum::Ready { .. })
+        ));
+        assert!(matches!(
+            buffer.quorum(now + Duration::from_secs(90)),
             Some(BufferQuorum::TimedOut { .. })
         ));
-
-        let extended = coordinator
-            .extend_active_deadline(now + Duration::from_secs(10))
-            .expect("active operation");
-
-        assert_eq!(extended.operation_id, "op");
-        assert!(matches!(
-            coordinator.quorum(now + Duration::from_secs(2)),
-            Some(BufferQuorum::Waiting {
-                ready: 0,
-                buffering: 1,
-                failed: 0,
-                threshold: 2
-            })
-        ));
+        let view = buffer.active().unwrap().view("local", now);
+        assert_eq!(view.queue_item_id.as_deref(), Some("item"));
+        assert_eq!((view.ready, view.eligible_peers, view.threshold), (2, 3, 2));
     }
 
     #[test]

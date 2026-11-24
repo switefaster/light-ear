@@ -40,6 +40,7 @@ boundaries:
 - `cargo check --manifest-path src-tauri\Cargo.toml`
 - `npm.cmd run build`
 - AAC enhancement/release parity check: `cargo check --features fdk-aac-decoder`
+- Optional live Bilibili playback check: `cargo test --lib live_bilibili_prepares_playable_audio_window -- --ignored --nocapture`. Set `LIGHT_EAR_TEST_BVID` to test another public video.
 
 For relay promotion policy or rendezvous behavior, include
 `cargo check --bin light-ear-relay`. For desktop bridge work, include the Tauri
@@ -67,7 +68,8 @@ Keep their real libp2p transports and run the full suite with both decoder confi
   Tauri command's `position` field compatible, but do not give it behavior
   unless the product rule changes.
 - Queue move always requires a vote. Queue remove is direct only for the peer
-  that requested that queue item; other peers must vote.
+  that requested that queue item. Other peers need a majority including an
+  independent ballot. Bind desktop removal to the displayed item ID.
 - Queue remove/move votes based on a newer queue version should stay visible
   while the peer catches up; request queue sync from the proposer instead of
   immediately discarding the vote as stale.
@@ -85,6 +87,9 @@ Keep their real libp2p transports and run the full suite with both decoder confi
 - Bilibili/audio streaming prepare runs off the main swarm event loop. Range
   download and Symphonia decode events must be checked by session id, operation
   id, and track id before they affect playback or buffer quorum.
+- Try the legacy DASH lookup before using a progressive video. Validate the
+  actual HTTP partial response and bound body reads. Preserve ranges demanded
+  by the decoder even outside the estimated playback window.
 - Bilibili resolve should select plausible media URLs only. Do not add a
   resolve-time decoder probe that can reject otherwise usable tracks because of
   partial Range metadata, missing `moov`, or decoder-specific AAC limitations;
@@ -111,7 +116,10 @@ Keep their real libp2p transports and run the full suite with both decoder confi
   diagnostic messages; do not treat them as room playback truth.
 - Start, seek, and resume should wait for a strict majority of real room peers
   to report buffered readiness before the leader publishes the playable
-  `PlaybackState`. Queue items are removed only after start quorum succeeds.
+  `PlaybackState`. The requester coordinates the start while present. Otherwise
+  the first signed room member in peer-ID order coordinates it. Reserve the
+  exact item during prepare and show it in the player. Consume the reservation
+  on commit or terminal failure. Bound leader preparation to 90 seconds.
 - Local audio output availability must not block the room. If output cannot be
   opened, try to restore it first; if that fails, report ready for prepare/quorum
   so other peers can continue, send a local status, and keep retrying output

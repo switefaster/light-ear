@@ -261,8 +261,12 @@ async fn skip(state: State<'_, BackendState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn remove_queue_item(state: State<'_, BackendState>, index: usize) -> Result<(), String> {
-    send_command(&state, NetworkCommand::RemoveQueueItem(index)).await
+async fn remove_queue_item(
+    state: State<'_, BackendState>,
+    index: usize,
+    item_id: Option<String>,
+) -> Result<(), String> {
+    send_command(&state, NetworkCommand::RemoveQueueItem { index, item_id }).await
 }
 
 #[tauri::command]

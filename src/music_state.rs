@@ -851,9 +851,7 @@ pub(crate) fn should_apply_playback_state(
     current.track.as_ref().map(|track| &track.track_id)
         == next.track.as_ref().map(|track| &track.track_id)
         && current.leader_peer_id == next.leader_peer_id
-        && (current.anchor_time_micros < next.anchor_time_micros
-            || current.position_ms != next.position_ms
-            || current.playing != next.playing)
+        && (current.position_ms != next.position_ms || current.playing != next.playing)
 }
 
 pub(crate) fn normalize_remote_playback_state(
@@ -939,6 +937,7 @@ mod tests {
             referer: "https://www.bilibili.com/video/BV1A4411N7".to_string(),
             media_init_range: None,
             media_index_range: None,
+            media_is_progressive: false,
         }
     }
 
@@ -1011,6 +1010,36 @@ mod tests {
             2,
             100,
             &queue_state(1, 100, Vec::new())
+        ));
+    }
+
+    #[test]
+    fn removal_cannot_pass_on_the_proposers_ballot_alone() {
+        let mut music = MusicState::new();
+        let mut p = VoteProposal {
+            vote_id: "remove".into(),
+            proposer: "alice".into(),
+            eligible_peers: ["alice".into()].into(),
+            action: VoteAction::Remove {
+                item_id: "song".into(),
+            },
+            queue_version: 0,
+            playback_session_id: None,
+            created_at_micros: 1,
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        music.start_vote(p.clone(), deadline);
+        assert!(matches!(
+            music.resolve_vote(1, 1),
+            Some(VoteResolution::Rejected(_))
+        ));
+        p.eligible_peers.insert("bob".into());
+        music.start_vote(p, deadline);
+        assert!(music.resolve_vote(1, 1).is_none());
+        assert!(music.cast_vote_for("remove", "bob".into(), true));
+        assert!(matches!(
+            music.resolve_vote(1, 1),
+            Some(VoteResolution::Passed(_))
         ));
     }
 

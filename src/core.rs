@@ -48,6 +48,8 @@ pub struct PlaybackTrack {
     pub media_init_range: Option<PlaybackByteRange>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_index_range: Option<PlaybackByteRange>,
+    #[serde(default)]
+    pub media_is_progressive: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,6 +161,8 @@ pub enum PlaybackBufferStatusKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaybackBufferView {
+    pub queue_item_id: Option<String>,
+    pub title: String,
     pub operation_id: String,
     pub session_id: String,
     pub track_id: String,
@@ -321,6 +325,8 @@ pub enum WireMessage {
         nonce: u64,
     },
     PlaybackBufferPrepare {
+        #[serde(default)]
+        queue_item_id: Option<String>,
         operation_id: String,
         session_id: String,
         track_id: String,
@@ -406,6 +412,8 @@ pub enum NetworkCommand {
     LearnTestCandidate(libp2p::Multiaddr),
     #[cfg(test)]
     LimitTestTransit(usize),
+    #[cfg(test)]
+    EnqueueTestTrack(PlaybackTrack),
     JoinRoom(String),
     LeaveRoom,
     Chat(String),
@@ -420,7 +428,10 @@ pub enum NetworkCommand {
     Seek(u64),
     SetVolume(u8),
     Skip,
-    RemoveQueueItem(usize),
+    RemoveQueueItem {
+        index: usize,
+        item_id: Option<String>,
+    },
     MoveQueueItem {
         from: usize,
         to: usize,
@@ -484,10 +495,16 @@ impl PendingPlayback {
 impl ActiveVote {
     pub(crate) fn counts(&self, threshold: usize, count: usize) -> (usize, usize) {
         let n = self.proposal.eligible_peers.len();
-        if n == 0 {
+        let (majority, members) = if n == 0 {
             (threshold, count)
         } else {
             (n / 2 + 1, n)
+        };
+        // Removing another member's request always needs an independent ballot.
+        if matches!(self.proposal.action, VoteAction::Remove { .. }) {
+            (majority.max(2), members)
+        } else {
+            (majority, members)
         }
     }
     pub fn new(proposal: VoteProposal, deadline: Instant) -> Self {

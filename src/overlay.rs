@@ -60,7 +60,7 @@ pub(super) struct Network {
     probes: HashMap<u64, (usize, String, Instant, bool)>,
     next_probe: Instant,
     probe_index: usize,
-    assigned: [u64; 2],
+    scheduler: ByteScheduler,
     proposed: Option<(topology::Plan, Instant)>,
     tail_window: Instant,
     tail_target: Option<String>,
@@ -146,7 +146,7 @@ impl Network {
             probes: Default::default(),
             next_probe: now,
             probe_index: 0,
-            assigned: [0; 2],
+            scheduler: ByteScheduler::default(),
             proposed: None,
             seed_addresses: Default::default(),
             tail_window: now,
@@ -155,10 +155,12 @@ impl Network {
         }
     }
     pub fn members(&self) -> BTreeSet<String> {
-        self.room
-            .as_deref()
-            .map(|r| self.directory.members(r))
-            .unwrap_or_default()
+        let Some(room) = &self.room else {
+            return BTreeSet::new();
+        };
+        let mut members = self.directory.members(room);
+        members.insert(self.local_peer_id().to_string());
+        members
     }
     pub fn remember_seed(&mut self, addr: Multiaddr) {
         if let Some(p) = peer_id_from_multiaddr(&addr) {
@@ -209,7 +211,7 @@ impl Network {
         self.missed.clear();
         self.lost.clear();
         self.repairs.clear();
-        self.assigned = [0; 2];
+        self.scheduler = ByteScheduler::default();
     }
     pub fn at_bootstrap_budget(&self) -> bool {
         self.routes.len() >= 12
@@ -889,6 +891,7 @@ impl Network {
             self.samples = Default::default();
             self.confirmation_neighbors = Default::default();
             self.probes.clear();
+            self.scheduler = ByteScheduler::default();
         }
         for i in 0..2 {
             let old = self.plan.neighbors[i].clone();
@@ -1107,12 +1110,8 @@ impl Network {
         if directory::room_topic(room).hash() != topic.hash() {
             return Ok(RoomPublishOutcome::NoSubscribers);
         }
-        let weights = self.lane_delays().map(|delay| delay.map(|ms| ms.max(25)));
-        let i = match weights {
-            [Some(_), Some(_)] => usize::from(self.assigned[1] < self.assigned[0]),
-            [None, Some(_)] => 1,
-            _ => 0,
-        };
+        let delays = self.lane_delays();
+        let i = self.scheduler.preferred(delays);
         let data = serde_json::to_vec(&Packet {
             id: new_nonce(*self.local_peer_id()),
             body: Payload::Room(wire.clone()),
@@ -1122,15 +1121,7 @@ impl Network {
             match self.lane(lane).publish(topic.clone(), data.clone()) {
                 Ok(_) => {
                     self.published_bytes[lane] += data.len() as u64;
-                    if let [Some(a), Some(b)] = weights {
-                        let cost = if a.abs_diff(b) <= 50 { 1 } else { [a, b][lane] };
-                        self.assigned[lane] = self.assigned[lane]
-                            .saturating_add(cost.saturating_mul(data.len() as u64));
-                        let floor = self.assigned[0].min(self.assigned[1]);
-                        self.assigned.iter_mut().for_each(|v| *v -= floor);
-                    } else {
-                        self.assigned = [0; 2];
-                    }
+                    self.scheduler.record(lane, data.len() as u64, delays);
                     return Ok(RoomPublishOutcome::Published);
                 }
                 Err(e) => match classify_room_publish_error(&e) {
@@ -1142,6 +1133,65 @@ impl Network {
             }
         }
         Ok(outcome)
+    }
+}
+
+#[derive(Default)]
+struct ByteScheduler {
+    debt: [u64; 2],
+}
+
+impl ByteScheduler {
+    fn preferred(&self, delays: [Option<u64>; 2]) -> usize {
+        match delays {
+            [Some(_), Some(_)] => usize::from(self.debt[1] < self.debt[0]),
+            [None, Some(_)] => 1,
+            _ => 0,
+        }
+    }
+
+    fn record(&mut self, lane: usize, bytes: u64, delays: [Option<u64>; 2]) {
+        let [Some(a), Some(b)] = delays else {
+            self.debt = [0; 2];
+            return;
+        };
+        // Keep every charge in the same units as earlier publications. RTT is a
+        // latency signal, not a capacity estimate: allow at most a 60:40 preference
+        // while both trees confirm delivery. Missing coverage is handled in preferred().
+        let excess = [a, b][lane].saturating_sub(a.min(b)).saturating_sub(50);
+        let premium = (excess.saturating_mul(100) / a.min(b).max(25)).min(50);
+        self.debt[lane] = self.debt[lane].saturating_add(bytes.saturating_mul(100 + premium));
+        let paid = self.debt[0].min(self.debt[1]);
+        self.debt.iter_mut().for_each(|v| *v -= paid);
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::ByteScheduler;
+
+    #[test]
+    fn probe_jitter_preserves_byte_share_on_both_confirmed_trees() {
+        // Change the observed p95 during a burst, including between individual
+        // packets. The previous scheduler mixed raw milliseconds with unit costs.
+        let mut scheduler = ByteScheduler::default();
+        let mut totals = [0u64; 2];
+        for i in 0..240 {
+            let delays = match i % 4 {
+                0 => [Some(27), Some(230)],
+                1 => [Some(91), Some(138)],
+                2 => [Some(65), Some(115)],
+                _ => [Some(150), Some(205)],
+            };
+            let bytes = [1300, 700, 900, 1050, 1500][i % 5];
+            let lane = scheduler.preferred(delays);
+            totals[lane] += bytes;
+            scheduler.record(lane, bytes, delays);
+        }
+        let share = totals[0] as f64 / totals.iter().sum::<u64>() as f64;
+        assert!((0.50..=0.61).contains(&share), "delivered {totals:?} bytes");
+        assert_eq!(scheduler.preferred([None, Some(500)]), 1);
+        assert_eq!(scheduler.preferred([Some(500), None]), 0);
     }
 }
 

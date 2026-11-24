@@ -489,7 +489,9 @@ function RoomConsole({ room, setRoom, callCommand, onOpenLog, onOpenPeers, displ
   const [volume, setVolume] = useState(100);
 
   const playback = room.playback;
-  const queueCount = room.queue?.items?.length ?? 0;
+  const reservedId = room.playbackBuffer?.queue_item_id;
+  const queuedItems = (room.queue?.items ?? []).map((item, i) => ({ ...item, queueIndex: i + 1 })).filter(item => item.item_id !== reservedId);
+  const queueCount = queuedItems.length;
   const progress = playback
     ? Math.min(100, Math.max(0, (playback.position_ms / Math.max(playback.duration_ms || 0, 1)) * 100))
     : 0;
@@ -519,6 +521,10 @@ function RoomConsole({ room, setRoom, callCommand, onOpenLog, onOpenPeers, displ
 
   async function confirmMove() {
     if (!pendingMove) return;
+    if (room.queue?.items[pendingMove.from - 1]?.item_id !== pendingMove.itemId || room.queue?.items[pendingMove.to - 1]?.item_id !== pendingMove.targetId) {
+      setPendingMove(null);
+      return;
+    }
     const moved = await callCommand("move_queue_item", {
       from: pendingMove.from,
       to: pendingMove.to,
@@ -621,7 +627,8 @@ function RoomConsole({ room, setRoom, callCommand, onOpenLog, onOpenPeers, displ
 
       <QueueDrawer
         open={queueOpen}
-        queue={room.queue}
+        items={queuedItems}
+        localPeerId={room.localPeerId}
         callCommand={callCommand}
         onClose={() => setQueueOpen(false)}
         onRequestMove={setPendingMove}
@@ -797,8 +804,10 @@ function PlayerDock({
   const leaderName = playback ? displayName(playback.leader_peer_id, playback.leader_name) : "";
   const playPauseCommand = playback?.playing ? "pause" : "resume";
   const playPauseLabel = playback ? (playback.playing ? "Pause" : "Resume") : "Play/Pause";
+  const preparing = buffer?.kind === "start";
+  const title = preparing ? buffer.title : playback?.title;
   const bufferLabel = buffer
-    ? `${formatBufferKind(buffer.kind)} ${buffer.ready}/${buffer.threshold}`
+    ? `${formatBufferKind(buffer.kind)} ${buffer.ready}/${buffer.eligible_peers} ready (${buffer.threshold} needed)`
     : null;
   const cacheLabel = cache && cache.status !== "ready"
     ? `${formatCacheStatus(cache.status)} ${formatMs(cache.buffered_until_ms)}`
@@ -807,17 +816,17 @@ function PlayerDock({
   return (
     <section className="player-dock" aria-label="Playback controls">
       <div className="player-track">
-        <p className="overline">Now Playing</p>
-        <h2 className={playback?.title && playback.title.length > 28 ? "track-title scrolling" : "track-title"}>
-          <span>{playback?.title ?? "Idle"}</span>
+        <p className="overline">{preparing ? "Preparing" : "Now Playing"}</p>
+        <h2 className={title && title.length > 28 ? "track-title scrolling" : "track-title"}>
+          <span>{title || "Idle"}</span>
         </h2>
         <div className="playback-details">
           <span className={`pill ${playback?.playing ? "playing" : playback ? "paused" : "neutral"}`}>
-            {playback ? (playback.playing ? "playing" : "paused") : "standing by"}
+            {preparing ? "buffering" : playback ? (playback.playing ? "playing" : "paused") : "standing by"}
           </span>
           {bufferLabel && <span className="pill buffering">{bufferLabel}</span>}
           {!bufferLabel && cacheLabel && <span className="pill buffering">{cacheLabel}</span>}
-          <span>{playback ? `leader ${leaderName}` : "no track selected"}</span>
+          {!preparing && <span>{playback ? `leader ${leaderName}` : "no track selected"}</span>}
         </div>
       </div>
 
@@ -954,10 +963,9 @@ function SeekBar({ playback, progress, cacheRange, onSeekRequest }) {
   );
 }
 
-function QueueDrawer({ open, queue, callCommand, onClose, onRequestMove, displayName }) {
+function QueueDrawer({ open, items, localPeerId, callCommand, onClose, onRequestMove, displayName }) {
   const [queueForm, setQueueForm] = useState({ bvid: "", part: "" });
   const clipboardBvidRef = useRef("");
-  const items = queue?.items ?? [];
 
   useEffect(() => {
     if (!open) return undefined;
@@ -1047,7 +1055,8 @@ function QueueDrawer({ open, queue, callCommand, onClose, onRequestMove, display
 
         <QueueList
           items={items}
-          onRemove={(index) => callCommand("remove_queue_item", { index })}
+          localPeerId={localPeerId}
+          onRemove={(item) => callCommand("remove_queue_item", { index: item.queueIndex, itemId: item.item_id })}
           onRequestMove={onRequestMove}
           displayName={displayName}
         />
@@ -1056,7 +1065,7 @@ function QueueDrawer({ open, queue, callCommand, onClose, onRequestMove, display
   );
 }
 
-function QueueList({ items, onRemove, onRequestMove, displayName }) {
+function QueueList({ items, localPeerId, onRemove, onRequestMove, displayName }) {
   const [dragIndex, setDragIndex] = useState(null);
   const [overIndex, setOverIndex] = useState(null);
 
@@ -1091,8 +1100,10 @@ function QueueList({ items, onRemove, onRequestMove, displayName }) {
       return;
     }
     onRequestMove({
-      from: fromIndex + 1,
-      to: toIndex + 1,
+      from: item.queueIndex,
+      to: items[toIndex].queueIndex,
+      itemId: item.item_id,
+      targetId: items[toIndex].item_id,
       title: item.track.title,
       meta: `${item.track.bvid} P${item.track.part || 1}`,
     });
@@ -1164,8 +1175,8 @@ function QueueList({ items, onRemove, onRequestMove, displayName }) {
               <ArrowDown size={16} aria-hidden="true" />
             </IconButton>
           </div>
-          <IconButton label={`Remove ${item.track.title}`} danger onClick={() => onRemove(index + 1)}>
-            <Trash2 size={17} aria-hidden="true" />
+          <IconButton label={`${item.requested_by === localPeerId ? "Remove" : "Vote to remove"} ${item.track.title}`} danger onClick={() => onRemove(item)}>
+            {item.requested_by === localPeerId ? <Trash2 size={17} aria-hidden="true" /> : <Vote size={17} aria-hidden="true" />}
           </IconButton>
         </article>
       ))}

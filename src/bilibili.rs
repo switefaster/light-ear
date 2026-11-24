@@ -88,6 +88,10 @@ struct BilibiliAudio {
     base_url_camel: Option<String>,
     #[serde(rename = "base_url")]
     base_url_snake: Option<String>,
+    #[serde(rename = "backupUrl", default)]
+    backup_url_camel: Option<Vec<String>>,
+    #[serde(default, rename = "backup_url")]
+    backup_url_snake: Option<Vec<String>>,
     #[serde(rename = "SegmentBase")]
     segment_base_camel: Option<BilibiliSegmentBase>,
     #[serde(rename = "segment_base")]
@@ -114,6 +118,7 @@ struct BilibiliSegmentBase {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MediaCandidate {
+    progressive: bool,
     url: String,
     init_range: Option<PlaybackByteRange>,
     index_range: Option<PlaybackByteRange>,
@@ -121,9 +126,21 @@ struct MediaCandidate {
 
 impl BilibiliAudio {
     fn base_url(&self) -> Option<&str> {
-        self.base_url_camel
-            .as_deref()
-            .or(self.base_url_snake.as_deref())
+        [
+            self.base_url_camel.as_deref(),
+            self.base_url_snake.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|url| !url.trim().is_empty())
+        .or_else(|| {
+            self.backup_url_camel
+                .iter()
+                .chain(&self.backup_url_snake)
+                .flatten()
+                .find(|url| !url.trim().is_empty())
+                .map(String::as_str)
+        })
     }
 
     fn segment_base(&self) -> Option<&BilibiliSegmentBase> {
@@ -138,7 +155,10 @@ impl BilibiliAudio {
     }
 
     fn decoder_codec_priority(&self) -> Option<u8> {
-        let codecs = self.codecs.as_deref()?;
+        let Some(codecs) = self.codecs.as_deref().filter(|s| !s.trim().is_empty()) else {
+            // Standard AAC audio rendition IDs allow the decoder to inspect missing codec metadata.
+            return matches!(self.id, 30216 | 30232 | 30280).then_some(0);
+        };
         let mut best = None;
         for codec in codecs
             .split(',')
@@ -229,6 +249,7 @@ pub fn client() -> Result<Client> {
     headers.insert("sec-fetch-dest", HeaderValue::from_static("empty"));
 
     Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
         .default_headers(headers)
         .build()
         .context("failed to build bilibili http client")
@@ -322,20 +343,12 @@ pub async fn resolve_track(
         .get(part_index)
         .ok_or_else(|| anyhow!("part {} does not exist", part_index + 1))?;
 
-    let player = resolve_player_info(client, bvid, page.cid, &referer).await?;
-    let media = match select_media(player) {
-        Ok(media) => media,
-        Err(err) => {
-            let legacy = resolve_player_info_legacy(client, bvid, page.cid, &referer)
-                .await
-                .with_context(|| {
-                    format!("play url had no supported media and legacy fallback failed: {err:#}")
-                })?;
-            select_media(legacy).with_context(|| {
-                format!("legacy play url had no supported media after WBI media failure: {err:#}")
-            })?
-        }
-    };
+    let primary = resolve_player_info_wbi(client, bvid, page.cid).await;
+    let media = select_with_dash_fallback(
+        primary,
+        resolve_player_info_legacy(client, bvid, page.cid, &referer),
+    )
+    .await?;
 
     Ok(PlaybackTrack {
         track_id: format!("bilibili:{bvid}:{}:{}", part_index + 1, page.cid),
@@ -348,27 +361,30 @@ pub async fn resolve_track(
         referer,
         media_init_range: media.init_range,
         media_index_range: media.index_range,
+        media_is_progressive: media.progressive,
     })
 }
 
-async fn resolve_player_info(
-    client: &Client,
-    bvid: &str,
-    cid: u64,
-    referer: &str,
-) -> Result<BilibiliPlayerInfo> {
-    match resolve_player_info_wbi(client, bvid, cid).await {
-        Ok(player) => Ok(player),
-        Err(err) if is_http_precondition_failed(&err) => {
-            resolve_player_info_legacy(client, bvid, cid, referer)
-                .await
-                .with_context(|| {
-                    format!(
-                        "WBI playurl returned HTTP 412 and legacy playurl fallback failed: {err:#}"
-                    )
-                })
-        }
-        Err(err) => Err(err),
+async fn select_with_dash_fallback(
+    primary: Result<BilibiliPlayerInfo>,
+    legacy: impl std::future::Future<Output = Result<BilibiliPlayerInfo>>,
+) -> Result<MediaCandidate> {
+    let primary = match primary {
+        Ok(info) => select_media(info),
+        Err(err) if is_http_precondition_failed(&err) => Err(err),
+        Err(err) => return Err(err),
+    };
+    if primary.as_ref().is_ok_and(|m| !m.progressive) {
+        return primary;
+    }
+    let alternate = legacy.await.and_then(select_media);
+    match (primary, alternate) {
+        (_, Ok(audio)) if !audio.progressive => Ok(audio),
+        (Ok(media), _) => Ok(media),
+        (Err(_), Ok(media)) => Ok(media),
+        (Err(primary), Err(legacy)) => Err(legacy).context(format!(
+            "no playable Bilibili stream after primary lookup: {primary:#}"
+        )),
     }
 }
 
@@ -418,8 +434,7 @@ async fn resolve_player_info_legacy(
             ("fnver", "0".to_string()),
             ("fnval", "16".to_string()),
             ("fourk", "1".to_string()),
-            ("platform", "html5".to_string()),
-            ("qn", "64".to_string()),
+            ("qn", "16".to_string()),
         ])
         .send()
         .await?
@@ -448,6 +463,7 @@ fn media_candidates(player: BilibiliPlayerInfo) -> Result<Vec<MediaCandidate>> {
                 Some((
                     audio.quality_key()?,
                     MediaCandidate {
+                        progressive: false,
                         url: base_url.to_string(),
                         init_range: audio
                             .segment_base()
@@ -477,6 +493,7 @@ fn media_candidates(player: BilibiliPlayerInfo) -> Result<Vec<MediaCandidate>> {
             .flat_map(BilibiliDurl::candidate_urls)
             .filter(|url| !url.is_empty())
             .map(|url| MediaCandidate {
+                progressive: true,
                 url,
                 init_range: None,
                 index_range: None,
@@ -488,19 +505,6 @@ fn media_candidates(player: BilibiliPlayerInfo) -> Result<Vec<MediaCandidate>> {
     }
 
     bail!("bilibili media stream with supported audio does not exist")
-}
-
-#[cfg(test)]
-fn best_media_url_with_fallback(
-    primary: BilibiliPlayerInfo,
-    fallback: impl FnOnce() -> Result<BilibiliPlayerInfo>,
-) -> Result<String> {
-    match best_media_url(primary) {
-        Ok(url) => Ok(url),
-        Err(err) => best_media_url(fallback()?).with_context(|| {
-            format!("fallback play url had no usable media after primary media failure: {err:#}")
-        }),
-    }
 }
 
 trait BilibiliResponseExt {
@@ -1095,6 +1099,8 @@ mod tests {
                         codecs: Some("mp4a.40.2".to_string()),
                         base_url_camel: Some("https://example.test/low.m4s".to_string()),
                         base_url_snake: None,
+                        backup_url_camel: None,
+                        backup_url_snake: None,
                         segment_base_camel: None,
                         segment_base_snake: None,
                     },
@@ -1104,6 +1110,8 @@ mod tests {
                         codecs: Some("mp4a.40.2".to_string()),
                         base_url_camel: None,
                         base_url_snake: Some("https://example.test/high.m4s".to_string()),
+                        backup_url_camel: None,
+                        backup_url_snake: None,
                         segment_base_camel: None,
                         segment_base_snake: None,
                     },
@@ -1131,6 +1139,8 @@ mod tests {
                     codecs: Some("mp4a.40.2".to_string()),
                     base_url_camel: Some("https://example.test/audio.m4s".to_string()),
                     base_url_snake: None,
+                    backup_url_camel: None,
+                    backup_url_snake: None,
                     segment_base_camel: Some(BilibiliSegmentBase {
                         initialization_camel: Some("0-817".to_string()),
                         initialization_snake: None,
@@ -1172,6 +1182,8 @@ mod tests {
                         codecs: Some("mp4a.40.5".to_string()),
                         base_url_camel: Some("https://example.test/he-aac.m4s".to_string()),
                         base_url_snake: None,
+                        backup_url_camel: None,
+                        backup_url_snake: None,
                         segment_base_camel: None,
                         segment_base_snake: None,
                     },
@@ -1181,6 +1193,8 @@ mod tests {
                         codecs: Some("mp4a.40.2".to_string()),
                         base_url_camel: Some("https://example.test/aac-lc.m4s".to_string()),
                         base_url_snake: None,
+                        backup_url_camel: None,
+                        backup_url_snake: None,
                         segment_base_camel: None,
                         segment_base_snake: None,
                     },
@@ -1221,6 +1235,8 @@ mod tests {
                     codecs: Some("fLaC".to_string()),
                     base_url_camel: Some("https://example.test/flac.m4s".to_string()),
                     base_url_snake: None,
+                    backup_url_camel: None,
+                    backup_url_snake: None,
                     segment_base_camel: None,
                     segment_base_snake: None,
                 }]),
@@ -1248,6 +1264,8 @@ mod tests {
                     codecs: Some("mp4a.40.5".to_string()),
                     base_url_camel: Some("https://example.test/he-aac.m4s".to_string()),
                     base_url_snake: None,
+                    backup_url_camel: None,
+                    backup_url_snake: None,
                     segment_base_camel: None,
                     segment_base_snake: None,
                 }]),
@@ -1265,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    fn best_media_url_falls_back_to_durl_when_dash_codec_is_unknown() {
+    fn standard_audio_rendition_without_codec_metadata_precedes_muxed_video() {
         let player = BilibiliPlayerInfo {
             dash: Some(BilibiliDash {
                 audio: Some(vec![BilibiliAudio {
@@ -1274,6 +1292,8 @@ mod tests {
                     codecs: None,
                     base_url_camel: Some("https://example.test/unknown-aac.m4s".to_string()),
                     base_url_snake: None,
+                    backup_url_camel: None,
+                    backup_url_snake: None,
                     segment_base_camel: None,
                     segment_base_snake: None,
                 }]),
@@ -1286,12 +1306,12 @@ mod tests {
 
         assert_eq!(
             best_media_url(player).unwrap(),
-            "https://example.test/video.mp4"
+            "https://example.test/unknown-aac.m4s"
         );
     }
 
-    #[test]
-    fn best_media_url_falls_back_when_primary_has_no_media() {
+    #[tokio::test]
+    async fn best_media_url_falls_back_when_primary_has_no_media() {
         let primary = BilibiliPlayerInfo {
             dash: Some(BilibiliDash { audio: None }),
             durl: None,
@@ -1305,9 +1325,24 @@ mod tests {
         };
 
         assert_eq!(
-            best_media_url_with_fallback(primary, || Ok(fallback)).unwrap(),
+            select_with_dash_fallback(Ok(primary), async { Ok(fallback) })
+                .await
+                .unwrap()
+                .url,
             "https://example.test/backup.mp4"
         );
+    }
+
+    #[tokio::test]
+    async fn primary_muxed_video_yields_to_legacy_dash_with_backup_url() {
+        let primary =
+            serde_json::from_value(serde_json::json!({"durl":[{"url":"muxed"}]})).unwrap();
+        let legacy = serde_json::from_value(serde_json::json!({"dash":{"audio":[{"id":30280,"codecs":"mp4a.40.2","baseUrl":"","backup_url":null,"backupUrl":["audio"]}]}})).unwrap();
+        let media = select_with_dash_fallback(Ok(primary), async { Ok(legacy) })
+            .await
+            .unwrap();
+        assert!(!media.progressive);
+        assert_eq!(media.url, "audio");
     }
 
     #[test]
