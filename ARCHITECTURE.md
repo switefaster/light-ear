@@ -275,6 +275,10 @@ Current rules:
 
 Playback does not stream audio from peer to peer. Each client resolves and streams audio locally from Bilibili using HTTP Range requests.
 
+While the current track has 15 seconds of decoded audio ahead or is buffered through its end, each listener can prefetch the first 2 MiB of the next two queue entries, one at a time. A verified shorter final range covers an entire small file. The player retains the bytes with the local media source and its verified length for up to ten minutes. Queue changes evict displaced entries and foreground buffering cancels pending work. At the next start the normal decoder consumes the cached opening and the downloader continues with missing ranges. Readiness and the room start anchor still come from the usual buffer quorum.
+
+For DASH audio with a complete MP4 movie header and segment index in the cached opening, the decoder can read the first fragment immediately at position zero. Seeks and other MP4 layouts use the seekable format probe.
+
 Bilibili API requests use matching Chrome user-agent and client-hint headers.
 WBI playurl uses `fnval=4048`, `try_look=1`, `web_location=1550101`, and fresh
 `dm_*` fingerprint fields with screen dimensions retained for the process.

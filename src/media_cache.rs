@@ -393,6 +393,7 @@ pub(crate) async fn probe_range_support(
             start: 0,
             end_inclusive: 0,
         },
+        false,
     )
 }
 
@@ -400,6 +401,32 @@ pub(crate) async fn fetch_range_bytes(
     client: &reqwest::Client,
     track: &PlaybackTrack,
     range: ByteRange,
+) -> std::result::Result<(Vec<u8>, RangeProbe), MediaRangeError> {
+    fetch_partial_bytes(client, track, range, false).await
+}
+
+/// One aligned chunk. A shorter response is valid only when it reaches the actual EOF.
+pub(crate) async fn fetch_opening_bytes(
+    client: &reqwest::Client,
+    track: &PlaybackTrack,
+) -> std::result::Result<(Vec<u8>, RangeProbe), MediaRangeError> {
+    fetch_partial_bytes(
+        client,
+        track,
+        ByteRange {
+            start: 0,
+            end_inclusive: STREAM_CHUNK_BYTES - 1,
+        },
+        true,
+    )
+    .await
+}
+
+async fn fetch_partial_bytes(
+    client: &reqwest::Client,
+    track: &PlaybackTrack,
+    range: ByteRange,
+    allow_short_eof: bool,
 ) -> std::result::Result<(Vec<u8>, RangeProbe), MediaRangeError> {
     let range_header = range.header_value();
     let response = media_range_request(client, track, &range_header)
@@ -416,14 +443,18 @@ pub(crate) async fn fetch_range_bytes(
         });
     }
 
-    let probe = verified_partial_response(&response, range)?;
-    let bytes = read_exact_body(response, range_header, range.len()).await?;
+    let probe = verified_partial_response(&response, range, allow_short_eof)?;
+    let length = range
+        .len()
+        .min(probe.total_bytes.expect("verified total") - range.start);
+    let bytes = read_exact_body(response, range_header, length).await?;
     Ok((bytes, probe))
 }
 
 fn verified_partial_response(
     response: &reqwest::Response,
     requested: ByteRange,
+    allow_short_eof: bool,
 ) -> Result<RangeProbe, MediaRangeError> {
     let content = response
         .headers()
@@ -438,7 +469,10 @@ fn verified_partial_response(
         }) = content
         {
             if start == requested.start
-                && end_inclusive == requested.end_inclusive
+                && (end_inclusive == requested.end_inclusive
+                    || (allow_short_eof
+                        && end_inclusive < requested.end_inclusive
+                        && end_inclusive.checked_add(1) == Some(total)))
                 && total > end_inclusive
             {
                 return Ok(RangeProbe {
@@ -632,45 +666,65 @@ mod tests {
     async fn range_fetch_rejects_ignored_shifted_and_oversized_responses() {
         use std::{io::Read, net::TcpListener};
         let client = reqwest::Client::new();
-        for (wire, expected_error) in [
+        for (wire, strict, opening) in [
             (
                 "200 OK\r\nAccept-Ranges: bytes\r\nContent-Length: 3000000000\r\n\r\n",
+                "range",
                 "range",
             ),
             (
                 "206 Partial Content\r\nContent-Range: bytes 1-1/10\r\nContent-Length: 1\r\n\r\nx",
                 "range",
+                "range",
             ),
             (
                 "206 Partial Content\r\nContent-Range: bytes 0-0/10\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nxx\r\n0\r\n\r\n",
                 "length",
+                "range",
             ),
             (
                 "206 Partial Content\r\nContent-Range: bytes 0-0/10\r\nContent-Length: 1\r\n\r\nx",
                 "ok",
+                "range",
+            ),
+            (
+                "206 Partial Content\r\nContent-Range: bytes 0-0/1\r\nContent-Length: 1\r\n\r\nx",
+                "ok",
+                "ok",
+            ),
+            (
+                "206 Partial Content\r\nContent-Range: bytes 0-0/1\r\nContent-Length: 2\r\n\r\nxx",
+                "length",
+                "length",
             ),
         ] {
-            let server = TcpListener::bind("127.0.0.1:0").unwrap();
-            let mut media = track();
-            media.audio_url = format!("http://{}/media", server.local_addr().unwrap());
-            let worker = std::thread::spawn(move || {
-                let (mut stream, _) = server.accept().unwrap();
-                let mut request = [0; 2048];
-                assert!(stream.read(&mut request).unwrap() > 0);
-                write!(stream, "HTTP/1.1 {wire}").unwrap();
-            });
-            let result = fetch_range_bytes(&client, &media, ByteRange::new(0, 0).unwrap()).await;
-            worker.join().unwrap();
-            match expected_error {
-                "range" => assert!(matches!(
-                    result,
-                    Err(MediaRangeError::UnsupportedRange { .. })
-                )),
-                "length" => assert!(matches!(
-                    result,
-                    Err(MediaRangeError::UnexpectedLength { .. })
-                )),
-                _ => assert_eq!(result.unwrap().0, b"x"),
+            for (is_opening, expected_error) in [(false, strict), (true, opening)] {
+                let server = TcpListener::bind("127.0.0.1:0").unwrap();
+                let mut media = track();
+                media.audio_url = format!("http://{}/media", server.local_addr().unwrap());
+                let worker = std::thread::spawn(move || {
+                    let (mut stream, _) = server.accept().unwrap();
+                    let mut request = [0; 2048];
+                    assert!(stream.read(&mut request).unwrap() > 0);
+                    write!(stream, "HTTP/1.1 {wire}").unwrap();
+                });
+                let result = if is_opening {
+                    fetch_opening_bytes(&client, &media).await
+                } else {
+                    fetch_range_bytes(&client, &media, ByteRange::new(0, 0).unwrap()).await
+                };
+                worker.join().unwrap();
+                match expected_error {
+                    "range" => assert!(matches!(
+                        result,
+                        Err(MediaRangeError::UnsupportedRange { .. })
+                    )),
+                    "length" => assert!(matches!(
+                        result,
+                        Err(MediaRangeError::UnexpectedLength { .. })
+                    )),
+                    _ => assert_eq!(result.unwrap().0, b"x"),
+                }
             }
         }
     }

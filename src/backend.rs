@@ -137,7 +137,7 @@ enum FinishedPlaybackRole {
 
 #[derive(Clone, Default)]
 struct LocalMediaResolver {
-    bilibili_tracks: std::sync::Arc<std::sync::Mutex<HashMap<String, PlaybackTrack>>>,
+    bilibili_tracks: std::sync::Arc<std::sync::Mutex<HashMap<String, (Instant, PlaybackTrack)>>>,
 }
 
 impl LocalMediaResolver {
@@ -146,7 +146,7 @@ impl LocalMediaResolver {
             self.bilibili_tracks
                 .lock()
                 .expect("media cache poisoned")
-                .insert(key, track.clone());
+                .insert(key, (Instant::now(), track.clone()));
         }
     }
 
@@ -177,7 +177,7 @@ impl LocalMediaResolver {
             session_id,
             track.clone(),
             position_ms,
-            async move { cache.playable_track(&http, &shared).await },
+            async move { cache.playable_track(&http, &shared, true).await },
         )
     }
 
@@ -185,6 +185,7 @@ impl LocalMediaResolver {
         &self,
         client: &reqwest::Client,
         track: &PlaybackTrack,
+        remember: bool,
     ) -> Result<PlaybackTrack> {
         let Some(key) = local_media_key(track) else {
             return Ok(track.clone());
@@ -195,7 +196,8 @@ impl LocalMediaResolver {
             .lock()
             .expect("media cache poisoned")
             .get(&key)
-            .cloned()
+            .filter(|(at, _)| at.elapsed() < Duration::from_secs(10 * 60))
+            .map(|(_, media)| media.clone())
         {
             return Ok(merge_local_media(track, &local));
         }
@@ -209,10 +211,12 @@ impl LocalMediaResolver {
                 )
             })?;
         let playable = merge_local_media(track, &resolved);
-        self.bilibili_tracks
-            .lock()
-            .expect("media cache poisoned")
-            .insert(key, resolved);
+        if remember {
+            self.bilibili_tracks
+                .lock()
+                .expect("media cache poisoned")
+                .insert(key, (Instant::now(), resolved));
+        }
         Ok(playable)
     }
 }
@@ -553,6 +557,7 @@ async fn run_network_with_output(
                     };
                     if swarm.room == next { continue; }
                     if let Some(player) = audio_player.as_mut() {
+                        player.clear_queue_prefetch();
                         player.stop();
                         player.drain_events();
                     }
@@ -930,6 +935,17 @@ async fn run_network_with_output(
                 }
             },
             _ = music_local.tick() => {
+                if let Some(player) = audio_player.as_mut() {
+                    let playing_session = music.playback_state()
+                        .filter(|s| s.playing && !buffer_coordinator.is_active() && swarm.room.is_some())
+                        .map(|s| s.session_id.as_str());
+                    player.prefetch_queue(&music.queue, playing_session, &http_client, |track| {
+                        let cache = local_media.clone();
+                        let client = http_client.clone();
+                        let track = track.clone();
+                        async move { cache.playable_track(&client, &track, false).await }
+                    });
+                }
                 if audio_player.is_none()
                     && (music.has_track() || buffer_coordinator.is_active())
                     && Instant::now() >= next_audio_output_retry

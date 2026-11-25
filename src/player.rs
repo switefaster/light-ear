@@ -1,3 +1,5 @@
+mod prefetch;
+
 use std::{
     collections::VecDeque,
     io::{Cursor, Read, Seek, SeekFrom},
@@ -30,7 +32,7 @@ use symphonia::{
 use tokio::sync::mpsc;
 
 use crate::{
-    core::{PlaybackCacheStatus, PlaybackCacheView, PlaybackTrack},
+    core::{PlaybackCacheStatus, PlaybackCacheView, PlaybackTrack, QueueItem},
     media_cache,
 };
 
@@ -55,6 +57,7 @@ pub struct AudioPlayer {
     session_id: Option<String>,
     audio: Option<DecodedAudio>,
     streaming: Option<StreamingSession>,
+    queue_prefetch: prefetch::QueuePrefetch,
     position_ms: u64,
     started_at_micros: i64,
     playing: bool,
@@ -103,6 +106,7 @@ struct StreamingMediaSource {
     shared: SharedBytes,
     decoder: DecodeToken,
     cursor: u64,
+    seekable: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -234,6 +238,7 @@ impl AudioPlayer {
             session_id: None,
             audio: None,
             streaming: None,
+            queue_prefetch: prefetch::QueuePrefetch::default(),
             position_ms: 0,
             started_at_micros: 0,
             playing: false,
@@ -304,6 +309,42 @@ impl AudioPlayer {
         self.playing
     }
 
+    pub(crate) fn prefetch_queue<
+        F: std::future::Future<Output = Result<PlaybackTrack>> + Send + 'static,
+    >(
+        &mut self,
+        queue: &VecDeque<QueueItem>,
+        playing_session: Option<&str>,
+        client: &reqwest::Client,
+        resolve: impl FnOnce(&PlaybackTrack) -> F,
+    ) {
+        if queue.is_empty() {
+            self.clear_queue_prefetch();
+            return;
+        }
+        let allowed = self.playing
+            && self.streaming.as_ref().is_some_and(|s| {
+                if playing_session != Some(&s.session_id) {
+                    return false;
+                }
+                let position = s.position_ms.load(Ordering::Relaxed);
+                let (start, end) = stream_pcm_cache_window(&s.pcm, s.duration_ms);
+                start <= position
+                    && end > position
+                    && (end >= position.saturating_add(media_cache::HIGH_WATERMARK_MS)
+                        || media_cache::covers_track_end(end, s.duration_ms, s.pcm.is_complete()))
+            });
+        self.queue_prefetch.update(queue, allowed, |track| {
+            let media = resolve(track);
+            let client = client.clone();
+            async move { prefetch::Opening::fetch(client, media.await?).await }
+        });
+    }
+
+    pub(crate) fn clear_queue_prefetch(&mut self) {
+        self.queue_prefetch = prefetch::QueuePrefetch::default();
+    }
+
     pub fn set_volume(&mut self, percent: u8, _now_micros: i64) -> Result<()> {
         let gain = volume_percent_to_gain(percent);
         let old = f32::from_bits(self.volume.load(Ordering::Relaxed));
@@ -370,6 +411,7 @@ impl AudioPlayer {
         position_ms: u64,
         media: impl std::future::Future<Output = Result<PlaybackTrack>> + Send + 'static,
     ) -> Result<()> {
+        self.queue_prefetch.pause();
         let position_ms = position_ms.min(track.duration_ms);
         if let Some(session) = self.streaming.as_mut().filter(|session| {
             session.session_id == session_id && session.track_id == track.track_id
@@ -451,7 +493,13 @@ impl AudioPlayer {
         self.started_at_micros = 0;
         self.playing = false;
 
+        let opening = if position_ms == 0 {
+            self.queue_prefetch.take(&track)
+        } else {
+            None
+        };
         let bytes = SharedBytes::new();
+        let warmed_media = opening.map(|opening| opening.install(&bytes));
         let pcm = SharedPcm::new();
         let decoder = DecodeToken::new();
         let position = Arc::new(AtomicU64::new(self.position_ms));
@@ -471,6 +519,8 @@ impl AudioPlayer {
         let event_tx = self.event_tx.clone();
         let download_client = client.clone();
         let download_track = track.clone();
+        // Local resolution can select DASH even when the requester received progressive video.
+        let decode_track = warmed_media.as_ref().cloned().unwrap_or(track);
         let download_bytes = bytes.clone();
         let download_fail_bytes = bytes.clone();
         let download_operation_id = operation_id.clone();
@@ -479,7 +529,10 @@ impl AudioPlayer {
         let download_position = Arc::clone(&position);
         tokio::spawn(async move {
             let result = async {
-                let playable = media.await?;
+                let playable = match warmed_media {
+                    Some(playable) => playable,
+                    None => media.await?,
+                };
                 if download_bytes.is_canceled() {
                     return Ok(());
                 }
@@ -525,7 +578,7 @@ impl AudioPlayer {
                 decode_tx,
                 operation_id,
                 session_id,
-                track,
+                decode_track,
                 position_ms,
                 decode_position,
             );
@@ -1462,6 +1515,7 @@ impl StreamingMediaSource {
             shared,
             decoder,
             cursor: 0,
+            seekable: Arc::new(AtomicBool::new(true)),
         }
     }
 }
@@ -1497,7 +1551,7 @@ impl Seek for StreamingMediaSource {
 
 impl MediaSource for StreamingMediaSource {
     fn is_seekable(&self) -> bool {
-        true
+        self.seekable.load(Ordering::Relaxed)
     }
 
     fn byte_len(&self) -> Option<u64> {
@@ -1608,13 +1662,18 @@ impl SharedBytes {
     }
 
     fn append(&self, bytes: &[u8], range: media_cache::ByteRange) {
+        self.append_chunk(StreamingByteChunk {
+            range,
+            bytes: Arc::from(bytes),
+        });
+    }
+
+    fn append_chunk(&self, chunk: StreamingByteChunk) {
         let (lock, condvar) = &*self.inner;
         let mut state = lock.lock().expect("streaming bytes lock poisoned");
-        if !bytes.is_empty() && !state.ranges.covers(range) {
-            state.chunks.push(StreamingByteChunk {
-                range,
-                bytes: Arc::from(bytes),
-            });
+        let range = chunk.range;
+        if !chunk.bytes.is_empty() && !state.ranges.covers(range) {
+            state.chunks.push(chunk);
             state.chunks.sort_by_key(|chunk| chunk.range.start);
             state.ranges.insert(range);
         }
@@ -1704,6 +1763,14 @@ impl SharedBytes {
         lock.lock()
             .expect("streaming bytes lock poisoned")
             .total_bytes
+    }
+
+    fn has_opening_index(&self) -> bool {
+        let state = self.inner.0.lock().expect("streaming bytes lock poisoned");
+        state
+            .chunks
+            .first()
+            .is_some_and(|chunk| chunk.range.start == 0 && has_front_loaded_mp4_index(&chunk.bytes))
     }
 
     fn covers(&self, range: media_cache::ByteRange) -> bool {
@@ -2203,23 +2270,29 @@ async fn download_streaming_bytes(
     session_id: String,
 ) -> Result<()> {
     let mut request_pacer = StreamRequestPacer::new();
-    let probe = probe_stream_range_with_retry(
-        &client,
-        &track,
-        &shared,
-        &mut request_pacer,
-        &event_tx,
-        operation_id.as_deref(),
-        &session_id,
-    )
-    .await?;
-    let total = probe
-        .total_bytes
-        .ok_or_else(|| anyhow!("media range probe did not report total length"))?;
-    shared.set_total(Some(total));
+    let opening_total = shared.total_bytes();
+    let total = if let Some(total) = opening_total {
+        total
+    } else {
+        let probe = probe_stream_range_with_retry(
+            &client,
+            &track,
+            &shared,
+            &mut request_pacer,
+            &event_tx,
+            operation_id.as_deref(),
+            &session_id,
+        )
+        .await?;
+        let total = probe
+            .total_bytes
+            .ok_or_else(|| anyhow!("media range probe did not report total length"))?;
+        shared.set_total(Some(total));
+        total
+    };
 
     let metadata_ranges = media_cache::metadata_ranges(&track, total);
-    if should_full_fetch_missing_metadata(&metadata_ranges, total) {
+    if opening_total.is_none() && should_full_fetch_missing_metadata(&metadata_ranges, total) {
         let bytes = fetch_full_media_with_retry(
             &client,
             &track,
@@ -2255,7 +2328,9 @@ async fn download_streaming_bytes(
     );
     shared.prioritize_offset(initial_window.start);
 
-    let mut downloaded = 0u64;
+    let mut downloaded = opening_total
+        .unwrap_or(0)
+        .min(media_cache::STREAM_CHUNK_BYTES);
     let mut prefetch_paused = false;
     loop {
         if shared.is_canceled() {
@@ -2560,6 +2635,32 @@ fn decode_streaming_audio(
     }
 }
 
+// Only select incremental MP4 opening when the complete file type, movie header
+// and segment index are present before the first fragment. Other layouts use the
+// usual seekable probe, including files with a trailing movie header.
+fn has_front_loaded_mp4_index(mut prefix: &[u8]) -> bool {
+    let mut has_ftyp = false;
+    let mut has_moov = false;
+    for _ in 0..64 {
+        if prefix.len() < 8 {
+            return false;
+        }
+        let size = u32::from_be_bytes(prefix[..4].try_into().unwrap()) as usize;
+        if size < 8 || size > prefix.len() {
+            return false;
+        }
+        match &prefix[4..8] {
+            b"ftyp" => has_ftyp = true,
+            b"moov" => has_moov = true,
+            b"sidx" => return has_ftyp && has_moov,
+            b"moof" | b"mdat" => return false,
+            _ => {}
+        }
+        prefix = &prefix[size..];
+    }
+    false
+}
+
 fn decode_streaming_audio_inner(
     bytes: SharedBytes,
     pcm: SharedPcm,
@@ -2571,17 +2672,29 @@ fn decode_streaming_audio_inner(
     position_ms: u64,
     playback_position: Arc<AtomicU64>,
 ) -> Result<()> {
-    let source = StreamingMediaSource::new(bytes.clone(), decoder_token.clone());
-    let mss = MediaSourceStream::new(Box::new(source), Default::default());
-
     let mut hint = Hint::new();
     hint.with_extension("m4a");
 
     let format_opts = FormatOptions::default();
     let metadata_opts = MetadataOptions::default();
-    let probed = get_probe()
-        .format(&hint, mss, &format_opts, &metadata_opts)
-        .context("failed to probe streaming audio format")?;
+    // Symphonia's seekable MP4 probe scans fragments to the end of the file.
+    // Stream through the opening index when it is already available locally.
+    let open = |incremental: bool| {
+        let source = StreamingMediaSource::new(bytes.clone(), decoder_token.clone());
+        let seekable = source.seekable.clone();
+        seekable.store(!incremental, Ordering::Relaxed);
+        let mss = MediaSourceStream::new(Box::new(source), Default::default());
+        let result = get_probe().format(&hint, mss, &format_opts, &metadata_opts);
+        // Once open, packet reads still have full access to HTTP Range seeks.
+        seekable.store(true, Ordering::Relaxed);
+        result
+    };
+    let probed = if position_ms == 0 && !track.media_is_progressive && bytes.has_opening_index() {
+        open(true).or_else(|_| open(false))
+    } else {
+        open(false)
+    }
+    .context("failed to probe streaming audio format")?;
 
     let mut format = probed.format;
     let track_info = format
@@ -2798,11 +2911,42 @@ mod tests {
     #[tokio::test]
     #[ignore = "reads a public Bilibili audio stream"]
     async fn live_bilibili_prepares_playable_audio_window() -> Result<()> {
+        let (client, track) = live_bilibili_track().await?;
+        live_bilibili_window(client, track, false).await.map(|_| ())
+    }
+
+    #[tokio::test]
+    #[ignore = "reads a public Bilibili audio stream"]
+    async fn live_bilibili_prefetched_opening_matches_cold_audio() -> Result<()> {
+        let (client, track) = live_bilibili_track().await?;
+        let cold = live_bilibili_window(client.clone(), track.clone(), false).await?;
+        let warm = live_bilibili_window(client, track, true).await?;
+        assert!(!cold.is_empty() && cold == warm, "opening PCM differs");
+        Ok(())
+    }
+
+    async fn live_bilibili_track() -> Result<(reqwest::Client, PlaybackTrack)> {
         let client = crate::bilibili::client()?;
         let bvid = std::env::var("LIGHT_EAR_TEST_BVID").unwrap_or_else(|_| "BV1xx411c7mD".into());
         let track = crate::bilibili::resolve_track(&client, &bvid, 0).await?;
+        Ok((client, track))
+    }
+
+    async fn live_bilibili_window(
+        client: reqwest::Client,
+        track: PlaybackTrack,
+        prefetched: bool,
+    ) -> Result<Vec<f32>> {
+        let bvid = track.bvid.clone();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let bytes = SharedBytes::new();
+        let track = if prefetched {
+            prefetch::Opening::fetch(client.clone(), track)
+                .await?
+                .install(&bytes)
+        } else {
+            track
+        };
         let decoder = DecodeToken::new();
         let position = Arc::new(AtomicU64::new(0));
         let download = download_streaming_bytes(
@@ -2819,10 +2963,13 @@ mod tests {
         let token = decoder.clone();
         let duration = track.duration_ms;
         let progressive = track.media_is_progressive;
+        let pcm = SharedPcm::new();
+        let output = pcm.clone();
+        let started = Instant::now();
         let decode = tokio::task::spawn_blocking(move || {
             decode_streaming_audio(
                 input,
-                SharedPcm::new(),
+                output,
                 token,
                 tx,
                 None,
@@ -2832,7 +2979,6 @@ mod tests {
                 position,
             )
         });
-        let started = Instant::now();
         let result = tokio::select! {
             r = download => r.and_then(|_| Err(anyhow!("download stopped before readiness"))),
             _ = tokio::time::sleep(Duration::from_secs(75)) => Err(anyhow!("audio prepare timed out")),
@@ -2847,16 +2993,46 @@ mod tests {
                 bail!("decoder closed before readiness")
             } => result,
         };
+        let elapsed = started.elapsed();
         decoder.cancel();
         bytes.cancel();
         decode.await?;
         let ready = result?;
         eprintln!(
-            "{bvid}: {duration} ms track, progressive {progressive}, {ready} ms ready in {:?}",
-            started.elapsed()
+            "{bvid}: {duration} ms track, progressive {progressive}, prefetched {prefetched}, {ready} ms ready in {:?}",
+            elapsed
         );
         assert!(ready >= media_cache::READY_WINDOW_MS.min(duration));
-        Ok(())
+        let state = pcm.inner.0.lock().unwrap();
+        let frames = media_cache::READY_WINDOW_MS.min(duration)
+            * u64::from(state.sample_rate.unwrap().get())
+            / 1000;
+        let n = frames as usize * usize::from(state.channels.unwrap().get());
+        Ok(state.samples[..n].to_vec())
+    }
+
+    #[test]
+    fn incremental_mp4_opening_requires_complete_headers_before_audio() {
+        let ftyp: &[u8] = b"\0\0\0\x08ftyp";
+        let moov: &[u8] = b"\0\0\0\x08moov";
+        let sidx: &[u8] = b"\0\0\0\x08sidx";
+        let mdat: &[u8] = b"\0\0\0\x08mdat";
+        let fragment: &[u8] = b"\0\0\0\x08moof";
+        assert!(has_front_loaded_mp4_index(
+            &[ftyp, moov, sidx, fragment].concat()
+        ));
+        for atoms in [
+            vec![ftyp, sidx],
+            vec![ftyp, moov],
+            vec![ftyp, moov, mdat, sidx],
+            vec![ftyp, fragment, moov, sidx],
+            vec![ftyp, moov, b"\0\0\0\x10sidx"],
+            vec![ftyp, moov, b"\0\0\0\x01sidx"],
+            vec![ftyp, moov, b"\0\0\0\x07free", sidx],
+            vec![ftyp, moov, b"\0\0\0\x10free", sidx],
+        ] {
+            assert!(!has_front_loaded_mp4_index(&atoms.concat()));
+        }
     }
 
     #[test]

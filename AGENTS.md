@@ -41,6 +41,7 @@ boundaries:
 - `npm.cmd run build`
 - AAC enhancement/release parity check: `cargo check --features fdk-aac-decoder`
 - Optional live Bilibili playback check: `cargo test --lib live_bilibili_prepares_playable_audio_window -- --ignored --nocapture`. Set `LIGHT_EAR_TEST_BVID` to test another public video.
+- To compare cold and prefetched preparation time and verify the decoded opening matches sample for sample, run `cargo test --lib --features fdk-aac-decoder live_bilibili_prefetched_opening_matches_cold_audio -- --ignored --nocapture`.
 
 For relay promotion policy or rendezvous behavior, include
 `cargo check --bin light-ear-relay`. For desktop bridge work, include the Tauri
@@ -160,6 +161,12 @@ Keep their real libp2p transports and run the full suite with both decoder confi
 - Cache progress is local UI state. `PlaybackCache` is sent to the desktop to
   render local cached/decoded progress and must not be mirrored into
   `PlaybackState`.
+- Queue lookahead is local to each listener. Keep one speculative request sequence
+  active across the next two items and at most one 2 MiB opening per item. Give
+  active playback and seeks priority. Only normal session-scoped decoding can
+  report buffer readiness. Discard obsolete openings on queue edits and room changes.
+  Allow incremental DASH demux at position zero when the cached opening contains
+  the MP4 movie header and segment index before the first fragment or payload.
 - Music download, decode, or playback-sync failures must converge explicitly
   instead of leaving a peer in fake playback. A leader failure should
   publish cancel/idle for the affected session and then try the next queued
