@@ -243,6 +243,8 @@ pub enum FrontendEvent {
     PeerCount(usize),
     LocalPeerId(String),
     History(Vec<ChatRecord>),
+    /// A newly accepted live chat from another peer in the joined room.
+    IncomingChat,
     Playback(Option<PlaybackView>),
     PlaybackCache(Option<PlaybackCacheView>),
     PlaybackBuffer(Option<PlaybackBufferView>),

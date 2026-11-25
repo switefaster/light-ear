@@ -259,6 +259,9 @@ Keep their real libp2p transports and run the full suite with both decoder confi
   may auto-follow only while the user is already near the latest message. The
   chat composer should handle IME composition correctly on Linux/WebKit as well
   as Windows.
+- Native taskbar and Dock progress follows the playback view. Only a newly
+  inserted live chat from another peer can mark the minimized window unread.
+  Clear the hint on focus, room change, and backend shutdown.
 - Clipboard-based Bilibili auto-fill should use the Tauri clipboard-manager
   command first and fall back to the WebView `navigator.clipboard` API only if
   the command fails. On Linux, clipboard reads must not run on the main thread.

@@ -3501,6 +3501,9 @@ async fn apply_chat_message(
     let inserted = insert_record(ctx.history, ctx.seen_messages, record);
     if inserted {
         send_history_snapshot(ui, ctx.history).await;
+        if claimed_peer_id != ctx.local_peer_id {
+            let _ = ui.send(UiEvent::IncomingChat).await;
+        }
     }
     inserted
 }
@@ -7667,16 +7670,27 @@ mod tests {
             .await
             .with(libp2p::multiaddr::Protocol::P2p(alice_peer_id));
 
+        let earlier = "sent before bob joined";
+        alice
+            .commands
+            .send(NetworkCommand::Chat(earlier.into()))
+            .await
+            .unwrap();
+        wait_for_history_text(&mut alice, earlier).await;
         let mut bob = spawn_test_backend(
             "bob",
             &topic,
             vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
             vec![alice_addr],
         );
-        let _bob_peer_id = wait_for_local_peer(&mut bob).await;
-
-        wait_for_peer_count(&mut alice, 1).await;
-        wait_for_peer_count(&mut bob, 1).await;
+        // Wait for the history response so both directions are subscribed before
+        // testing live delivery. Replaying the existing record must stay quiet.
+        bob.recv_matching(Duration::from_secs(20), |event| match event {
+            UiEvent::IncomingChat => panic!("backfilled history raised a new-message hint"),
+            UiEvent::History(records) if records.iter().any(|r| r.text == earlier) => Some(()),
+            _ => None,
+        })
+        .await;
 
         let text = "hello from loopback smoke";
         alice
@@ -7685,8 +7699,23 @@ mod tests {
             .await
             .expect("alice command channel open");
 
-        wait_for_history_text(&mut alice, text).await;
-        wait_for_history_text(&mut bob, text).await;
+        alice
+            .recv_matching(Duration::from_secs(8), |event| match event {
+                UiEvent::IncomingChat => panic!("local message raised a new-message hint"),
+                UiEvent::History(records) if records.iter().any(|r| r.text == text) => Some(()),
+                _ => None,
+            })
+            .await;
+        bob.recv_matching(Duration::from_secs(8), |event| match event {
+            UiEvent::IncomingChat => panic!("unexpected hint before live chat delivery"),
+            UiEvent::History(records) if records.iter().any(|r| r.text == text) => Some(()),
+            _ => None,
+        })
+        .await;
+        bob.recv_matching(Duration::from_secs(8), |event| {
+            matches!(event, UiEvent::IncomingChat).then_some(())
+        })
+        .await;
 
         alice.abort();
         bob.abort();

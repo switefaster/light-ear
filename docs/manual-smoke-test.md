@@ -72,6 +72,16 @@ Capture on failure:
 - Last history-related log entries.
 - Whether peer overview showed the expected target peer as chat `ready`.
 
+### Minimized window
+
+During playback, minimize peer B's window. From A, send a new chat, pause the
+song, then seek and resume. B's taskbar or Dock should show the track position
+and a separate message hint. Windows shows a dot. macOS and supported Linux
+launchers show a count. Bringing B back into focus clears the hint. Progress
+should follow the seek, hold while paused, and clear when playback stops.
+Switch rooms and check that both indicators clear. Joining a room with
+existing chat history should leave the badge clear.
+
 ## Queue Rules
 
 1. Peer A enqueues a Bilibili track.

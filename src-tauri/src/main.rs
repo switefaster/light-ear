@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod taskbar;
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -11,7 +13,7 @@ use std::{
 use libp2p::Multiaddr;
 use light_ear::{
     backend::{self, BackendConfig},
-    core::NetworkCommand,
+    core::{FrontendEvent, NetworkCommand},
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
@@ -156,6 +158,11 @@ async fn start_backend(
         relay: parse_multiaddrs(config.relay)?,
         no_mdns: config.no_mdns,
     };
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window unavailable".to_string())?
+        .as_ref()
+        .window();
 
     let (command_tx, command_rx) = mpsc::channel(64);
     let (event_tx, mut event_rx) = mpsc::channel(256);
@@ -175,15 +182,21 @@ async fn start_backend(
         let local = tokio::task::LocalSet::new();
         local.block_on(&runtime, async move {
             let event_app = app.clone();
-            tokio::task::spawn_local(async move {
+            let forward_events = tokio::task::spawn_local(async move {
+                let mut taskbar = taskbar::Taskbar::default();
                 while let Some(event) = event_rx.recv().await {
-                    let _ = event_app.emit("backend-event", event);
+                    taskbar.observe(&window, &event);
+                    if !matches!(event, FrontendEvent::IncomingChat) {
+                        let _ = event_app.emit("backend-event", event);
+                    }
                 }
+                taskbar.clear(&window);
             });
 
             if let Err(err) = backend::run_network(backend_config, command_rx, event_tx).await {
                 let _ = app.emit("backend-error", format!("{err:#}"));
             }
+            let _ = forward_events.await;
         });
     });
 
@@ -563,12 +576,13 @@ fn main() {
     tauri::Builder::default()
         .manage(BackendState::default())
         .manage(UpdaterState::default())
+        .manage(taskbar::UnreadCount::default())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .on_window_event(|window, event| {
-            if !matches!(event, WindowEvent::CloseRequested { .. }) {
-                return;
+            if window.label() == "main" && matches!(event, WindowEvent::Focused(true)) {
+                taskbar::on_focus(window);
             }
 
             let WindowEvent::CloseRequested { api, .. } = event else {
