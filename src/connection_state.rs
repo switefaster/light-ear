@@ -783,6 +783,13 @@ pub(crate) fn normalize_peer_address(peer_id: PeerId, address: Multiaddr) -> Opt
     if is_unspecified_ip_address(&address) {
         return None;
     }
+    if is_relay_address(&address) {
+        let base = circuit_relay_endpoint(&address)?;
+        if peer_id_from_multiaddr(&base) == Some(peer_id) {
+            return None;
+        }
+        return address.with_p2p(peer_id).ok();
+    }
 
     let last_peer_id = address
         .iter()
@@ -830,6 +837,24 @@ pub(crate) fn is_relay_address(address: &Multiaddr) -> bool {
         .any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::P2pCircuit))
 }
 
+/// The server transport address, including its peer ID, from a one-hop circuit.
+pub(crate) fn circuit_relay_endpoint(address: &Multiaddr) -> Option<Multiaddr> {
+    use libp2p::multiaddr::Protocol;
+    let mut base = address.clone();
+    if matches!(base.iter().last(), Some(Protocol::P2p(_))) {
+        base.pop();
+    }
+    if base.pop() == Some(Protocol::P2pCircuit)
+        && matches!(base.iter().last(), Some(Protocol::P2p(_)))
+        && !is_relay_address(&base)
+        && !is_unspecified_ip_address(&base)
+    {
+        Some(base)
+    } else {
+        None
+    }
+}
+
 fn is_unspecified_ip_address(address: &Multiaddr) -> bool {
     address.iter().any(|protocol| match protocol {
         libp2p::multiaddr::Protocol::Ip4(address) => address.is_unspecified(),
@@ -870,6 +895,33 @@ mod tests {
 
     fn bare_addr(port: u16) -> Multiaddr {
         format!("/ip4/192.0.2.10/tcp/{port}").parse().unwrap()
+    }
+
+    #[test]
+    fn circuit_candidates_distinguish_relay_and_destination() {
+        use libp2p::multiaddr::Protocol;
+        let relay = peer_id();
+        let target = peer_id();
+        let base = addr(relay, 4001);
+        let bare = base.clone().with(Protocol::P2pCircuit);
+        let full = bare.clone().with(Protocol::P2p(target));
+        assert_eq!(circuit_relay_endpoint(&full), Some(base.clone()));
+        assert_eq!(circuit_relay_endpoint(&bare), Some(base.clone()));
+        assert_eq!(circuit_relay_endpoint(&base), None);
+        assert_eq!(
+            normalize_peer_address(target, bare.clone()),
+            Some(full.clone())
+        );
+        assert_eq!(
+            normalize_peer_address(target, full.clone()),
+            Some(full.clone())
+        );
+        assert_eq!(normalize_peer_address(peer_id(), full.clone()), None);
+        assert_eq!(normalize_peer_address(relay, bare), None);
+        assert_eq!(
+            normalize_peer_address(target, full.with(Protocol::P2pCircuit)),
+            None
+        );
     }
 
     fn status_text(effects: &[ConnectionEffect]) -> Vec<&str> {

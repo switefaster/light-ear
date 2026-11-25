@@ -8,6 +8,7 @@ pub const NAMESPACE: &str = "light-ear.network.v2";
 pub const MAX_PEERS: usize = 512;
 const TTL: u64 = 90;
 const PAGE: usize = 8;
+const MAX_ADDRESSES: usize = 8;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Link {
@@ -57,7 +58,7 @@ impl Signed {
         r.issued <= now.saturating_add(5)
             && r.issued.saturating_add(TTL) > now
             && r.room.as_deref().is_none_or(valid_room)
-            && r.addresses.len() <= 8
+            && r.addresses.len() <= MAX_ADDRESSES
             && r.addresses
                 .iter()
                 .all(|a| a.len() <= 512 && a.parse::<Multiaddr>().is_ok_and(|a| shareable(&a)))
@@ -82,6 +83,20 @@ pub fn valid_room(room: &str) -> bool {
 }
 pub fn room_topic(room: &str) -> libp2p::gossipsub::IdentTopic {
     libp2p::gossipsub::IdentTopic::new(format!("light-ear.room.v2/{room}"))
+}
+pub fn presence_addresses<'a>(addrs: impl Iterator<Item = &'a Multiaddr>) -> Vec<String> {
+    let (circuits, direct): (BTreeSet<_>, BTreeSet<_>) = addrs
+        .filter(|a| shareable(a))
+        .partition(|a| crate::connection_state::is_relay_address(a));
+    // Keep one advertised reservation even on hosts with many public interfaces.
+    circuits
+        .iter()
+        .take(1)
+        .chain(&direct)
+        .chain(circuits.iter().skip(1))
+        .take(MAX_ADDRESSES)
+        .map(ToString::to_string)
+        .collect()
 }
 pub fn shareable(addr: &Multiaddr) -> bool {
     // LAN candidates stay in the local mDNS table. Gossip only public IP literals.
@@ -288,5 +303,30 @@ mod tests {
             assert!(!shareable(&a.parse().unwrap()));
         }
         assert!(shareable(&"/ip4/1.1.1.1/tcp/42".parse().unwrap()));
+    }
+
+    #[test]
+    fn presence_keeps_a_public_reservation_among_many_direct_listeners() {
+        let server = identity::Keypair::generate_ed25519().public().to_peer_id();
+        let mut addrs: Vec<Multiaddr> = (1..=12)
+            .map(|port| format!("/ip4/1.1.1.1/tcp/{port}").parse().unwrap())
+            .collect();
+        let public: Multiaddr = format!("/ip4/8.8.8.8/tcp/42/p2p/{server}/p2p-circuit")
+            .parse()
+            .unwrap();
+        let private: Multiaddr = format!("/ip4/192.168.1.2/tcp/42/p2p/{server}/p2p-circuit")
+            .parse()
+            .unwrap();
+        addrs.extend([public.clone(), public.clone(), private.clone()]);
+        let advertised = presence_addresses(addrs.iter());
+        assert_eq!(advertised.len(), MAX_ADDRESSES);
+        assert_eq!(
+            advertised
+                .iter()
+                .filter(|a| **a == public.to_string())
+                .count(),
+            1
+        );
+        assert!(!advertised.contains(&private.to_string()));
     }
 }

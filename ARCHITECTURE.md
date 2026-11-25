@@ -167,6 +167,8 @@ Current rules:
 - Relay-only peers wait for chat subscription readiness or gossipsub warmup timeout before direct promotion.
 - Direct dial failure and DCUtR failure update the same backoff.
 - Direct failure must not close relay routes.
+- Clients reserve inbound capacity at configured relays and up to two relays learned from circuit seeds or established outbound circuits. A closed reservation listener is retried with bounded backoff. Public reservations are included in signed presence even when the peer has many direct addresses.
+- After a bridge disappears, clients try direct introductions and independently schedule bounded circuit repairs for unreachable room members and previously reachable discovery peers. This also reconnects browsers before they join a room. A repair can use the destination's advertised reservation or try its peer ID at a locally known relay. The two endpoints stagger their attempts so the opposite direction can recover a one-sided reservation. Private relay addresses stay local.
 - A newly established direct route does not immediately close relay. Circuit retirement requires a verified alternative. The overlay observes the underlying connection for inbound gossipsub deliveries and probes for a replacement path.
 - If direct drops during handoff grace, the relay route remains the reliability path.
 - Early direct connections before warmup readiness may be closed directly, but this should close only that direct connection, not the relay route.

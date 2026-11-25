@@ -38,8 +38,8 @@ use crate::{
     },
     connection_state::{
         ConnectionEffect, ConnectionState, DIRECT_PROMOTION_RETRY_INTERVAL,
-        GOSSIP_WARMUP_CHECK_INTERVAL, RelayCloseReason, is_relay_address, normalize_peer_address,
-        peer_id_from_multiaddr, prioritize_multiaddrs,
+        GOSSIP_WARMUP_CHECK_INTERVAL, RelayCloseReason, circuit_relay_endpoint, is_relay_address,
+        normalize_peer_address, peer_id_from_multiaddr, prioritize_multiaddrs,
     },
     core::{
         ChatRecord, FrontendEvent as UiEvent, MAX_MESSAGES, NetworkCommand, PeerNameClaim,
@@ -419,8 +419,20 @@ async fn run_network_with_output(
         .build();
 
     let mut swarm = Network::new(swarm, key, initial_room);
+    for endpoint in &relay_addrs {
+        if let Some(id) = swarm.remember_relay(endpoint.clone(), true) {
+            rendezvous_nodes.insert(id);
+        } else {
+            send_status(&ui, format!("invalid relay endpoint {endpoint}: expected a server address ending in its /p2p peer ID")).await;
+        }
+    }
     for addr in &config.peer {
         swarm.remember_seed(addr.clone());
+        if let Some(id) =
+            circuit_relay_endpoint(addr).and_then(|relay| swarm.remember_relay(relay, false))
+        {
+            rendezvous_nodes.insert(id);
+        }
     }
     let mut overlay_tick = time::interval(Duration::from_millis(500));
     let local_peer_id = *swarm.local_peer_id();
@@ -450,38 +462,15 @@ async fn run_network_with_output(
         }
     }
 
-    for relay_addr in relay_addrs.iter().cloned() {
-        let rendezvous_peer = peer_id_from_multiaddr(&relay_addr);
-        if let Some(peer_id) = rendezvous_peer {
-            rendezvous_nodes.insert(peer_id);
-        } else {
-            send_status(
-                &ui,
-                format!("relay address has no /p2p peer id; rendezvous disabled for {relay_addr}"),
-            )
-            .await;
-        }
-
-        let circuit_addr = relay_addr.with(libp2p::multiaddr::Protocol::P2pCircuit);
-        match swarm.listen_on(circuit_addr.clone()) {
-            Ok(_) => {
-                send_status(
-                    &ui,
-                    format!("requesting relay reservation via {circuit_addr}"),
-                )
-                .await
-            }
-            Err(err) => {
-                send_status(
-                    &ui,
-                    format!("relay reservation request failed {circuit_addr}: {err}"),
-                )
-                .await
-            }
-        }
-    }
-
     for peer in prioritize_multiaddrs(config.peer) {
+        // The relay transport can cancel a circuit dial if it races the first
+        // reservation dial to the same server. Start these seeds on connection.
+        if circuit_relay_endpoint(&peer)
+            .and_then(|base| peer_id_from_multiaddr(&base))
+            .is_some_and(|server| rendezvous_nodes.contains(&server))
+        {
+            continue;
+        }
         match swarm.dial(peer.clone()) {
             Ok(_) => send_status(&ui, format!("dialing peer {peer}")).await,
             Err(err) => send_status(&ui, format!("peer dial failed {peer}: {err}")).await,
@@ -1356,7 +1345,7 @@ async fn run_network_with_output(
                     &mut swarm,
                     &ui,
                     &mut connections,
-                    &rendezvous_nodes,
+                    &mut rendezvous_nodes,
                     &rendezvous_namespace,
                     &mut rendezvous_cookies,
                     &mut zero_peer_recovery,
@@ -1510,17 +1499,25 @@ async fn handle_swarm_event(
     swarm: &mut Network,
     ui: &mpsc::Sender<UiEvent>,
     connections: &mut ConnectionState,
-    rendezvous_nodes: &HashSet<PeerId>,
+    rendezvous_nodes: &mut HashSet<PeerId>,
     rendezvous_namespace: &rendezvous::Namespace,
     rendezvous_cookies: &mut HashMap<PeerId, rendezvous::Cookie>,
     zero_peer_recovery: &mut ZeroPeerRecovery,
     mut ctx: HistoryContext<'_>,
 ) {
     match event {
-        SwarmEvent::NewListenAddr { address, .. } => {
+        SwarmEvent::NewListenAddr {
+            listener_id,
+            address,
+        } => {
+            swarm.reservation_listening(listener_id);
+            swarm.listen_address_changed(&address);
             send_status(ui, format!("listening on {address}")).await;
         }
+        SwarmEvent::ExpiredListenAddr { address, .. } => swarm.listen_address_changed(&address),
+        SwarmEvent::ListenerClosed { listener_id, .. } => swarm.reservation_closed(listener_id),
         SwarmEvent::ExternalAddrConfirmed { address } => {
+            swarm.listen_address_changed(&address);
             send_status(ui, format!("confirmed external address {address}")).await;
             if is_relay_address(&address) {
                 register_with_rendezvous_nodes(swarm, rendezvous_nodes, rendezvous_namespace, ui)
@@ -1528,6 +1525,7 @@ async fn handle_swarm_event(
             }
         }
         SwarmEvent::ExternalAddrExpired { address } => {
+            swarm.listen_address_changed(&address);
             send_status(ui, format!("expired external address {address}")).await;
         }
         SwarmEvent::ConnectionEstablished {
@@ -1538,6 +1536,11 @@ async fn handle_swarm_event(
         } => {
             let is_relayed =
                 endpoint.is_relayed() || is_relay_address(endpoint.get_remote_address());
+            if let Some(id) = circuit_relay_endpoint(endpoint.get_remote_address())
+                .and_then(|relay| swarm.remember_relay(relay, false))
+            {
+                rendezvous_nodes.insert(id);
+            }
             if !rendezvous_nodes.contains(&peer_id) {
                 swarm.link(peer_id, connection_id, Some(!is_relayed));
             }
@@ -1551,6 +1554,7 @@ async fn handle_swarm_event(
             apply_connection_effects(swarm, connections, ui, rendezvous_nodes, effects).await;
 
             if rendezvous_nodes.contains(&peer_id) {
+                swarm.dial_relay_seeds(peer_id);
                 register_with_rendezvous_node(swarm, peer_id, rendezvous_namespace, ui).await;
                 discover_rendezvous_node(
                     swarm,
@@ -7146,8 +7150,7 @@ mod tests {
         assert!(normalize_direct_peer_address(peer, relay_addr).is_none());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn circuit_handoff_and_recovery_across_a_peer_bridge() {
+    async fn test_relay_server() -> (Multiaddr, JoinHandle<()>) {
         let mut relay = SwarmBuilder::with_new_identity()
             .with_tokio()
             .with_tcp(
@@ -7175,6 +7178,106 @@ mod tests {
                 let _ = relay.select_next_some().await;
             }
         });
+        (endpoint, server)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn relay_only_peers_reconnect_after_their_only_bridge_exits() {
+        check_relay_bridge_loss("relay-only").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn browsers_recover_discovery_after_their_only_relayed_bridge_exits() {
+        check_relay_bridge_loss("").await;
+    }
+
+    async fn check_relay_bridge_loss(initial_room: &str) {
+        let (relay, server) = test_relay_server().await;
+        let config = |name: &str, relay, peer| BackendConfig {
+            name: name.into(),
+            topic: initial_room.into(),
+            // No usable direct listeners or rendezvous service in this fixture.
+            listen: vec!["/memory/1".parse().unwrap()],
+            peer,
+            relay,
+            no_mdns: true,
+        };
+        let mut bridge = test_network(config("bridge", vec![relay.clone()], vec![]));
+        let bridge_id = wait_for_local_peer(&mut bridge).await;
+        bridge.recv_matching(Duration::from_secs(12), |e| {
+            matches!(e, UiEvent::Status(s) if s.starts_with("listening on") && s.contains("p2p-circuit")).then_some(())
+        }).await;
+        let seed = relay
+            .with(libp2p::multiaddr::Protocol::P2pCircuit)
+            .with(libp2p::multiaddr::Protocol::P2p(bridge_id));
+        let mut west = test_network(config("west", vec![], vec![seed.clone()]));
+        let mut east = test_network(config("east", vec![], vec![seed]));
+        let west_id = wait_for_local_peer(&mut west).await.to_string();
+        let east_id = wait_for_local_peer(&mut east).await.to_string();
+        let mut bridge_events = bridge.events;
+        tokio::spawn(async move { while bridge_events.recv().await.is_some() {} });
+        let bridge_id = bridge_id.to_string();
+        let via_bridge = |e| {
+            matches!(e, UiEvent::Topology(g) if g.links.len() == 2 &&
+            g.links.iter().all(|l| !l.direct && l.lanes != 0 && (l.source == bridge_id || l.target == bridge_id))).then_some(())
+        };
+        tokio::join!(
+            west.recv_matching(Duration::from_secs(15), via_bridge),
+            east.recv_matching(Duration::from_secs(15), via_bridge)
+        );
+        if !initial_room.is_empty() {
+            west.commands
+                .send(NetworkCommand::Chat("through the middle peer".into()))
+                .await
+                .unwrap();
+            wait_for_history_text(&mut east, "through the middle peer").await;
+        }
+        bridge.task.abort();
+        let _ = bridge.task.await;
+        let restored = |e| {
+            matches!(e, UiEvent::Topology(g) if g.links.iter().any(|l| {
+                !l.direct && l.lanes != 0 && ((l.source == east_id && l.target == west_id)
+                    || (l.source == west_id && l.target == east_id))
+            }))
+            .then_some(())
+        };
+        tokio::join!(
+            west.recv_matching(Duration::from_secs(30), restored),
+            east.recv_matching(Duration::from_secs(30), restored)
+        );
+        if initial_room.is_empty() {
+            let room = "created after repair";
+            west.commands
+                .send(NetworkCommand::JoinRoom(room.into()))
+                .await
+                .unwrap();
+            east.recv_matching(Duration::from_secs(12), |e| {
+                matches!(e, UiEvent::RoomDirectory { active: None, rooms } if rooms.get(room) == Some(&1)).then_some(())
+            }).await;
+            east.commands
+                .send(NetworkCommand::JoinRoom(room.into()))
+                .await
+                .unwrap();
+            wait_for_peer_count(&mut west, 1).await;
+        }
+        east.commands
+            .send(NetworkCommand::Chat("east after bridge exit".into()))
+            .await
+            .unwrap();
+        wait_for_history_text(&mut west, "east after bridge exit").await;
+        west.commands
+            .send(NetworkCommand::Chat("west after bridge exit".into()))
+            .await
+            .unwrap();
+        wait_for_history_text(&mut east, "west after bridge exit").await;
+        west.abort();
+        east.abort();
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn circuit_handoff_and_recovery_across_a_peer_bridge() {
+        let (endpoint, server) = test_relay_server().await;
         // Only the relay is a listener. Both endpoints can dial out.
         let config = |name: &str, relays, peer| BackendConfig {
             name: name.into(),
@@ -7226,7 +7329,11 @@ mod tests {
         wait_for_history_text(&mut east, "over repaired peer path").await;
         helper.task.abort();
         // This seed is the only available transport once the helper exits.
-        east.recv_matching(Duration::from_secs(45),|e|matches!(e,UiEvent::Status(s) if s.contains(" via relay") && s.contains(&id.to_string())).then_some(())).await;
+        let reconnected = format!("connected {id} via relay");
+        east.recv_matching(Duration::from_secs(45), |e| {
+            matches!(e, UiEvent::Status(s) if s == reconnected).then_some(())
+        })
+        .await;
         west.commands
             .send(NetworkCommand::Chat("back on circuit".into()))
             .await

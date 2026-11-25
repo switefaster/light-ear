@@ -3,6 +3,7 @@ use crate::{
     directory::{self, Directory, Link, Page, Presence, Signed, Summary},
     topology,
 };
+use libp2p::{core::transport::ListenerId, multiaddr::Protocol};
 use libp2p::{identity, request_response as rr};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -12,6 +13,23 @@ use std::{
 
 const TRANSIT_BYTES_PER_SECOND: usize = 256 * 1024;
 const HELPER_ROOMS: usize = 8;
+const MAX_LEARNED_RELAYS: usize = 2;
+
+struct RelayReservation {
+    endpoints: Vec<Multiaddr>,
+    next_endpoint: usize,
+    listener: Option<ListenerId>,
+    retry_at: Instant,
+    retry_delay: Duration,
+}
+
+impl RelayReservation {
+    fn retry(&mut self, now: Instant) {
+        self.listener = None;
+        self.retry_at = now + self.retry_delay;
+        self.retry_delay = (self.retry_delay * 2).min(Duration::from_secs(60));
+    }
+}
 
 pub(super) type Exchange = rr::json::Behaviour<Summary, Page>;
 pub(super) struct Network {
@@ -47,6 +65,10 @@ pub(super) struct Network {
     dirty: bool,
     pub(super) room_routes_changed: bool,
     seed_addresses: HashMap<String, Vec<Multiaddr>>,
+    reservations: BTreeMap<PeerId, RelayReservation>,
+    learned_relays: usize,
+    circuit_retries: HashMap<String, Instant>,
+    next_circuit_dial: Instant,
     announce: bool,
     seq: u64,
     refresh: Instant,
@@ -149,6 +171,10 @@ impl Network {
             scheduler: ByteScheduler::default(),
             proposed: None,
             seed_addresses: Default::default(),
+            reservations: Default::default(),
+            learned_relays: 0,
+            circuit_retries: Default::default(),
+            next_circuit_dial: now,
             tail_window: now,
             tail_target: None,
             shortcut: None,
@@ -168,6 +194,123 @@ impl Network {
                 .entry(p.to_string())
                 .or_default()
                 .push(addr);
+        }
+    }
+    pub fn dial_relay_seeds(&mut self, relay: PeerId) {
+        for (id, addrs) in &self.seed_addresses {
+            let Ok(peer) = id.parse::<PeerId>() else {
+                continue;
+            };
+            if peer == relay || self.inner.is_connected(&peer) || self.reachable_without_seed(peer)
+            {
+                continue;
+            }
+            let addresses: Vec<_> = addrs
+                .iter()
+                .filter(|addr| {
+                    circuit_relay_endpoint(addr).and_then(|base| peer_id_from_multiaddr(&base))
+                        == Some(relay)
+                })
+                .cloned()
+                .collect();
+            if !addresses.is_empty() {
+                let _ = self.inner.dial(
+                    DialOpts::peer_id(peer)
+                        .addresses(addresses)
+                        .condition(PeerCondition::DisconnectedAndNotDialing)
+                        .build(),
+                );
+            }
+        }
+    }
+    pub fn remember_relay(&mut self, endpoint: Multiaddr, configured: bool) -> Option<PeerId> {
+        let Some(Protocol::P2p(id)) = endpoint.iter().last() else {
+            return None;
+        };
+        if id == *self.local_peer_id() || is_relay_address(&endpoint) {
+            return None;
+        }
+        if let Some(reservation) = self.reservations.get_mut(&id) {
+            if (configured || reservation.endpoints.len() < 4)
+                && !reservation.endpoints.contains(&endpoint)
+            {
+                reservation.endpoints.push(endpoint);
+            }
+            return Some(id);
+        }
+        if !configured {
+            if self.learned_relays >= MAX_LEARNED_RELAYS {
+                return None;
+            }
+            self.learned_relays += 1;
+        }
+        self.reservations.insert(
+            id,
+            RelayReservation {
+                endpoints: vec![endpoint],
+                next_endpoint: 0,
+                listener: None,
+                retry_at: Instant::now(),
+                retry_delay: Duration::from_secs(5),
+            },
+        );
+        // The control socket to a newly learned relay can precede the peer circuit.
+        self.routes.remove(&id);
+        self.pending.remove(&id);
+        self.announce = true;
+        Some(id)
+    }
+
+    async fn maintain_reservations(&mut self, now: Instant, ui: &mpsc::Sender<UiEvent>) {
+        for reservation in self.reservations.values_mut() {
+            if reservation.listener.is_some() || reservation.retry_at > now {
+                continue;
+            }
+            let endpoint = reservation.endpoints[reservation.next_endpoint].clone();
+            reservation.next_endpoint =
+                (reservation.next_endpoint + 1) % reservation.endpoints.len();
+            let circuit = endpoint.with(Protocol::P2pCircuit);
+            match self.inner.listen_on(circuit.clone()) {
+                Ok(listener) => {
+                    reservation.listener = Some(listener);
+                    send_status(ui, format!("requesting relay reservation via {circuit}")).await;
+                }
+                Err(err) => {
+                    reservation.retry(now);
+                    send_status(
+                        ui,
+                        format!("relay reservation request failed {circuit}: {err}"),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    pub fn listen_address_changed(&mut self, address: &Multiaddr) {
+        if is_relay_address(address) {
+            self.announce = true;
+        }
+    }
+
+    pub fn reservation_listening(&mut self, listener: ListenerId) {
+        if let Some(r) = self
+            .reservations
+            .values_mut()
+            .find(|r| r.listener == Some(listener))
+        {
+            r.retry_delay = Duration::from_secs(5);
+        }
+    }
+
+    pub fn reservation_closed(&mut self, listener: ListenerId) {
+        if let Some(r) = self
+            .reservations
+            .values_mut()
+            .find(|r| r.listener == Some(listener))
+        {
+            r.retry(Instant::now());
+            self.announce = true;
         }
     }
     fn addresses(&self, p: &str) -> Vec<Multiaddr> {
@@ -209,7 +352,7 @@ impl Network {
         self.samples = Default::default();
         self.confirmation_neighbors = Default::default();
         self.missed.clear();
-        self.lost.clear();
+        // Discovery partitions and their dial backoff survive a room switch.
         self.repairs.clear();
         self.scheduler = ByteScheduler::default();
     }
@@ -356,12 +499,13 @@ impl Network {
     pub async fn tick(&mut self, ui: &mpsc::Sender<UiEvent>) {
         let now = Instant::now();
         let local = self.local_peer_id().to_string();
+        self.maintain_reservations(now, ui).await;
         self.refresh_presence(now, &local);
         self.apply_directory(now, &local, ui).await;
-        self.observe_partition(now);
         self.publish_metrics(now, ui).await;
         self.check_handoffs(now, &local);
-        self.repair_connections(now, &local);
+        self.try_introduction(now);
+        self.repair_circuit(now, &local, ui).await;
         self.sample_delivery(now, &local);
     }
     fn refresh_presence(&mut self, now: Instant, local: &str) {
@@ -374,15 +518,8 @@ impl Network {
         self.dirty |= count != self.directory.records.len();
         if self.announce || now >= self.refresh || !self.directory.records.contains_key(local) {
             self.seq += 1;
-            let mut addresses: Vec<_> = self
-                .external_addresses()
-                .chain(self.listeners())
-                .filter(|a| directory::shareable(a))
-                .map(ToString::to_string)
-                .collect();
-            addresses.sort();
-            addresses.dedup();
-            addresses.truncate(8);
+            let addresses =
+                directory::presence_addresses(self.external_addresses().chain(self.listeners()));
             let mut links: Vec<_> = self
                 .routes
                 .iter()
@@ -486,15 +623,20 @@ impl Network {
             let _ = ui.send(UiEvent::PeerCount(n)).await;
         }
     }
-    fn observe_partition(&mut self, now: Instant) {
-        if let Some(r) = &self.room {
-            let members = self.directory.members(r);
-            for p in members.difference(&self.plan.reachable) {
-                self.lost.entry(p.clone()).or_insert(now);
+    fn observe_partition(&mut self, reachable: &BTreeSet<String>, now: Instant) {
+        let members = self.members();
+        for p in self.plan.reachable.union(&members) {
+            if reachable.contains(p) || !self.directory.records.contains_key(p) {
+                continue;
             }
-            self.lost
-                .retain(|p, _| members.contains(p) && !self.plan.reachable.contains(p));
+            if let std::collections::hash_map::Entry::Vacant(entry) = self.lost.entry(p.clone()) {
+                entry.insert(now);
+                self.dialed.remove(p);
+                self.circuit_retries.remove(p);
+            }
         }
+        self.lost
+            .retain(|p, _| self.directory.records.contains_key(p) && !reachable.contains(p));
     }
     async fn publish_metrics(&mut self, now: Instant, ui: &mpsc::Sender<UiEvent>) {
         if now >= self.metrics_at {
@@ -633,55 +775,109 @@ impl Network {
             }
         }
     }
-    fn repair_connections(&mut self, now: Instant, local: &str) {
-        if now >= self.next_dial
-            && self
-                .network_info()
-                .connection_counters()
-                .num_pending_outgoing()
-                < 2
+    fn circuit_addresses(&self, peer: PeerId) -> Vec<Multiaddr> {
+        let mut addresses: Vec<_> = self
+            .addresses(&peer.to_string())
+            .into_iter()
+            .filter(is_relay_address)
+            .filter_map(|addr| normalize_peer_address(peer, addr))
+            .collect();
+        // Peers can share a relay even when its address is LAN-scoped or the
+        // destination's first directory record predates its reservation.
+        for (relay, reservation) in &self.reservations {
+            if *relay != peer {
+                addresses.extend(
+                    reservation
+                        .endpoints
+                        .iter()
+                        .cloned()
+                        .map(|addr| addr.with(Protocol::P2pCircuit).with(Protocol::P2p(peer))),
+                );
+            }
+        }
+        let mut seen = HashSet::new();
+        addresses.retain(|addr| seen.insert(addr.clone()));
+        addresses
+    }
+    async fn repair_circuit(&mut self, now: Instant, local: &str, ui: &mpsc::Sender<UiEvent>) {
+        if now < self.next_circuit_dial {
+            return;
+        }
+        self.circuit_retries
+            .retain(|id, _| self.directory.records.contains_key(id));
+        // A stalled direct dial can occupy an introduction slot. Leave one
+        // additional slot for circuit recovery when a room path has failed.
+        if self
+            .network_info()
+            .connection_counters()
+            .num_pending_outgoing()
+            < 3
         {
-            let overdue = self
-                .room
-                .as_deref()
-                .map(|r| self.directory.members(r))
-                .unwrap_or_default()
-                .into_iter()
-                .find(|id| {
-                    id != local
-                        && (self.lost_member(id)
-                            || (!self.plan.healthy_peer_paths.contains(id)
-                                && id.parse().is_ok_and(|p| self.degraded(&p)))
-                            || (0..2).all(|i| {
-                                self.missed.get(&(i, id.clone())).copied().unwrap_or(0) >= 3
-                            }))
-                        && self.dialed.get(id).is_none_or(|(t, _)| *t <= now)
-                });
-            if let Some(id) = overdue {
-                if let Ok(peer) = id.parse::<PeerId>() {
-                    let addrs = self
-                        .addresses(&id)
-                        .into_iter()
-                        .filter(is_relay_address)
-                        .collect::<Vec<_>>();
-                    if !addrs.is_empty()
-                        && !self
+            let members = self.members();
+            let mut candidates = members.clone();
+            candidates.extend(self.lost.keys().cloned());
+            let candidate = candidates
+                .iter()
+                .filter_map(|id| {
+                    let peer = id.parse::<PeerId>().ok()?;
+                    let retry_at = self.circuit_retries.get(id).copied();
+                    if id == local
+                        || retry_at.is_some_and(|t| now < t)
+                        || self
                             .routes
                             .get(&peer)
-                            .is_some_and(|rs| rs.values().any(|v| !v.0))
+                            .is_some_and(|rs| rs.values().any(|(direct, _)| !*direct))
                     {
-                        self.next_dial = now + Duration::from_secs(5);
-                        self.dialed.insert(id, (now + Duration::from_secs(60), 1));
-                        let _ = self.dial(
-                            DialOpts::peer_id(peer)
-                                .addresses(addrs)
-                                .condition(PeerCondition::Always)
-                                .build(),
-                        );
+                        return None;
+                    }
+                    let detached = self
+                        .lost
+                        .get(id)
+                        .is_some_and(|since| now.duration_since(*since) >= Duration::from_secs(5));
+                    let unhealthy = (!self.plan.healthy_peer_paths.contains(id)
+                        && self.degraded(&peer))
+                        || (0..2)
+                            .all(|i| self.missed.get(&(i, id.clone())).copied().unwrap_or(0) >= 3);
+                    if !detached && !(members.contains(id) && unhealthy) {
+                        return None;
+                    }
+                    // Give one end a head start. The other can still dial if only its
+                    // direction works, without routinely opening parallel circuits.
+                    if local > id.as_str()
+                        && self.lost.get(id).is_some_and(|since| {
+                            now.duration_since(*since) < Duration::from_secs(8)
+                        })
+                    {
+                        return None;
+                    }
+                    let addresses = self.circuit_addresses(peer);
+                    (!addresses.is_empty()).then_some((retry_at, peer, addresses))
+                })
+                .min_by_key(|(last, _, _)| *last);
+            if let Some((_, peer, addresses)) = candidate {
+                self.next_circuit_dial = now + Duration::from_secs(5);
+                self.circuit_retries
+                    .insert(peer.to_string(), now + Duration::from_secs(15));
+                let dial = DialOpts::peer_id(peer)
+                    .addresses(addresses)
+                    .condition(PeerCondition::Always)
+                    .build();
+                match self.dial(dial) {
+                    Ok(()) => {
+                        send_status(
+                            ui,
+                            format!("requesting relay circuit to recover peer {peer}"),
+                        )
+                        .await
+                    }
+                    Err(err) => {
+                        send_status(ui, format!("relay repair dial to {peer} failed: {err}")).await
                     }
                 }
             }
         }
+    }
+    fn try_introduction(&mut self, now: Instant) {
         if now >= self.next_dial
             && self
                 .network_info()
@@ -696,6 +892,7 @@ impl Network {
                 .shortcut
                 .iter()
                 .chain(self.plan.candidates.iter())
+                .chain(self.lost.keys())
                 .filter_map(|id| {
                     let p = id.parse::<PeerId>().ok()?;
                     if self.is_connected(&p) || self.dialed.get(id).is_some_and(|(t, _)| *t > now) {
@@ -703,7 +900,10 @@ impl Network {
                     }
                     let attempts = self.dialed.get(id).map_or(0, |(_, n)| *n);
                     let mut addresses = self.addresses(id);
-                    if self.shortcut.as_ref() == Some(id) && !self.plan.candidates.contains(id) {
+                    if self.lost.contains_key(id)
+                        || (self.shortcut.as_ref() == Some(id)
+                            && !self.plan.candidates.contains(id))
+                    {
                         addresses.retain(|a| !is_relay_address(a));
                     }
                     if attempts == 0 && addresses.iter().any(|a| !is_relay_address(a)) {
@@ -922,6 +1122,7 @@ impl Network {
         if self.plan.trees != next.trees {
             self.alternate_proof.clear();
         }
+        self.observe_partition(&next.reachable, now);
         self.plan = next;
     }
     pub fn receive(

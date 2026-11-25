@@ -51,7 +51,7 @@ guardrail:
 
 - `cargo test --lib local_loopback_smoke_syncs_chat_history_between_two_backends`
 
-For adaptive topology changes, run the full library suite with loopback TCP access. The four-peer crossing test measures payload distribution, the foreign-room bridge test checks isolation and the circuit fixture exercises the relay.
+For adaptive topology changes, run the full library suite with loopback TCP access. The four-peer crossing test measures payload distribution, the foreign-room bridge test checks isolation, and the relay fixtures cover handoff and bridge loss for room members and browsers.
 
 The loopback networking fixtures run peers without opening a system audio device.
 Keep their real libp2p transports and run the full suite with both decoder configurations.
@@ -63,6 +63,7 @@ Keep their real libp2p transports and run the full suite with both decoder confi
   LAN startup available when the updater is unreachable and no update is known.
 - The v2 directory is network-wide. Keep memberships and vote electorates independent of transport neighbors and transient forwarding subscriptions. Directory request-response carries discovery records only. Room data and probes use the two gossipsub trees. Keep browse, join and leave on the same swarm identity.
 - Keep relay reservations independent of measured room payload. Require delivery evidence and the handoff grace before releasing a live fallback circuit.
+- A peer using an outbound circuit should also reserve an inbound route on that relay. Retry closed reservation listeners. After bridge loss, try the remaining signed room members through their advertised circuits or a locally known relay. Keep circuit-repair retries independent of direct-introduction backoff and local relay addresses out of the public directory.
 
 - Enqueue always appends to the queue and does not require a vote. Keep the
   Tauri command's `position` field compatible, but do not give it behavior
