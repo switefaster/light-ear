@@ -210,8 +210,12 @@ Current rules:
 - Local cache progress can update the desktop frequently, but
   `PlaybackBufferHealth` publishes are rate-limited so fast decode/download
   progress cannot fill gossipsub peer queues. Status changes publish
-  immediately; same-status progress publishes only after a wall-clock interval
-  and actual buffer advancement.
+  immediately. Ordinary progress requires a wall-clock interval and actual
+  buffer advancement. Ready coverage reaching track end is sent immediately
+  once. The leader caps both fresh and stale buffer requirements at the track
+  duration. At decoder EOF, a subsecond difference from the whole-second
+  Bilibili duration counts as complete for health. The desktop still receives
+  the measured cache range.
 - `PlaybackState` remains the only authoritative room playback state. Buffer
   operations and health messages are short-lived and should be cleared or
   superseded by ready, cancel, timeout, impossible quorum, or session changes.

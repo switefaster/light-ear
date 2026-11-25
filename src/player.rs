@@ -186,6 +186,7 @@ pub enum AudioPlayerEvent {
     },
     Cache {
         operation_id: Option<String>,
+        decoder_finished: bool,
         view: PlaybackCacheView,
     },
     Buffering {
@@ -391,6 +392,7 @@ impl AudioPlayer {
                 });
                 let _ = self.event_tx.send(AudioPlayerEvent::Cache {
                     operation_id: operation_id.clone(),
+                    decoder_finished: session.pcm.is_complete(),
                     view: PlaybackCacheView {
                         session_id,
                         track_id: track.track_id,
@@ -421,6 +423,7 @@ impl AudioPlayer {
                 stream_pcm_cache_window(&session.pcm, track.duration_ms);
             let _ = self.event_tx.send(AudioPlayerEvent::Cache {
                 operation_id,
+                decoder_finished: false,
                 view: PlaybackCacheView {
                     session_id,
                     track_id: track.track_id,
@@ -591,6 +594,7 @@ impl AudioPlayer {
             if let Some(view) = cache_view {
                 let _ = self.event_tx.send(AudioPlayerEvent::Cache {
                     operation_id: None,
+                    decoder_finished: false,
                     view,
                 });
             }
@@ -644,6 +648,7 @@ impl AudioPlayer {
                         stream_pcm_cache_window(&session.pcm, session.duration_ms);
                     let _ = self.event_tx.send(AudioPlayerEvent::Cache {
                         operation_id: None,
+                        decoder_finished: false,
                         view: PlaybackCacheView {
                             session_id: session.session_id.clone(),
                             track_id: session.track_id.clone(),
@@ -957,7 +962,9 @@ fn stream_ready_for_position(
     let ready_until = position_ms
         .saturating_add(media_cache::READY_WINDOW_MS)
         .min(duration_ms);
-    buffered_until_ms >= ready_until || (complete && buffered_until_ms >= position_ms)
+    buffered_until_ms >= ready_until
+        || (complete && buffered_until_ms >= position_ms)
+        || media_cache::covers_track_end(buffered_until_ms, duration_ms, complete)
 }
 
 fn stream_pcm_ready_for_position(pcm: &SharedPcm, position_ms: u64, duration_ms: u64) -> bool {
@@ -2656,6 +2663,7 @@ fn decode_streaming_audio_inner(
                     last_cache_event_ms = buffered_until_ms;
                     let _ = event_tx.send(AudioPlayerEvent::Cache {
                         operation_id: operation_id.clone(),
+                        decoder_finished: false,
                         view: PlaybackCacheView {
                             session_id: session_id.clone(),
                             track_id: track.track_id.clone(),
@@ -2683,6 +2691,7 @@ fn decode_streaming_audio_inner(
                     });
                     let _ = event_tx.send(AudioPlayerEvent::Cache {
                         operation_id: operation_id.clone(),
+                        decoder_finished: false,
                         view: PlaybackCacheView {
                             session_id: session_id.clone(),
                             track_id: track.track_id.clone(),
@@ -2742,6 +2751,7 @@ fn decode_streaming_audio_inner(
     }
     let _ = event_tx.send(AudioPlayerEvent::Cache {
         operation_id,
+        decoder_finished: true,
         view: PlaybackCacheView {
             session_id,
             track_id: track.track_id,
@@ -2987,6 +2997,21 @@ mod tests {
         assert!(stream_ready_for_position(30_000, 120_000, 45_000, false));
         assert!(!stream_ready_for_position(30_000, 120_000, 39_000, false));
         assert!(stream_ready_for_position(118_000, 120_000, 120_000, true));
+    }
+
+    #[test]
+    fn seek_into_rounded_track_end_reuses_the_finished_decoder() {
+        let pcm = SharedPcm::new();
+        pcm.set_base_position(28_000);
+        pcm.set_spec(NonZeroU16::new(1).unwrap(), NonZeroU32::new(10).unwrap())
+            .unwrap();
+        pcm.push_samples(&[1.0; 13]); // Actual audio ends at 29.3s.
+        assert!(!stream_pcm_ready_for_position(&pcm, 29_900, 30_000));
+        pcm.complete();
+        assert!(stream_pcm_ready_for_position(&pcm, 29_900, 30_000));
+        assert!(!stream_pcm_ready_for_position(&pcm, 29_900, 31_000));
+        assert!(!stream_pcm_ready_for_position(&pcm, 27_500, 30_000));
+        assert_eq!(stream_pcm_cache_window(&pcm, 30_000), (28_000, 29_300));
     }
 
     #[test]

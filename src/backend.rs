@@ -71,10 +71,6 @@ const MUSIC_START_DELAY: Duration = Duration::from_millis(1500);
 const BUFFER_OPERATION_TIMEOUT: Duration = Duration::from_secs(90);
 const BUFFER_PREPARE_REPUBLISH_INTERVAL: Duration = Duration::from_secs(2);
 const BUFFER_READY_WINDOW_MS: u64 = media_cache::READY_WINDOW_MS;
-const BUFFER_HEALTH_LOSS_GRACE: Duration = Duration::from_secs(3);
-const BUFFER_HEALTH_STALE_AFTER: Duration = Duration::from_secs(5);
-const BUFFER_HEALTH_PUBLISH_MIN_INTERVAL: Duration = Duration::from_secs(1);
-const BUFFER_HEALTH_PUBLISH_MIN_ADVANCE_MS: u64 = media_cache::LOW_WATERMARK_MS;
 const AUDIO_OUTPUT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const VOTE_TIMEOUT: Duration = Duration::from_secs(20);
 const RENDEZVOUS_DISCOVER_INTERVAL: Duration = Duration::from_secs(30);
@@ -4192,6 +4188,7 @@ async fn handle_audio_player_events(
                             &session_id,
                             PlaybackBufferStatusKind::Ready,
                             Some(buffered_until_ms),
+                            false,
                         );
                         let _ = buffer.mark_status(
                             &operation_id,
@@ -4260,6 +4257,7 @@ async fn handle_audio_player_events(
                             &session_id,
                             PlaybackBufferStatusKind::Ready,
                             Some(buffered_until_ms),
+                            false,
                         );
                         maybe_start_pending_playback(
                             music,
@@ -4284,6 +4282,7 @@ async fn handle_audio_player_events(
                         &session_id,
                         PlaybackBufferStatusKind::Ready,
                         Some(buffered_until_ms),
+                        false,
                     );
                     if let Some(state) = music.playback_state().cloned() {
                         sync_loaded_player_to_state(
@@ -4294,7 +4293,11 @@ async fn handle_audio_player_events(
                     }
                 }
             }
-            player::AudioPlayerEvent::Cache { operation_id, view } => {
+            player::AudioPlayerEvent::Cache {
+                operation_id,
+                decoder_finished,
+                view,
+            } => {
                 if !stream_event_matches_current(
                     buffer,
                     music,
@@ -4311,6 +4314,12 @@ async fn handle_audio_player_events(
                     }
                     PlaybackCacheStatus::Failed => PlaybackBufferStatusKind::Failed,
                 };
+                let ready_through_end = view.ready_through_track_end(decoder_finished);
+                let health_end_ms = if ready_through_end {
+                    view.duration_ms
+                } else {
+                    view.buffered_until_ms
+                };
                 let _ = publish_local_buffer_health(
                     playback_health,
                     swarm,
@@ -4319,7 +4328,8 @@ async fn handle_audio_player_events(
                     local_peer_id,
                     &view.session_id,
                     status,
-                    Some(view.buffered_until_ms),
+                    Some(health_end_ms),
+                    ready_through_end,
                 );
                 let _ = ui.send(UiEvent::PlaybackCache(Some(view))).await;
             }
@@ -4359,6 +4369,7 @@ async fn handle_audio_player_events(
                     &session_id,
                     PlaybackBufferStatusKind::Buffering,
                     Some(buffered_until_ms),
+                    false,
                 );
                 let _ = ui.send(UiEvent::PlaybackCache(Some(view))).await;
             }
@@ -4428,6 +4439,7 @@ async fn handle_audio_player_events(
                     &session_id,
                     PlaybackBufferStatusKind::Failed,
                     None,
+                    false,
                 );
                 let view = PlaybackCacheView {
                     session_id: session_id.clone(),
@@ -4731,15 +4743,20 @@ async fn maybe_pause_for_buffer_health_loss(
         return Ok(());
     }
 
-    let expected = playback_members(swarm, rendezvous_nodes);
+    let Some(track) = current.track.as_ref() else {
+        return Ok(());
+    };
     let position_ms = playback_position_ms(&current, current_timestamp_micros());
+    if position_ms >= track.duration_ms {
+        return Ok(()); // Let the normal track-finished transition advance the queue.
+    }
+    let expected = playback_members(swarm, rendezvous_nodes);
     match playback_health.evaluate(
         &current.session_id,
         &expected,
-        position_ms.saturating_add(media_cache::LOW_WATERMARK_MS),
+        position_ms,
+        track.duration_ms,
         Instant::now(),
-        BUFFER_HEALTH_LOSS_GRACE,
-        BUFFER_HEALTH_STALE_AFTER,
     ) {
         PlaybackHealthDecision::MajorityLost { healthy, threshold } => {
             let Some(item) = queue_item_from_playback_state(&current) else {
@@ -6238,6 +6255,7 @@ fn publish_local_buffer_health(
     session_id: &str,
     status: PlaybackBufferStatusKind,
     buffered_until_ms: Option<u64>,
+    ready_through_end: bool,
 ) -> Result<()> {
     let should_publish = playback_health.mark_local_status_for_publish(
         session_id,
@@ -6245,8 +6263,7 @@ fn publish_local_buffer_health(
         status.clone(),
         buffered_until_ms,
         Instant::now(),
-        BUFFER_HEALTH_PUBLISH_MIN_INTERVAL,
-        BUFFER_HEALTH_PUBLISH_MIN_ADVANCE_MS,
+        ready_through_end,
     );
     if !should_publish {
         return Ok(());

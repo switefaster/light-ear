@@ -153,6 +153,9 @@ Keep their real libp2p transports and run the full suite with both decoder confi
   through the normal buffer quorum path. Health/cache progress updates must be
   rate-limited before gossipsub publish; UI-local cache updates may be more
   frequent, but room health messages should not be emitted per decoded packet.
+  Cap both the low watermark and the extra margin for stale reports at track
+  end. Publish final ready coverage once even if the last progress update was
+  recent. Keep the UI cache range sample-accurate.
 - Cache progress is local UI state. `PlaybackCache` is sent to the desktop to
   render local cached/decoded progress and must not be mirrored into
   `PlaybackState`.

@@ -22,6 +22,16 @@ pub(crate) const MAX_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub(crate) const STREAM_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
 const BILIBILI_MEDIA_ACCEPT: &str = "*/*";
 
+pub(crate) fn covers_track_end(
+    buffered_until_ms: u64,
+    duration_ms: u64,
+    decoder_finished: bool,
+) -> bool {
+    // Bilibili page durations have whole-second precision, while PCM is timed in milliseconds.
+    buffered_until_ms >= duration_ms
+        || (decoder_finished && duration_ms.saturating_sub(buffered_until_ms) < 1_000)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ByteRange {
     pub(crate) start: u64,
