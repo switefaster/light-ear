@@ -317,14 +317,32 @@ pub async fn run_network(
     commands: mpsc::Receiver<NetworkCommand>,
     ui: mpsc::Sender<UiEvent>,
 ) -> Result<()> {
-    run_network_with_output(config, commands, ui, Some(player::AudioPlayer::new)).await
+    run_network_with_device(config, commands, ui, None).await
+}
+
+pub async fn run_network_with_device(
+    config: BackendConfig,
+    commands: mpsc::Receiver<NetworkCommand>,
+    ui: mpsc::Sender<UiEvent>,
+    device: Option<String>,
+) -> Result<()> {
+    run_network_with_output(
+        config,
+        commands,
+        ui,
+        Some(player::OutputSettings {
+            device,
+            ..Default::default()
+        }),
+    )
+    .await
 }
 
 async fn run_network_with_output(
     config: BackendConfig,
     mut commands: mpsc::Receiver<NetworkCommand>,
     ui: mpsc::Sender<UiEvent>,
-    open_output: Option<fn() -> Result<player::AudioPlayer>>,
+    mut output: Option<player::OutputSettings>,
 ) -> Result<()> {
     let initial_room = (!config.topic.is_empty()).then(|| config.topic.clone());
     if initial_room
@@ -360,7 +378,11 @@ async fn run_network_with_output(
     let mut failed_audio_sessions = HashSet::new();
     let mut buffer_coordinator = BufferCoordinator::new();
     let mut playback_health = PlaybackHealth::new();
-    let mut audio_player = match open_output.map(|open| open()).transpose() {
+    let mut audio_player = match output
+        .as_ref()
+        .map(|s| player::AudioPlayer::with_output(s, true))
+        .transpose()
+    {
         Ok(player) => player,
         Err(err) => {
             send_status(&ui, format!("audio output unavailable: {err:#}")).await;
@@ -711,6 +733,23 @@ async fn run_network_with_output(
                 Some(NetworkCommand::MediaUploadLimit(kib)) => {
                     swarm.media.limit = kib.clamp(1, 102400) * 1024;
                 }
+                Some(NetworkCommand::SetOutputDevice(device, reply)) => {
+                    let result = match output.as_mut() {
+                        Some(settings) => {
+                            let next = player::OutputSettings { device, volume: settings.volume };
+                            let selected = if let Some(player) = audio_player.as_mut() {
+                                player.switch_output(next.device.clone(), false, current_timestamp_micros()).map(|_| ())
+                            } else {
+                                // The regular recovery path also prepares any active playback.
+                                next_audio_output_retry = Instant::now();
+                                player::AudioPlayer::with_output(&next, false).map(drop)
+                            };
+                            selected.map(|()| *settings = next)
+                        }
+                        None => Err(anyhow!("audio output is disabled")),
+                    };
+                    let _ = reply.send(result.map_err(|e| format!("{e:#}")));
+                }
                 Some(NetworkCommand::CancelImport(id)) => {
                     if let Some(flag)=imports.get(&id){flag.0.store(true,Ordering::Relaxed);}
                 }
@@ -941,6 +980,9 @@ async fn run_network_with_output(
                     }
                 }
                 Some(NetworkCommand::SetVolume(percent)) => {
+                    if let Some(settings) = output.as_mut() {
+                        settings.volume = percent.min(100);
+                    }
                     if let Some(player) = audio_player.as_mut() {
                         player.set_volume(percent, current_timestamp_micros())?;
                     }
@@ -1126,7 +1168,7 @@ async fn run_network_with_output(
                     && Instant::now() >= next_audio_output_retry
                 {
                     next_audio_output_retry = Instant::now() + AUDIO_OUTPUT_RETRY_INTERVAL;
-                    if ensure_audio_output(&mut audio_player, open_output, &ui, "scheduled retry").await {
+                    if ensure_audio_output(&mut audio_player, output.as_ref(), &ui, "scheduled retry").await {
                         if let Some(state) = music.playback_state().cloned().filter(|state| state.track.is_some() && !playback_state_uses_failed_audio_session(&failed_audio_sessions, state) && !buffer_coordinator.is_active()) {
                             if let Err(err) = apply_remote_playback_state(
                                 &http_client,
@@ -1512,7 +1554,7 @@ async fn run_network_with_output(
             },
             event = swarm.select_next_some() => {
                 let ctx = HistoryContext {
-                    open_output,
+                    open_output: output.as_ref(),
                     topic: &topic,
                     local_peer_id,
                     history: &mut history,
@@ -1612,7 +1654,7 @@ fn build_gossipsub(
 }
 
 struct HistoryContext<'a> {
-    open_output: Option<fn() -> Result<player::AudioPlayer>>,
+    open_output: Option<&'a player::OutputSettings>,
     topic: &'a gossipsub::IdentTopic,
     local_peer_id: PeerId,
     history: &'a mut Vec<ChatRecord>,
@@ -4344,7 +4386,7 @@ fn build_queue_state(local_peer_id: PeerId, music: &MusicState) -> QueueState {
 
 async fn ensure_audio_output(
     audio_player: &mut Option<player::AudioPlayer>,
-    open_output: Option<fn() -> Result<player::AudioPlayer>>,
+    open_output: Option<&player::OutputSettings>,
     ui: &mpsc::Sender<UiEvent>,
     context: &str,
 ) -> bool {
@@ -4352,10 +4394,10 @@ async fn ensure_audio_output(
         return true;
     }
 
-    let Some(open) = open_output else {
+    let Some(settings) = open_output else {
         return false;
     };
-    match open() {
+    match player::AudioPlayer::with_output(settings, true) {
         Ok(player) => {
             *audio_player = Some(player);
             send_status(ui, format!("audio output recovered during {context}")).await;
@@ -4795,11 +4837,7 @@ async fn handle_audio_player_events(
                     .await;
                     continue;
                 }
-                send_status(
-                    ui,
-                    format!("audio output error: {error}; reopening default output"),
-                )
-                .await;
+                send_status(ui, format!("audio output error: {error}; reopening output")).await;
                 match audio_player
                     .as_mut()
                     .map(|player| player.recover_output_device(current_timestamp_micros()))
@@ -6688,7 +6726,7 @@ async fn maybe_start_pending_playback(
 }
 
 async fn apply_playback_prepare(
-    open_output: Option<fn() -> Result<player::AudioPlayer>>,
+    open_output: Option<&player::OutputSettings>,
     client: &reqwest::Client,
     local_media: &mut LocalMediaResolver,
     audio_player: &mut Option<player::AudioPlayer>,

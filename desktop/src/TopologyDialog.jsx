@@ -13,6 +13,12 @@ function linkTitle(link) {
     link.media_bytes > 0 && `Local audio ${link.media_bytes.toLocaleString()} B · Relay ${link.media_relay_bytes.toLocaleString()} B`, link.degraded && "Degraded"].filter(Boolean).join(" · ");
 }
 
+function zoomAt(frame, factor, dx = 0, dy = 0) {
+  const scale = Math.max(Math.min(frame.scale, 0.04), Math.min(4, frame.scale * factor));
+  const shift = 1 / frame.scale - 1 / scale;
+  return { x: frame.x + dx * shift, y: frame.y + dy * shift, scale };
+}
+
 export default function TopologyDialog({ room, displayName, onClose }) {
   const dialog = useRef(null);
   const stage = useRef(null);
@@ -28,10 +34,11 @@ export default function TopologyDialog({ room, displayName, onClose }) {
   const neighbors = graph.adjacency.get(selected.id);
   const stats = selected.peer;
   const received = metrics?.received_bytes[selected.id];
-  const frame = camera ?? {
+  const fitted = useMemo(() => ({
     x: graph.width / 2, y: graph.height / 2,
     scale: Math.min(1.35, (size.width - 22) / graph.width, (size.height - 30) / graph.height),
-  };
+  }), [graph.width, graph.height, size]);
+  const frame = camera ?? fitted;
   const viewWidth = size.width / frame.scale;
   const viewHeight = size.height / frame.scale;
   const name = id => id === localPeerId ? "You" : displayName(id);
@@ -48,6 +55,22 @@ export default function TopologyDialog({ room, displayName, onClose }) {
     return () => { observer.disconnect(); element.close(); };
   }, []);
 
+  useEffect(() => {
+    const svg = stage.current.querySelector("svg");
+    function wheel(event) {
+      event.preventDefault();
+      if (!event.deltaY || drag.current) return;
+      const rect = svg.getBoundingClientRect();
+      const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? rect.height : 1;
+      const factor = Math.exp(-Math.max(-400, Math.min(400, event.deltaY * unit)) * 0.002);
+      const dx = event.clientX - rect.left - rect.width / 2;
+      const dy = event.clientY - rect.top - rect.height / 2;
+      setCamera(current => zoomAt(current ?? fitted, factor, dx, dy));
+    }
+    svg.addEventListener("wheel", wheel, { passive: false });
+    return () => svg.removeEventListener("wheel", wheel);
+  }, [fitted]);
+
   function inspect(id, center = false) {
     setSelection(id);
     if (center) {
@@ -57,7 +80,7 @@ export default function TopologyDialog({ room, displayName, onClose }) {
   }
 
   function zoom(factor) {
-    setCamera({ ...frame, scale: Math.max(Math.min(frame.scale, 0.04), Math.min(4, frame.scale * factor)) });
+    setCamera(current => zoomAt(current ?? fitted, factor));
   }
 
   return (
@@ -81,6 +104,7 @@ export default function TopologyDialog({ room, displayName, onClose }) {
         </div>
         <div className="topology-tools">
           <button aria-label="Zoom out" title="Zoom out" onClick={() => zoom(1 / 1.5)}><Minus size={16} /></button>
+          <output className="zoom-level" aria-label="Diagram scale">{Math.round(frame.scale * 100)}%</output>
           <button aria-label="Zoom in" title="Zoom in" onClick={() => zoom(1.5)}><Plus size={16} /></button>
           <button aria-label="Fit network" title="Fit network" onClick={() => setCamera(null)}><Maximize size={16} /></button>
         </div>

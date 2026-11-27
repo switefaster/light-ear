@@ -20,6 +20,9 @@ connections when direct addresses become usable so relay traffic stays bounded.
   dashboard.
 - `src-tauri/src/main.rs`: Tauri command bridge into the Rust backend.
 - `desktop/src/main.jsx`: React/Vite desktop UI.
+- `app-icon.png`: original desktop artwork. Generate icons with
+  `cargo tauri icon app-icon.png --output .tmp/app-icons`. Copy the desktop
+  formats into `src-tauri/icons/` and the 128 px PNG to `desktop/public/light-ear.png`.
 - `ARCHITECTURE.md`: current architecture boundaries, state-machine rules,
   timing assumptions, and change guidance.
 - `.github/workflows/build.yml`: push-triggered matrix CI build for Windows,
@@ -61,6 +64,10 @@ The loopback networking fixtures run peers without opening a system audio device
 Keep their real libp2p transports and run the full suite with both decoder configurations.
 
 ## Current collaboration rules
+
+- Desktop setup requires a nonblank display name. Restore the last accepted
+  display name and relay addresses on the device, including an empty relay list.
+  Keep routine status messages in Settings while a room is open.
 
 - Packaged desktop clients check for an update before starting the swarm. A confirmed
   update survives a failed install and offline restarts of that version. Keep offline
@@ -193,9 +200,9 @@ Keep their real libp2p transports and run the full suite with both decoder confi
   `session_id + track_id`, local cache, buffering, and failure events must carry
   that operation id to be accepted. This prevents old decoder windows from
   keeping seek UI and quorum state pinned to the pre-seek position.
-- Local audio output device errors, such as headphone hotplug or default-device
-  changes, should reopen the default output and reattach the current sink when
-  possible. The player also polls the cross-platform default output device id
+- Settings groups output selection, media transfer, and logs. Keep output preferences local.
+  On hotplug, reopen the selected output if present, otherwise the system default,
+  and reattach the current sink when possible. The player polls the effective device id
   while active (about 1s) and idle (about 5s) to notice default-device changes
   without platform-specific listeners. This is local recovery and must not
   publish room playback changes or mark the media session failed by itself.

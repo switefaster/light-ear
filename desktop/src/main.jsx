@@ -8,11 +8,15 @@ import {
   Check,
   Download,
   GripVertical,
+  FileAudio,
+  Hash,
   ListMusic,
+  Plus,
   Pause,
   Play,
   Radio,
   Search,
+  Settings,
   Send,
   Shuffle,
   Signal,
@@ -25,6 +29,7 @@ import {
 } from "lucide-react";
 import "./styles.css";
 import TopologyDialog from "./TopologyDialog.jsx";
+import SettingsDialog from "./SettingsDialog.jsx";
 
 const tauri = window.__TAURI__;
 const isPreview = !tauri?.core?.invoke;
@@ -33,12 +38,21 @@ const invoke = tauri?.core?.invoke ?? previewInvoke;
 const listen = tauri?.event?.listen ?? previewListen;
 const previewListeners = new Map();
 
-const initialConfig = {
-  name: "light-ear",
-  peers: "",
-  relays: "",
-  noMdns: false,
-};
+const connectionProfileKey = "connectionProfile";
+
+function loadConnectionConfig() {
+  const defaults = { name: "", peers: "", relays: "", noMdns: false };
+  try {
+    const saved = JSON.parse(localStorage.getItem(connectionProfileKey));
+    return {
+      ...defaults,
+      name: typeof saved?.name === "string" ? saved.name.trim() : "",
+      relays: typeof saved?.relays === "string" ? saved.relays : "",
+    };
+  } catch {
+    return defaults;
+  }
+}
 
 const initialRoom = {
   active: null,
@@ -73,14 +87,15 @@ const initialUpdate = {
 };
 
 function App() {
-  const [config, setConfig] = useState(initialConfig);
+  const [config, setConfig] = useState(loadConnectionConfig);
   const [room, setRoom] = useState(initialRoom);
   const [update, setUpdate] = useState(() => ({
     ...initialUpdate, status: checkUpdatesAtStartup ? "checking" : "idle",
   }));
   const [checkAttempt, setCheckAttempt] = useState(0);
   const installInFlight = useRef(false);
-  const [logOpen, setLogOpen] = useState(false);
+  const [settingsSection, setSettingsSection] = useState(null);
+  const [volume, setVolume] = useState(100);
   const [topologyOpen, setTopologyOpen] = useState(false);
   const updateProgressBucket = useRef(-1);
   const isConnected = room.backendRunning && Boolean(room.localPeerId);
@@ -273,7 +288,9 @@ function App() {
 
   async function startBackend(event) {
     event.preventDefault();
-    if (room.backendRunning || room.backendStarting) return;
+    const name = config.name.trim();
+    if (!name || room.backendRunning || room.backendStarting) return;
+    const relay = lines(config.relays);
 
     setRoom((current) => ({
       ...appendStatus(current, "starting backend"),
@@ -282,16 +299,24 @@ function App() {
 
     const started = await callCommand("start_backend", {
       config: {
-        name: config.name.trim() || "light-ear",
+        name,
         topic: "",
         listen: [],
         peer: lines(config.peers),
-        relay: lines(config.relays),
+        relay,
         noMdns: config.noMdns,
+        outputDevice: localStorage.getItem("audioOutputDevice") || null,
       },
     }, { requiresBackend: false });
 
     if (started) {
+      const profile = { name, relays: relay.join("\n") };
+      setConfig((current) => ({ ...current, ...profile }));
+      try {
+        localStorage.setItem(connectionProfileKey, JSON.stringify(profile));
+      } catch {
+        setRoom((current) => appendStatus(current, "could not save connection settings on this device"));
+      }
       setRoom((current) => ({
         ...appendStatus(current, "backend command channel ready"),
         backendRunning: true,
@@ -352,17 +377,20 @@ function App() {
           room={room}
           setConfig={setConfig}
           onSubmit={startBackend}
-          onOpenLog={() => setLogOpen(true)}
+          onOpenSettings={() => setSettingsSection("audio")}
+          onOpenLog={() => setSettingsSection("logs")}
         />
       ) : !room.active ? (
-        <RoomBrowser room={room} onOpenPeers={() => setTopologyOpen(true)} onJoin={(topic) => callCommand("join_room", {topic})} />
+        <RoomBrowser room={room} onOpenSettings={() => setSettingsSection("audio")} onOpenPeers={() => setTopologyOpen(true)} onJoin={(topic) => callCommand("join_room", {topic})} />
       ) : (
         <RoomConsole key={room.active}
           displayName={displayName}
           room={room}
           setRoom={setRoom}
           callCommand={callCommand}
-          onOpenLog={() => setLogOpen(true)}
+          onOpenSettings={() => setSettingsSection("audio")}
+          volume={volume}
+          setVolume={setVolume}
           onOpenPeers={() => setTopologyOpen(true)}
         />
       )}
@@ -370,23 +398,23 @@ function App() {
       {isConnected && topologyOpen && <TopologyDialog room={room}
         displayName={displayName}
         onClose={() => setTopologyOpen(false)} />}
-      {logOpen && (
-        <StatusLogModal
-          statuses={room.statuses}
-          logs={room.logs}
-          onExportLog={exportLogs}
-          onClose={() => setLogOpen(false)}
-        />
+      {settingsSection && (
+        <SettingsDialog section={settingsSection} onSelect={setSettingsSection}
+          onClose={() => setSettingsSection(null)} room={room} invoke={invoke} displayName={displayName}
+          onLeave={async () => { if (await callCommand("leave_room")) setSettingsSection(null); }}>
+          <StatusLog statuses={room.statuses} logs={room.logs} onExportLog={exportLogs} />
+        </SettingsDialog>
       )}
     </>
   );
 }
 
-function RoomBrowser({ room, onJoin, onOpenPeers }) {
+function RoomBrowser({ room, onJoin, onOpenPeers, onOpenSettings }) {
   const [name, setName] = useState("");
   return <main className="setup-page"><section className="setup-card directory-card">
     <div className="panel-head split"><h1>Public rooms</h1>
-      <button type="button" className="btn subtle" onClick={onOpenPeers}><Signal size={16} />Topology</button>
+      <div className="directory-tools"><button type="button" className="btn subtle" onClick={onOpenPeers}><Signal size={16} />Topology</button>
+        <IconButton label="Settings" onClick={onOpenSettings}><Settings size={17} /></IconButton></div>
     </div>
     <ul>{Object.entries(room.rooms).map(([topic, count]) => <li key={topic}>
       <button type="button" onClick={() => onJoin(topic)}><strong>{topic}</strong><span>{count} online</span></button>
@@ -399,7 +427,7 @@ function RoomBrowser({ room, onJoin, onOpenPeers }) {
   </section></main>;
 }
 
-function SetupPage({ config, room, setConfig, onSubmit, onOpenLog }) {
+function SetupPage({ config, room, setConfig, onSubmit, onOpenLog, onOpenSettings }) {
   const statusText = room.backendStarting ? "starting" : "offline";
   const [showPeerSettings, setShowPeerSettings] = useState(false);
 
@@ -408,24 +436,26 @@ function SetupPage({ config, room, setConfig, onSubmit, onOpenLog }) {
       <section className="setup-card" aria-label="Connection setup">
         <div className="setup-titlebar">
           <div className="setup-identity">
-            <div className="compact-mark" aria-hidden="true"><span></span></div>
+            <img className="app-mark" src="./light-ear.png" alt="" />
             <div>
               <p className="overline">light-ear</p>
               <h1>Connection</h1>
             </div>
           </div>
-          <span className="backend-state">
+          <div className="directory-tools"><span className="backend-state">
             <span className="status-light" aria-hidden="true"></span>
             {statusText}
-          </span>
+          </span><IconButton label="Settings" onClick={onOpenSettings}><Settings size={17} /></IconButton></div>
         </div>
 
         <form className="setup-form" onSubmit={onSubmit}>
           <div className="setup-grid setup-grid-compact">
-            <Field label="Name">
+            <Field label="Display name">
               <input
                 value={config.name}
                 autoComplete="off"
+                required
+                disabled={room.backendStarting}
                 onChange={(event) => setConfigValue(setConfig, "name", event.target.value)}
               />
             </Field>
@@ -437,6 +467,7 @@ function SetupPage({ config, room, setConfig, onSubmit, onOpenLog }) {
             <textarea
               rows="4"
               value={config.relays}
+              disabled={room.backendStarting}
               placeholder="/ip4/.../tcp/.../p2p/..."
               onChange={(event) => setConfigValue(setConfig, "relays", event.target.value)}
             />
@@ -474,7 +505,7 @@ function SetupPage({ config, room, setConfig, onSubmit, onOpenLog }) {
               <span className="toggle-box" aria-hidden="true"></span>
               <span>mDNS off</span>
             </label>
-            <button className="btn primary" type="submit" disabled={room.backendStarting}>
+            <button className="btn primary" type="submit" disabled={room.backendStarting || !config.name.trim()}>
               <Radio size={18} aria-hidden="true" />
               {room.backendStarting ? "Starting" : "Connect"}
             </button>
@@ -489,13 +520,12 @@ function SetupPage({ config, room, setConfig, onSubmit, onOpenLog }) {
   );
 }
 
-function RoomConsole({ room, setRoom, callCommand, onOpenLog, onOpenPeers, displayName }) {
+function RoomConsole({ room, setRoom, callCommand, onOpenSettings, onOpenPeers, displayName, volume, setVolume }) {
   const [chatText, setChatText] = useState("");
   const [chatComposing, setChatComposing] = useState(false);
   const [queueOpen, setQueueOpen] = useState(false);
   const [pendingMove, setPendingMove] = useState(null);
   const [pendingSeek, setPendingSeek] = useState(null);
-  const [volume, setVolume] = useState(100);
 
   const playback = room.playback;
   const reservedId = room.playbackBuffer?.queue_item_id;
@@ -564,14 +594,12 @@ function RoomConsole({ room, setRoom, callCommand, onOpenLog, onOpenPeers, displ
   return (
     <main className="console-page" data-backend="running">
       <RoomNavBar
-        onLeave={() => callCommand("leave_room")}
-        onJoin={(topic) => callCommand("join_room", {topic})}
         room={room}
         queueCount={queueCount}
         onBack={previewBackToSetup}
         onQueue={openQueue}
         onOpenPeers={onOpenPeers}
-        onOpenLog={onOpenLog}
+        onOpenSettings={onOpenSettings}
         displayName={displayName}
       />
 
@@ -585,7 +613,7 @@ function RoomConsole({ room, setRoom, callCommand, onOpenLog, onOpenPeers, displ
         <section className="panel chat-panel room-chat-panel">
           <div className="chat-head">
             <div>
-              <p className="overline">Room</p>
+              <p className="overline chat-room-name" title={room.active}><Hash size={12} />{room.active}</p>
               <h2>Chat</h2>
             </div>
             <span className="count-chip">{room.messages.length}</span>
@@ -723,16 +751,14 @@ function ConnectionAlert({ onOpenPeers }) {
 }
 
 function RoomNavBar({
-  onLeave, onJoin,
   room,
   queueCount,
   onBack,
   onQueue,
   onOpenPeers,
-  onOpenLog,
+  onOpenSettings,
   displayName,
 }) {
-  const latestStatus = room.statuses.at(-1) ?? "quiet";
   const localName = displayName(room.localPeerId);
   const hasRoomPeers = room.peerCount > 0;
   const peerDropAlert = room.peerDropAlert && !hasRoomPeers;
@@ -753,13 +779,13 @@ function RoomNavBar({
             setup
           </button>
         )}
-        <div className="compact-mark" aria-hidden="true"><span></span></div>
+        <img className="app-mark" src="./light-ear.png" alt="" />
         <strong>light-ear</strong>
       </div>
 
       <div className="nav-meta">
         <span className="nav-chip" title={room.localPeerId}>
-          <Radio size={14} aria-hidden="true" />
+          <span className="status-light" role="img" aria-label="Network running" />
           {localName}
         </span>
         <button
@@ -772,24 +798,10 @@ function RoomNavBar({
           <PeerIcon size={14} aria-hidden="true" />
           {peerLabel}
         </button>
-        <select className="nav-chip topic-chip" aria-label="Switch room" value={room.active} onChange={e => onJoin(e.target.value)}>
-          {Object.keys(room.rooms).map(topic => <option key={topic}>{topic}</option>)}
-        </select>
-        <button className="btn ghost" onClick={onLeave}>Leave room</button>
       </div>
 
-      <button
-        className="status-ticker"
-        type="button"
-        title={latestStatus}
-        aria-label={`Open status log: ${latestStatus}`}
-        onClick={onOpenLog}
-      >
-        <span className="status-light" aria-hidden="true"></span>
-        <span>{latestStatus}</span>
-      </button>
-
       <div className="nav-actions">
+        <IconButton label="Settings" onClick={onOpenSettings}><Settings size={18} /></IconButton>
         <button className="btn ghost queue-nav-button" type="button" onClick={onQueue}>
           <ListMusic size={17} aria-hidden="true" />
           Queue
@@ -980,19 +992,13 @@ function SeekBar({ playback, progress, cacheRange, onSeekRequest }) {
 function QueueDrawer({ open, room, items, localPeerId, callCommand, onClose, onRequestMove, displayName }) {
   const [queueForm, setQueueForm] = useState({ bvid: "", part: "" });
   const clipboardBvidRef = useRef("");
-  const [uploadLimit, setUploadLimit] = useState(() => localStorage.getItem("mediaUploadKiB") || "1024");
-
-  async function saveLimit() {
-    const kib = Math.min(102400, Math.max(1, Math.round(Number(uploadLimit) || 1024)));
-    if (await callCommand("set_media_upload_limit", { kib })) {
-      setUploadLimit(String(kib));
-      localStorage.setItem("mediaUploadKiB", String(kib));
-    }
-  }
+  const drawerRef = useRef(null);
 
   useEffect(() => {
     if (!open) return undefined;
 
+    const opener = document.activeElement;
+    drawerRef.current.querySelector(".drawer-head button")?.focus();
     let cancelled = false;
     resolveBilibiliBvidFromClipboard().then((bvid) => {
       if (cancelled || !bvid) return;
@@ -1013,6 +1019,7 @@ function QueueDrawer({ open, room, items, localPeerId, callCommand, onClose, onR
 
     return () => {
       cancelled = true;
+      if (opener?.isConnected) opener.focus();
     };
   }, [open]);
 
@@ -1034,27 +1041,40 @@ function QueueDrawer({ open, room, items, localPeerId, callCommand, onClose, onR
     <>
       {open && <button className="drawer-scrim" type="button" aria-label="Close queue" onClick={onClose}></button>}
       <aside
+        ref={drawerRef}
         className={`queue-drawer${open ? " open" : ""}`}
         aria-hidden={!open}
         inert={!open}
-        aria-label="Queue widget"
+        aria-label="Music queue"
+        onKeyDown={event => {
+          if (event.key === "Escape") { event.preventDefault(); onClose(); }
+          if (event.key !== "Tab") return;
+          const controls = event.currentTarget.querySelectorAll("button:not(:disabled), input:not(:disabled)");
+          const first = controls[0], last = controls[controls.length - 1];
+          if (event.shiftKey && event.target === first) { event.preventDefault(); last.focus(); }
+          if (!event.shiftKey && event.target === last) { event.preventDefault(); first.focus(); }
+        }}
       >
         <div className="drawer-head">
-          <div>
-            <p className="overline">Music</p>
-            <h2>Queue</h2>
-          </div>
+          <div className="drawer-title"><ListMusic size={23} aria-hidden="true" /><h2>Queue</h2></div>
           <IconButton label="Close queue" onClick={onClose}>
             <X size={19} aria-hidden="true" />
           </IconButton>
         </div>
 
-        <form className="stack queue-add-form" onSubmit={enqueue}>
-          <div className="field-row queue-add-row">
+        <form className="queue-add-form" onSubmit={enqueue}>
+          <div className="queue-source-row">
+            <label className="overline" htmlFor="queue-bvid">Bilibili</label>
+            <button className="local-audio-button" type="button" onClick={() => callCommand("enqueue_local_audio", { room: room.active, id: crypto.randomUUID() })}>
+              <FileAudio size={15} aria-hidden="true" /> Add local audio
+            </button>
+          </div>
+          <div className="queue-add-row">
             <input
+              id="queue-bvid"
               value={queueForm.bvid}
               autoComplete="off"
-              placeholder="BV id"
+              placeholder="BV ID"
               aria-label="Bilibili BV id"
               onChange={(event) => {
                 clipboardBvidRef.current = "";
@@ -1065,30 +1085,26 @@ function QueueDrawer({ open, room, items, localPeerId, callCommand, onClose, onR
               value={queueForm.part}
               type="number"
               min="1"
-              placeholder="part"
+              placeholder="Part"
               aria-label="Part"
               onChange={(event) => setQueueValue(setQueueForm, "part", event.target.value)}
             />
-            <button className="btn primary" type="submit">
-              <ListMusic size={17} aria-hidden="true" />
+            <button className="btn primary" type="submit" disabled={!queueForm.bvid.trim()}>
+              <Plus size={15} aria-hidden="true" />
               Add
             </button>
           </div>
-          <button className="btn" type="button" onClick={() => callCommand("enqueue_local_audio",{room:room.active,id:crypto.randomUUID()})}>Add local audio</button>
-          {Object.values(room.audioImports || {}).map(importing => <div key={importing.id}>
-            <label>{importing.title} <progress max="100" value={importing.percent}/></label>
-            <button className="btn" type="button" onClick={()=>callCommand("cancel_audio_import",{id:importing.id})}>Cancel import</button>
-          </div>)}
-        </form>
-        <details className="queue-add-form"><summary>Media transfer</summary>
-          <label>Upload limit (KiB/s) <input type="number" min="1" max="102400" value={uploadLimit} onChange={e=>setUploadLimit(e.target.value)} onBlur={saveLimit}/></label>
-          {room.mediaMetrics && <div>
-            <p>Worst listener p95 {room.mediaMetrics.worst_receiver_p95_ms ?? "—"} ms · Retries {room.mediaMetrics.retries}</p>
-            {Object.entries(room.mediaMetrics.neighbors).map(([peer,[sent,received,relay]])=>
-              <p key={peer}>{displayName(peer)} · Sent {Math.round(sent/1024)} KiB · Received {Math.round(received/1024)} KiB · Relay {Math.round(relay/1024)} KiB</p>)}
+          {Object.keys(room.audioImports).length > 0 && <div className="audio-imports">
+            {Object.values(room.audioImports).map(item => <div className="audio-import" key={item.id}>
+              <span title={item.title}>{item.title}</span>
+              <span>{item.percent}%</span>
+              <IconButton label={`Cancel import of ${item.title}`} onClick={() => callCommand("cancel_audio_import", { id: item.id })}><X size={14} /></IconButton>
+              <progress aria-label={`Importing ${item.title}`} max="100" value={item.percent} />
+            </div>)}
           </div>}
-        </details>
+        </form>
 
+        <div className="queue-section-head"><h3>Up next</h3><span>{items.length} {items.length === 1 ? "track" : "tracks"}</span></div>
         <QueueList
           items={items}
           localPeerId={localPeerId}
@@ -1111,7 +1127,7 @@ function QueueList({ items, localPeerId, onRemove, onRequestMove, displayName })
   const [overIndex, setOverIndex] = useState(null);
 
   if (items.length === 0) {
-    return <div className="empty-state queue-empty">queue is empty</div>;
+    return <div className="empty-state queue-empty"><ListMusic size={22} />Queue is empty</div>;
   }
 
   function clearDrag() {
@@ -1349,7 +1365,7 @@ function VoteModal({ vote, onVote, onDismiss, displayName }) {
   );
 }
 
-function StatusLogModal({ statuses, logs, onExportLog, onClose }) {
+function StatusLog({ statuses, logs, onExportLog }) {
   const listRef = useRef(null);
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("all");
@@ -1367,17 +1383,6 @@ function StatusLogModal({ statuses, logs, onExportLog, onClose }) {
       filter === "all" || entry.level === filter || entry.category === filter;
     return matchesQuery && matchesFilter;
   });
-
-  useEffect(() => {
-    function closeOnEscape(event) {
-      if (event.key === "Escape") {
-        onClose();
-      }
-    }
-
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [onClose]);
 
   useEffect(() => {
     const list = listRef.current;
@@ -1401,27 +1406,7 @@ function StatusLogModal({ statuses, logs, onExportLog, onClose }) {
   }
 
   return (
-    <div
-      className="modal-scrim log-scrim"
-      role="dialog"
-      aria-modal="true"
-      aria-label="Status log"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) {
-          onClose();
-        }
-      }}
-    >
-      <section className="modal-card log-modal">
-        <div className="panel-head split">
-          <div>
-            <p className="overline">Status</p>
-            <h2>Full Log</h2>
-          </div>
-          <IconButton label="Close status log" onClick={onClose}>
-            <X size={18} aria-hidden="true" />
-          </IconButton>
-        </div>
+      <div className="settings-log">
 
         <div className="log-toolbar">
           <label className="log-search">
@@ -1489,24 +1474,10 @@ function StatusLogModal({ statuses, logs, onExportLog, onClose }) {
             ))
           )}
         </div>
-      </section>
-    </div>
-  );
-}
-
-
-function Brand({ localPeerId }) {
-  return (
-    <header className="brand-block">
-      <div className="mark" aria-hidden="true"><span></span></div>
-      <div className="brand-copy">
-        <p className="overline">light-ear</p>
-        <h1>light-ear</h1>
-        <p className="peer-chip">{localPeerId || "offline"}</p>
       </div>
-    </header>
   );
 }
+
 
 function Field({ label, children }) {
   return (
@@ -2036,6 +2007,9 @@ async function previewInvoke(command, args = {}) {
     case "set_volume":
       emitPreview("backend-event", { type: "status", payload: `local volume set to ${args.percent}%` });
       return;
+    case "list_output_devices":
+      return [{ id: "preview-speakers", name: "Speakers", is_default: true },
+        { id: "preview-headphones", name: "Headphones", is_default: false }];
     case "export_status_logs":
       return `preview-downloads/${args.filename || "light-ear-log.jsonl"}`;
     case "check_for_update":

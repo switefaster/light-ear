@@ -34,9 +34,9 @@ Each desktop peer should join the same topic and relay address:
 /ip4/<relay-ip>/tcp/4001/p2p/<relay-peer-id>
 ```
 
-Keep the desktop status log and peer overview open while testing. If a check
-fails, copy the last 20 log entries from each peer and note whether the peer
-overview shows `direct`, `relay`, or `direct+relay`.
+If a check fails, open **Settings → Status log** on each peer and copy its last
+20 entries. Open the topology diagram and inspect the affected peer to record
+whether its connection shows `direct`, `relay`, or `direct+relay`.
 
 ## Preflight
 
@@ -210,7 +210,10 @@ Capture on failure:
 - Volume changes are local only and do not create votes or playback state
   messages.
 - Peer overview opens from `N peers` and shows direct/relay diagnostics.
-- Status log search and filters work without losing new status lines.
+- In Settings, search, filter, and export the status log while new lines arrive.
+- Switch the playback device during a track. Verify local position and volume are preserved, other listeners continue, and the choice survives restarting the client. Disconnect the chosen device and verify the system default takes over.
+- Scroll over a node in the topology diagram. The node under the pointer should stay in place as the diagram scales. Fit network should restore the overview.
+- Use Settings → Leave room to return to the directory and join another room on the same connection.
 - Duplicate display names can send chat; peer id remains the unique identity.
 - Queue requester and playback leader labels show display aliases when known,
   while still allowing short peer id disambiguation.
@@ -240,5 +243,5 @@ Start two groups with separate LAN discovery and a single connection between the
 
 1. In a room with two listeners and a leased helper, add a ten-minute WAV and a variable-bitrate MP3. Cancel a second import and verify only the completed items appear. Confirm the requester can remove their song directly and another listener sees a vote.
 2. Start the track and seek near the end. Compare the decoded window, song position and source status on both devices. Add a late listener and check that their progress begins near the room position.
-3. During playback, inspect media bytes in the topology and the queue’s Media transfer panel. Lower one supplier’s upload limit. Check that chat and votes still arrive and that a healthy alternative carries more bytes.
+3. During playback, inspect media bytes in the topology and in Settings → Media transfer. Lower one supplier’s upload limit. Check that chat and votes still arrive and that a healthy alternative carries more bytes.
 4. Leave on the uploader. Check that the same session continues from cached pieces, then seek to an uncached section. Verify the source wait is visible and the queue advances once after the recovery deadline.

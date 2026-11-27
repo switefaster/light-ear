@@ -3495,7 +3495,7 @@ dependencies = [
 
 [[package]]
 name = "light-ear"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3522,7 +3522,7 @@ dependencies = [
 
 [[package]]
 name = "light-ear-desktop"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "libp2p",
  "light-ear",

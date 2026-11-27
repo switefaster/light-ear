@@ -310,10 +310,11 @@ Range fetch and decode run outside the main swarm event loop. Skip/cancel/vote m
 
 Long media uses a rolling in-memory byte cache and PCM window. Decoder-requested offsets and initialization metadata survive eviction outside the estimated playback window. The downloader caps speculative lookahead at 8 MiB and validates the status, byte span and body size for every partial response. The ready window is 12 seconds, with low and high watermarks at 5 and 15 seconds.
 
-Audio output device errors are local recoverable events. When the rodio/cpal
-stream reports an error, the backend reopens the current default output device
-and reattaches the current sink at the local playback position when possible.
-The player also polls the default output device id every second while playing
+Audio output device errors are recoverable on the affected listener. When the
+rodio/cpal stream reports an error, the backend reopens the selected output or
+falls back to the system default if the device is absent. It reattaches the
+current sink at the local playback position when possible.
+The player also polls the effective output device id every second while playing
 and every five seconds while idle, which provides a cross-platform default
 device change watcher without platform-specific callbacks. This recovery must
 not publish a room playback change or mark the media session failed by itself.
@@ -343,6 +344,8 @@ The frontend talks to Rust through stable Tauri commands:
 - `resume`
 - `seek`
 - `set_volume`
+- `list_output_devices`
+- `set_output_device`
 - `skip`
 - `remove_queue_item`
 - `move_queue_item`

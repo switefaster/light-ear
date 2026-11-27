@@ -462,6 +462,10 @@ pub enum NetworkCommand {
     Resume,
     Seek(u64),
     SetVolume(u8),
+    SetOutputDevice(
+        Option<String>,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    ),
     Skip,
     RemoveQueueItem {
         index: usize,

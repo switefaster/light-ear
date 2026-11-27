@@ -64,7 +64,7 @@ pub struct AudioPlayer {
     position_ms: u64,
     started_at_micros: i64,
     playing: bool,
-    output_device_id: Option<String>,
+    preferred_device: Option<String>,
     device_watcher: AudioDeviceWatcher,
     volume: Arc<AtomicU32>,
     event_tx: mpsc::UnboundedSender<AudioPlayerEvent>,
@@ -238,9 +238,13 @@ pub enum AudioPlayerEvent {
 
 impl AudioPlayer {
     pub fn new() -> Result<Self> {
+        Self::with_output(&OutputSettings::default(), true)
+    }
+
+    pub(crate) fn with_output(settings: &OutputSettings, allow_missing: bool) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let output_device_id = default_output_device_id();
-        let stream = open_default_output(event_tx.clone())?;
+        let (stream, device_id) =
+            open_output(settings.device.as_deref(), allow_missing, event_tx.clone())?;
         Ok(Self {
             stream,
             sink: None,
@@ -253,9 +257,11 @@ impl AudioPlayer {
             position_ms: 0,
             started_at_micros: 0,
             playing: false,
-            output_device_id: output_device_id.clone(),
-            device_watcher: AudioDeviceWatcher::new(output_device_id),
-            volume: Arc::new(AtomicU32::new(volume_percent_to_gain(100).to_bits())),
+            preferred_device: settings.device.clone(),
+            device_watcher: AudioDeviceWatcher::new(device_id),
+            volume: Arc::new(AtomicU32::new(
+                volume_percent_to_gain(settings.volume).to_bits(),
+            )),
             event_tx,
             event_rx,
         })
@@ -629,8 +635,10 @@ impl AudioPlayer {
 
     pub fn drain_events(&mut self) -> Vec<AudioPlayerEvent> {
         let mut events = Vec::new();
-        if let Some(change) = self.device_watcher.poll(self.playing) {
-            self.output_device_id = change.current.clone();
+        if let Some(change) = self
+            .device_watcher
+            .poll(self.playing, self.preferred_device.as_deref())
+        {
             events.push(AudioPlayerEvent::OutputDeviceChanged {
                 previous: change.previous,
                 current: change.current,
@@ -800,6 +808,18 @@ impl AudioPlayer {
     }
 
     pub fn recover_output_device(&mut self, now_micros: i64) -> Result<bool> {
+        self.switch_output(self.preferred_device.clone(), true, now_micros)
+    }
+
+    pub(crate) fn switch_output(
+        &mut self,
+        device: Option<String>,
+        allow_missing: bool,
+        now_micros: i64,
+    ) -> Result<bool> {
+        // Open first so a failed selection leaves the current stream playing.
+        let (stream, device_id) =
+            open_output(device.as_deref(), allow_missing, self.event_tx.clone())?;
         let position_ms = self.position_ms(now_micros);
         let playing = self.playing;
 
@@ -807,7 +827,9 @@ impl AudioPlayer {
             sink.stop();
         }
 
-        self.reopen_output_device()?;
+        self.stream = stream;
+        self.preferred_device = device;
+        self.device_watcher.reset(device_id, Instant::now());
 
         if self.streaming.is_some() {
             if self.streaming.as_ref().is_some_and(|session| {
@@ -817,7 +839,7 @@ impl AudioPlayer {
                 return Ok(true);
             }
             self.position_ms = position_ms;
-            self.playing = playing;
+            self.playing = false;
             return Ok(false);
         }
 
@@ -918,26 +940,87 @@ impl AudioPlayer {
     }
 
     fn reopen_output_device(&mut self) -> Result<()> {
-        let stream = open_default_output(self.event_tx.clone())?;
+        let (stream, device_id) = open_output(
+            self.preferred_device.as_deref(),
+            true,
+            self.event_tx.clone(),
+        )?;
         self.stream = stream;
-        self.output_device_id = default_output_device_id();
-        self.device_watcher
-            .reset(self.output_device_id.clone(), Instant::now());
+        self.device_watcher.reset(device_id, Instant::now());
         Ok(())
     }
 }
 
-fn open_default_output(
+pub(crate) struct OutputSettings {
+    pub device: Option<String>,
+    pub volume: u8,
+}
+
+impl Default for OutputSettings {
+    fn default() -> Self {
+        Self {
+            device: None,
+            volume: 100,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct OutputDevice {
+    id: String,
+    name: String,
+    is_default: bool,
+}
+
+pub fn list_output_devices() -> Result<Vec<OutputDevice>> {
+    let default_id = default_output_device_id();
+    Ok(cpal::default_host()
+        .output_devices()?
+        .filter_map(|d| {
+            let id = d.id().ok()?.to_string();
+            let name = d.description().ok()?.name().to_owned();
+            Some(OutputDevice {
+                is_default: Some(&id) == default_id.as_ref(),
+                id,
+                name,
+            })
+        })
+        .collect())
+}
+
+fn find_device(id: &str) -> Option<cpal::Device> {
+    cpal::default_host().device_by_id(&id.parse().ok()?)
+}
+
+fn open_output(
+    preferred: Option<&str>,
+    allow_missing: bool,
     event_tx: mpsc::UnboundedSender<AudioPlayerEvent>,
-) -> Result<MixerDeviceSink> {
-    let diagnostics = default_output_diagnostics();
+) -> Result<(MixerDeviceSink, Option<String>)> {
     let callback = move |err: cpal::StreamError| {
         let _ = event_tx.send(AudioPlayerEvent::OutputDeviceError {
             error: err.to_string(),
         });
     };
-    open_default_sink_with_callback(callback)
-        .with_context(|| format!("failed to open default audio output ({diagnostics})"))
+    if let Some(id) = preferred {
+        if let Some(device) = find_device(id) {
+            let stream = DeviceSinkBuilder::from_device(device)?
+                .with_error_callback(callback)
+                .open_sink_or_fallback()
+                .context("failed to open selected audio output")?;
+            return Ok((stream, Some(id.to_owned())));
+        }
+        if !allow_missing {
+            bail!("Selected output device is no longer connected");
+        }
+    }
+    let stream = open_default_sink_with_callback(callback).with_context(|| {
+        format!(
+            "failed to open default audio output ({})",
+            default_output_diagnostics()
+        )
+    })?;
+    Ok((stream, default_output_device_id()))
 }
 
 fn open_default_sink_with_callback<E>(callback: E) -> Result<MixerDeviceSink, DeviceSinkError>
@@ -1013,7 +1096,7 @@ impl AudioDeviceWatcher {
         }
     }
 
-    fn poll(&mut self, playing: bool) -> Option<OutputDeviceChange> {
+    fn poll(&mut self, playing: bool, preferred: Option<&str>) -> Option<OutputDeviceChange> {
         let now = Instant::now();
         let interval = if playing {
             Self::PLAYING_INTERVAL
@@ -1024,7 +1107,11 @@ impl AudioDeviceWatcher {
             return None;
         }
         self.last_checked = now;
-        self.observe(default_output_device_id())
+        let current = preferred
+            .filter(|id| find_device(id).is_some())
+            .map(str::to_owned)
+            .or_else(default_output_device_id);
+        self.observe(current)
     }
 
     fn reset(&mut self, known_device_id: Option<String>, now: Instant) {
@@ -4124,6 +4211,17 @@ pub(crate) mod tests {
         assert_eq!(
             bytes.read_at(1_000, &mut buf, &DecodeToken::new()).unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn selecting_a_missing_output_reports_failure_before_opening_the_default() {
+        let (events, _rx) = mpsc::unbounded_channel();
+        let result = open_output(Some("missing-device-for-test"), false, events);
+        assert!(
+            result
+                .err()
+                .is_some_and(|error| error.to_string().contains("no longer connected"))
         );
     }
 

@@ -51,6 +51,8 @@ struct DesktopConfig {
     peer: Vec<String>,
     relay: Vec<String>,
     no_mdns: bool,
+    #[serde(default)]
+    output_device: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -145,13 +147,14 @@ async fn start_backend(
     if !tauri::is_dev() && !matches!(*updater.startup.lock().await, StartupUpdate::Ready) {
         return Err("complete the desktop update check before connecting".into());
     }
+    let name = connection_display_name(&config.name)?;
     let mut commands = state.commands.lock().await;
     if commands.is_some() {
         return Ok(());
     }
 
     let backend_config = BackendConfig {
-        name: config.name,
+        name: name.to_owned(),
         topic: config.topic,
         listen: parse_multiaddrs(config.listen)?,
         peer: parse_multiaddrs(config.peer)?,
@@ -193,7 +196,14 @@ async fn start_backend(
                 taskbar.clear(&window);
             });
 
-            if let Err(err) = backend::run_network(backend_config, command_rx, event_tx).await {
+            if let Err(err) = backend::run_network_with_device(
+                backend_config,
+                command_rx,
+                event_tx,
+                config.output_device,
+            )
+            .await
+            {
                 let _ = app.emit("backend-error", format!("{err:#}"));
             }
             let _ = forward_events.await;
@@ -303,6 +313,24 @@ async fn seek(state: State<'_, BackendState>, seconds: u64) -> Result<(), String
 #[tauri::command]
 async fn set_volume(state: State<'_, BackendState>, percent: u8) -> Result<(), String> {
     send_command(&state, NetworkCommand::SetVolume(percent)).await
+}
+
+#[tauri::command]
+async fn list_output_devices() -> Result<Vec<light_ear::player::OutputDevice>, String> {
+    tauri::async_runtime::spawn_blocking(light_ear::player::list_output_devices)
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn set_output_device(
+    state: State<'_, BackendState>,
+    device: Option<String>,
+) -> Result<(), String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    send_command(&state, NetworkCommand::SetOutputDevice(device, tx)).await?;
+    rx.await.map_err(|_| "audio backend stopped".to_owned())?
 }
 
 #[tauri::command]
@@ -535,6 +563,14 @@ fn parse_multiaddrs(values: Vec<String>) -> Result<Vec<Multiaddr>, String> {
         .collect()
 }
 
+fn connection_display_name(value: &str) -> Result<&str, &'static str> {
+    let name = value.trim();
+    if name.is_empty() {
+        return Err("Enter a display name before connecting.");
+    }
+    Ok(name)
+}
+
 fn sanitize_log_filename(value: &str) -> String {
     let mut filename = value
         .chars()
@@ -567,7 +603,17 @@ fn normalize_log_export_path(mut path: PathBuf) -> PathBuf {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{allow_offline_start, normalize_log_export_path, sanitize_log_filename};
+    use super::{
+        allow_offline_start, connection_display_name, normalize_log_export_path,
+        sanitize_log_filename,
+    };
+
+    #[test]
+    fn connection_requires_a_nonblank_display_name() {
+        assert!(connection_display_name("").is_err());
+        assert!(connection_display_name(" \t\u{3000}").is_err());
+        assert_eq!(connection_display_name("  小 林  "), Ok("小 林"));
+    }
 
     #[test]
     fn offline_start_respects_a_previously_confirmed_update() {
@@ -655,6 +701,8 @@ fn main() {
             resume,
             seek,
             set_volume,
+            list_output_devices,
+            set_output_device,
             skip,
             remove_queue_item,
             move_queue_item,

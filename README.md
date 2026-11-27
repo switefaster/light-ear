@@ -17,7 +17,9 @@ Run the desktop app in development with the Tauri CLI:
 npx --yes @tauri-apps/cli@^2 dev
 ```
 
-Connect with a display name, optional peer or relay addresses, and mDNS on or off. The public room browser lists rooms in your connected network. Select a room or enter a name to create one. Use the room selector or Leave room to switch without reconnecting.
+Enter a display name to connect. Relay and direct peer addresses are optional, and you can turn mDNS off. The app remembers the display name and relay addresses you last connected with on this device. Clear the relay field and connect to save an empty list.
+
+The public room browser lists rooms in your connected network. Select a room or enter a name to create one. **Settings → Leave room** returns to the browser on the same connection. Settings also contains the local playback device, media transfer controls, and searchable status log.
 
 Build the desktop bundle:
 
@@ -127,7 +129,7 @@ a delivery probe confirms the replacement path, relay links may close for that p
 
 ## Music sync
 
-Choose **Add local audio** in the queue to share an MP3, FLAC, PCM WAV, or AAC M4A. Import signs a piece index before enqueueing. Listeners can start with 12 seconds of decoded audio and serve verified pieces to other listeners. The queue’s **Media transfer** section shows peer traffic and lets you change the default 1 MiB/s upload limit. Local audio requires the coordinated v3 room upgrade.
+Choose **Add local audio** in the queue to share an MP3, FLAC, PCM WAV, or AAC M4A. Import signs a piece index before enqueueing. Listeners can start with 12 seconds of decoded audio and serve verified pieces to other listeners. **Settings → Media transfer** shows peer traffic and lets you change the default 1 MiB/s upload limit. Local audio requires the coordinated v3 room upgrade.
 
 For Bilibili songs, the peer that starts the next queue item resolves the Bilibili BV through the web API, announces a buffer prepare phase, and every expected peer streams the audio URL locally with HTTP Range requests before playback starts. Range fetch and decode run outside the main libp2p event loop, so skip/cancel/vote messages can still be processed while media is preparing. Stale stream events are ignored if the playback session, buffer operation, or track changed.
 
@@ -138,3 +140,7 @@ Queue enqueue is immediate and always appends. Moving tracks always opens a vote
 ## Manual smoke test
 
 Use `docs/test-report-audit.md` to see how the real-world test report maps to current implementation and automated coverage. Use `docs/manual-smoke-test.md` for repeatable multi-peer testing. The smoke test covers a three-person room with one relay-only peer, one direct-capable peer, and one slower peer, including chat/history sync, queue votes, playback readiness, direct promotion failure, relay fallback, duplicate display names, IME input, peer overview, and status log checks.
+
+## Credits
+
+The light-ear app icon was created by ChatGPT.
