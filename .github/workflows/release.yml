@@ -37,6 +37,9 @@ jobs:
           if not Path(f"docs/releases/{tag}.md").is_file():
               raise SystemExit(f"Missing release notes for {tag}")
 
+      - name: Test updater manifest generation
+        run: node --test .github/scripts/updater-manifest.test.cjs
+
       - name: Create draft with release notes
         id: draft
         uses: softprops/action-gh-release@v3
@@ -55,8 +58,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      # Each uploader merges its platform into the same latest.json asset.
-      max-parallel: 1
       matrix:
         include:
           - os: windows-latest
@@ -130,7 +131,7 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseDraft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
-          uploadUpdaterJson: true
+          uploadUpdaterJson: false
           uploadUpdaterSignatures: true
           args: --features fdk-aac-decoder -- --locked
 
@@ -139,3 +140,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$GITHUB_REF_NAME" relay-dist/* --clobber
+
+  updater-manifest:
+    name: Generate updater manifest
+    needs: [draft, release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Generate and upload latest.json
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.draft.outputs.id }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RUNNER_TEMP/release.json"
+          gh release download "$GITHUB_REF_NAME" --pattern '*.sig' --dir "$RUNNER_TEMP/signatures"
+          node .github/scripts/updater-manifest.cjs "$GITHUB_REF_NAME" "$RUNNER_TEMP/release.json" "$RUNNER_TEMP/signatures" > "$RUNNER_TEMP/latest.json"
+          gh release upload "$GITHUB_REF_NAME" "$RUNNER_TEMP/latest.json" --clobber

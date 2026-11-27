@@ -26,8 +26,10 @@ connections when direct addresses become usable so relay traffic stays bounded.
   Linux, and macOS. It runs frontend/Rust checks and builds the relay binary
   plus Tauri desktop bundle, but does not upload artifacts.
 - `.github/workflows/release.yml`: a version tag such as `v0.1.0` prepares a
-  GitHub draft using `docs/releases/<tag>.md`. Platform jobs add installers,
-  relay binaries and signed updater assets before the maintainer publishes it.
+  GitHub draft using `docs/releases/<tag>.md`. Windows, Linux and macOS build
+  and upload their installers, relay binaries and updater signatures in parallel.
+  After all three succeed, one job generates `latest.json` from the draft assets.
+  The maintainer publishes the completed draft.
 
 ## Useful checks
 
@@ -39,6 +41,7 @@ boundaries:
 - `cargo check --bin light-ear-relay`
 - `cargo check --manifest-path src-tauri\Cargo.toml`
 - `npm.cmd run build`
+- Updater manifest generation: `node --test .github/scripts/updater-manifest.test.cjs`
 - AAC enhancement/release parity check: `cargo check --features fdk-aac-decoder`
 - Optional live Bilibili playback check: `cargo test --lib live_bilibili_prepares_playable_audio_window -- --ignored --nocapture`. Set `LIGHT_EAR_TEST_BVID` to test another public video.
 - To compare cold and prefetched preparation time and verify the decoded opening matches sample for sample, run `cargo test --lib --features fdk-aac-decoder live_bilibili_prefetched_opening_matches_cold_audio -- --ignored --nocapture`.
