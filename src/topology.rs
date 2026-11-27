@@ -47,6 +47,8 @@ pub fn view(directory: &Directory) -> TopologyView {
                 lanes: link.lanes & back.lanes,
                 rtt_ms: link.rtt_ms.max(back.rtt_ms),
                 degraded: link.degraded || back.degraded,
+                media_bytes: link.media_rx.saturating_add(back.media_rx),
+                media_relay_bytes: link.media_relay_rx.saturating_add(back.media_relay_rx),
             })
             .collect(),
     }
@@ -410,6 +412,7 @@ mod tests {
                 addresses: vec![],
                 transit_rooms: 8,
                 upload_utilization: 0,
+                media_p95_ms: None,
                 leases: [vec![], vec!["music".into()]],
                 repairs: vec![],
                 links: neighbors
@@ -422,6 +425,8 @@ mod tests {
                         degraded: lanes == 1,
                         payload_bytes: [0; 2],
                         circuit_bytes: 0,
+                        media_rx: 0,
+                        media_relay_rx: 0,
                     })
                     .collect(),
             };

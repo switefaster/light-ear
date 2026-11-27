@@ -362,6 +362,7 @@ pub async fn resolve_track(
         media_init_range: media.init_range,
         media_index_range: media.index_range,
         media_is_progressive: media.progressive,
+        local_audio: None,
     })
 }
 

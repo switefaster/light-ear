@@ -235,3 +235,10 @@ If any peer diverges, save:
 ## Adaptive topology and room discovery
 
 Start two groups with separate LAN discovery and a single connection between them. Open the public room browser in each group. Check that a remote room appears within two directory refreshes, join it, then switch rooms and verify the local peer ID stays the same. In the peer overview, record per-neighbor payload byte deltas and worst-receiver p95 before and after adding a second crossing. Use sustained chat traffic for the comparison. Disconnect the first gateway and verify history convergence and voting. Repeat with only the circuit available, restore the peer path, then check that the circuit payload counter stops growing.
+
+## Local audio
+
+1. In a room with two listeners and a leased helper, add a ten-minute WAV and a variable-bitrate MP3. Cancel a second import and verify only the completed items appear. Confirm the requester can remove their song directly and another listener sees a vote.
+2. Start the track and seek near the end. Compare the decoded window, song position and source status on both devices. Add a late listener and check that their progress begins near the room position.
+3. During playback, inspect media bytes in the topology and the queue’s Media transfer panel. Lower one supplier’s upload limit. Check that chat and votes still arrive and that a healthy alternative carries more bytes.
+4. Leave on the uploader. Check that the same session continues from cached pieces, then seek to an uncached section. Verify the source wait is visible and the queue advances once after the recovery deadline.

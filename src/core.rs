@@ -50,6 +50,8 @@ pub struct PlaybackTrack {
     pub media_index_range: Option<PlaybackByteRange>,
     #[serde(default)]
     pub media_is_progressive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_audio: Option<crate::local_audio::Descriptor>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -212,6 +214,8 @@ pub struct TopologyLink {
     pub target: String,
     pub direct: bool,
     pub lanes: u8,
+    pub media_bytes: u64,
+    pub media_relay_bytes: u64,
     pub rtt_ms: u32,
     pub degraded: bool,
 }
@@ -226,6 +230,21 @@ pub struct TopologyView {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum FrontendEvent {
     Topology(TopologyView),
+    AudioImport {
+        id: String,
+        title: String,
+        percent: u8,
+        finished: bool,
+    },
+    MediaMetrics {
+        neighbors: BTreeMap<String, [u64; 3]>,
+        lane_bytes: [u64; 2],
+        retries: u64,
+        receiver_p95_ms: Option<u64>,
+        worst_receiver_p95_ms: Option<u64>,
+        waiting: bool,
+        shortfall_kib_s: Option<u64>,
+    },
     NetworkMetrics {
         received_bytes: BTreeMap<String, [u64; 2]>,
         circuit_payload_bytes: u64,
@@ -329,6 +348,9 @@ pub enum WireMessage {
     PlaybackBufferPrepare {
         #[serde(default)]
         queue_item_id: Option<String>,
+        /// Version the leader expects to publish when this preparation commits.
+        #[serde(default)]
+        commit_version: Option<u64>,
         operation_id: String,
         session_id: String,
         track_id: String,
@@ -409,6 +431,10 @@ pub enum WireMessage {
 #[derive(Debug)]
 pub enum NetworkCommand {
     #[cfg(test)]
+    TestPlayback(tokio::sync::oneshot::Sender<Option<PlaybackState>>),
+    #[cfg(test)]
+    TestMediaClient(tokio::sync::oneshot::Sender<crate::local_audio::Client>),
+    #[cfg(test)]
     DialTestPeer(libp2p::Multiaddr),
     #[cfg(test)]
     LearnTestCandidate(libp2p::Multiaddr),
@@ -424,6 +450,13 @@ pub enum NetworkCommand {
         part: usize,
         position: Option<usize>,
     },
+    EnqueueLocal {
+        path: std::path::PathBuf,
+        room: String,
+        id: String,
+    },
+    CancelImport(String),
+    MediaUploadLimit(usize),
     ShowQueue,
     Pause,
     Resume,

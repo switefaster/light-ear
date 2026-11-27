@@ -298,8 +298,26 @@ impl BufferCoordinator {
 }
 
 impl BufferOperation {
+    /// Both room trees can deliver the pre-seek pause after the new prepare.
+    pub(crate) fn precedes_commit(&self, state: &PlaybackState) -> bool {
+        self.state.session_id == state.session_id
+            && self.state.leader_peer_id == state.leader_peer_id
+            && self
+                .state
+                .track
+                .as_ref()
+                .zip(state.track.as_ref())
+                .is_some_and(|(a, b)| a.track_id == b.track_id)
+            && if self.state.state_version == 0 {
+                // Older senders omitted the planned version.
+                !state.playing
+            } else {
+                state.state_version < self.state.state_version
+            }
+    }
+
     fn is_resolved_by_playback_state(&self, state: &PlaybackState) -> bool {
-        if self.state.session_id != state.session_id {
+        if self.state.session_id != state.session_id || self.precedes_commit(state) {
             return false;
         }
         let Some(track) = state.track.as_ref() else {
@@ -428,6 +446,7 @@ mod tests {
                 media_init_range: None,
                 media_index_range: None,
                 media_is_progressive: false,
+                local_audio: None,
             }),
             playing,
             ..state(session_id)
@@ -736,6 +755,32 @@ mod tests {
                 .map(|operation| operation.operation_id),
             Some("op".to_string())
         );
+    }
+
+    #[test]
+    fn reordered_snapshots_do_not_interrupt_remote_seek_preparation() {
+        let mut buffer = BufferCoordinator::new();
+        let mut seek = track_state("session", false);
+        seek.state_version = 12;
+        seek.position_ms = 503_123;
+        buffer.receive_remote_operation(
+            "seek".into(),
+            None,
+            seek.clone(),
+            PlaybackBufferOperationKind::Seek,
+            peers(["listener", "leader"]),
+            Duration::from_secs(90),
+            Instant::now(),
+        );
+        for (version, playing) in [(10, true), (11, false)] {
+            let mut previous = track_state("session", playing);
+            previous.state_version = version;
+            assert!(buffer.active().unwrap().precedes_commit(&previous));
+            assert!(buffer.clear_matching_playback_state(&previous).is_none());
+        }
+        seek.playing = true;
+        assert!(!buffer.active().unwrap().precedes_commit(&seek));
+        assert!(buffer.clear_matching_playback_state(&seek).is_some());
     }
 
     #[test]

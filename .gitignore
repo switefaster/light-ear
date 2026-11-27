@@ -12,3 +12,12 @@
 !.env.example
 *.log
 *.jsonl
+
+# Only the three codec regression samples are needed from local audio test runs.
+/src/local_audio/fixtures/*.mp3
+/src/local_audio/fixtures/*.flac
+/src/local_audio/fixtures/*.wav
+/src/local_audio/fixtures/*.m4a
+!/src/local_audio/fixtures/tone.mp3
+!/src/local_audio/fixtures/tone.flac
+!/src/local_audio/fixtures/tone.m4a

@@ -218,6 +218,43 @@ async fn send_chat(state: State<'_, BackendState>, text: String) -> Result<(), S
 }
 
 #[tauri::command]
+async fn enqueue_local_audio(
+    app: AppHandle,
+    state: State<'_, BackendState>,
+    room: String,
+    id: String,
+) -> Result<(), String> {
+    let file = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_title("Add local audio")
+            .add_filter("Audio", &["mp3", "flac", "wav", "m4a"])
+            .blocking_pick_file()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    if let Some(file) = file {
+        send_command(
+            &state,
+            NetworkCommand::EnqueueLocal {
+                path: file.into_path().map_err(|e| e.to_string())?,
+                room,
+                id,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+#[tauri::command]
+async fn cancel_audio_import(state: State<'_, BackendState>, id: String) -> Result<(), String> {
+    send_command(&state, NetworkCommand::CancelImport(id)).await
+}
+#[tauri::command]
+async fn set_media_upload_limit(state: State<'_, BackendState>, kib: usize) -> Result<(), String> {
+    send_command(&state, NetworkCommand::MediaUploadLimit(kib)).await
+}
+#[tauri::command]
 async fn enqueue_bilibili(
     state: State<'_, BackendState>,
     bvid: String,
@@ -608,6 +645,9 @@ fn main() {
             join_room,
             leave_room,
             send_chat,
+            enqueue_local_audio,
+            cancel_audio_import,
+            set_media_upload_limit,
             enqueue_bilibili,
             read_clipboard_text,
             show_queue,

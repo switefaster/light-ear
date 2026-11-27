@@ -1,6 +1,6 @@
 # light-ear architecture
 
-`light-ear` is a P2P chat and shared listening app. Its core goal is not to stream audio between peers, but to synchronize chat history, a shared queue, vote results, and playback state so each client can download audio locally and play it at roughly the same time.
+`light-ear` is a P2P chat and shared listening app. It synchronizes chat, queue edits, votes, and playback. Listeners resolve Bilibili audio locally and exchange verified pieces of user-selected audio files.
 
 This document describes the current implementation boundaries. Runtime commands and examples live in `README.md`; repeatable real-world checks live in `docs/manual-smoke-test.md`.
 
@@ -88,7 +88,7 @@ The event loop should stay responsive. Bilibili Range fetch and Symphonia decode
 
 ## Wire Messages And Source Validation
 
-Room protocol messages are JSON `WireMessage` values inside a room-scoped packet. Both v2 forwarding trees carry the same public room topic over separate gossipsub protocol IDs. The signed publisher and packet ID identify a publication across retries.
+Room protocol messages are JSON `WireMessage` values inside a room-scoped packet. Both v3 forwarding trees carry the same public room topic over separate gossipsub protocol IDs. The signed publisher and packet ID identify a publication across retries.
 
 `HistoryRequest`, `HistoryResponse`, `QueueRequest`, and `QueueResponse` keep their `target` fields, but they are still broadcast over gossipsub and ignored by non-target peers. If gossipsub reports `NoPeersSubscribedToTopic`, the backend reports a status error and does not attempt direct request-response fallback.
 
@@ -127,7 +127,7 @@ Peers can meet in three ways:
 - mDNS on LAN, unless disabled;
 - relay/rendezvous discovery.
 
-Clients bootstrap through the shared `light-ear.network.v2` rendezvous namespace. A desktop can browse before joining. Changing rooms keeps the identity and swarm and resets local chat, queue, audio and voting state. Clients require a coordinated upgrade. The relay can continue providing standard libp2p circuit and rendezvous services.
+Clients bootstrap through the shared `light-ear.network.v3` rendezvous namespace. A desktop can browse before joining. Changing rooms keeps the identity and swarm and resets local chat, queue, audio and voting state. Clients require a coordinated upgrade. The relay can continue providing standard libp2p circuit and rendezvous services.
 
 - `src/directory.rs` signs per-origin membership and reachability records. Directory peers compare sequence summaries over an authenticated request-response protocol. Pages contain up to eight records. The directory supports 512 participants. Records refresh at 30 seconds and expire 90 seconds after issuance, with five seconds of future clock tolerance. Only public IP candidates are shared globally.
 - `src/topology.rs` builds the graph from reciprocal link reports. A depth-first search identifies single-peer cuts. The primary forwarding tree uses path costs. The alternate penalizes reusing central edges of the primary. Both normally prefer an all-direct path. Each room needs only the branches joining its members. Ordinary peers may take up to eight foreign-room subscriptions. Renewed directory records maintain those subscriptions.
@@ -273,7 +273,13 @@ Current rules:
 
 ## Bilibili And Audio
 
-Playback does not stream audio from peer to peer. Each client resolves and streams audio locally from Bilibili using HTTP Range requests.
+Bilibili uses HTTP Range. Local audio uses the same sparse player byte cache and decoded readiness window. A native picker starts a cancelable background import. The signed room descriptor binds the sharer, title, format, length, duration, sparse seek points and SHA-256 root. The uploader keeps the file and its disk-backed Merkle index. A listener verifies each 64 KiB piece against its index and exact length, including the short final piece.
+
+The binary `/light-ear/media/1` protocol carries requests, availability and pieces between established reciprocal tree neighbors. Gateways combine outstanding requests for identical pieces. Both trees can carry distinct pieces concurrently. Confirmed delivery time, pending bytes and advertised upload utilization influence supplier selection. Device upload limits include foreign-room traffic, which also spends the existing room transit budget. Public circuits follow the overlay's health policy. Signed directory observations expose per-edge media bytes and the worst room receiver's p95.
+
+An MP3 decoder starts at the indexed frame before its target, including reservoir preroll. Up to four adjacent pieces can be in flight through the last indexed frame needed for the 12-second readiness window. A new seek drops the previous decoder's outstanding demand. Buffer prepares carry the planned commit version so a late pre-seek pause cannot redirect the follower's decoder.
+
+Temporary pieces and inclusion proofs share a 512 MiB disk budget. Decoder requests and the active window take priority over queue lookahead. A replacement coordinator continues the current local-audio session after signed membership or confirmed route loss establishes the previous leader's departure. Missing pieces are retried within the existing preparation deadline.
 
 While the current track has 15 seconds of decoded audio ahead or is buffered through its end, each listener can prefetch the first 2 MiB of the next two queue entries, one at a time. A verified shorter final range covers an entire small file. The player retains the bytes with the local media source and its verified length for up to ten minutes. Queue changes evict displaced entries and foreground buffering cancels pending work. At the next start the normal decoder consumes the cached opening and the downloader continues with missing ranges. Readiness and the room start anchor still come from the usual buffer quorum.
 

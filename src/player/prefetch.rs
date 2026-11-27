@@ -21,6 +21,13 @@ pub(super) struct Opening {
 }
 
 impl Opening {
+    pub(super) fn local(media: PlaybackTrack, bytes: Vec<u8>) -> Self {
+        Self {
+            total: media.local_audio.as_ref().unwrap().info.length,
+            media,
+            bytes: bytes.into(),
+        }
+    }
     pub(super) async fn fetch(client: reqwest::Client, media: PlaybackTrack) -> Result<Self> {
         let (bytes, probe) = media_cache::fetch_opening_bytes(&client, &media).await?;
         let total = probe
@@ -89,9 +96,8 @@ impl QueuePrefetch {
             return;
         }
         let Some(track) = upcoming().find(|t| {
-            t.source_kind == "bilibili"
-                && !t.bvid.is_empty()
-                && t.part > 0
+            (t.local_audio.is_some()
+                || (t.source_kind == "bilibili" && !t.bvid.is_empty() && t.part > 0))
                 && !self.entries.iter().any(|entry| same_media(t, &entry.track))
         }) else {
             return;
@@ -143,6 +149,7 @@ mod tests {
                 media_init_range: None,
                 media_index_range: None,
                 media_is_progressive: false,
+                local_audio: None,
             },
         }
     }

@@ -32,7 +32,7 @@ Release builds are signed for the Tauri updater. The public updater key is in
 its contents as the GitHub secret `TAURI_SIGNING_PRIVATE_KEY`. If the key is
 password-protected, set `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` as well.
 
-Clients register with rendezvous under the shared light-ear.network.v2 namespace. Signed room advertisements also travel between ordinary peers. A LAN group can discover a remote group through one connected member. Clients then try to establish other direct paths. Upgrade all room clients together.
+Clients register with rendezvous under the shared light-ear.network.v3 namespace. Signed room advertisements also travel between ordinary peers. A LAN group can discover a remote group through one connected member. Clients then try to establish other direct paths. Upgrade all room clients together.
 
 Run a minimal public relay plus rendezvous node on a reachable host:
 
@@ -127,7 +127,9 @@ a delivery probe confirms the replacement path, relay links may close for that p
 
 ## Music sync
 
-Music sync uses a shared queue and playback state instead of P2P audio streaming. The peer that starts the next queue item resolves the Bilibili BV through the web API, announces a buffer prepare phase, and every expected peer streams the audio URL locally with HTTP Range requests before playback starts. Range fetch and decode run outside the main libp2p event loop, so skip/cancel/vote messages can still be processed while media is preparing. Stale stream events are ignored if the playback session, buffer operation, or track changed.
+Choose **Add local audio** in the queue to share an MP3, FLAC, PCM WAV, or AAC M4A. Import signs a piece index before enqueueing. Listeners can start with 12 seconds of decoded audio and serve verified pieces to other listeners. The queue’s **Media transfer** section shows peer traffic and lets you change the default 1 MiB/s upload limit. Local audio requires the coordinated v3 room upgrade.
+
+For Bilibili songs, the peer that starts the next queue item resolves the Bilibili BV through the web API, announces a buffer prepare phase, and every expected peer streams the audio URL locally with HTTP Range requests before playback starts. Range fetch and decode run outside the main libp2p event loop, so skip/cancel/vote messages can still be processed while media is preparing. Stale stream events are ignored if the playback session, buffer operation, or track changed.
 
 The resolver first prefers DASH audio and falls back to single-file `durl` media when needed. If WBI playurl returns HTTP 412, or a successful playurl response has no usable media URL, the backend tries the legacy playurl endpoint before reporting failure.
 

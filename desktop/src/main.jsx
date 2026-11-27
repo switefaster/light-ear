@@ -58,6 +58,8 @@ const initialRoom = {
   peers: [],
   topology: null,
   networkMetrics: null,
+  audioImports: {},
+  mediaMetrics: null,
   peerNames: [],
   hadPeers: false,
   peerDropAlert: false,
@@ -245,6 +247,13 @@ function App() {
       canceled = true;
     };
   }, [checkAttempt]);
+
+  useEffect(() => {
+    if (!room.backendRunning) return;
+    const kib = Number(localStorage.getItem("mediaUploadKiB")) || 1024;
+    invoke("set_media_upload_limit", { kib })
+      .catch(error => setRoom(current => appendStatus(current, formatError(error))));
+  }, [room.backendRunning]);
 
   async function callCommand(command, args = {}, options = {}) {
     const requiresBackend = options.requiresBackend ?? true;
@@ -614,6 +623,7 @@ function RoomConsole({ room, setRoom, callCommand, onOpenLog, onOpenPeers, displ
 
       <PlayerDock
         playback={playback}
+        media={room.mediaMetrics}
         cache={room.playbackCache}
         buffer={room.playbackBuffer}
         progress={progress}
@@ -628,6 +638,7 @@ function RoomConsole({ room, setRoom, callCommand, onOpenLog, onOpenPeers, displ
       <QueueDrawer
         open={queueOpen}
         items={queuedItems}
+        room={room}
         localPeerId={room.localPeerId}
         callCommand={callCommand}
         onClose={() => setQueueOpen(false)}
@@ -790,6 +801,7 @@ function RoomNavBar({
 }
 
 function PlayerDock({
+  media,
   playback,
   cache,
   buffer,
@@ -824,6 +836,8 @@ function PlayerDock({
           <span className={`pill ${playback?.playing ? "playing" : playback ? "paused" : "neutral"}`}>
             {preparing ? "buffering" : playback ? (playback.playing ? "playing" : "paused") : "standing by"}
           </span>
+          {media?.waiting && <span role="status" className="pill buffering">Waiting for an audio source</span>}
+          {media?.shortfall_kib_s > 0 && <span className="pill buffering">Audio delivery is {media.shortfall_kib_s} KiB/s below the track bitrate</span>}
           {bufferLabel && <span className="pill buffering">{bufferLabel}</span>}
           {!bufferLabel && cacheLabel && <span className="pill buffering">{cacheLabel}</span>}
           {!preparing && <span>{playback ? `leader ${leaderName}` : "no track selected"}</span>}
@@ -963,9 +977,18 @@ function SeekBar({ playback, progress, cacheRange, onSeekRequest }) {
   );
 }
 
-function QueueDrawer({ open, items, localPeerId, callCommand, onClose, onRequestMove, displayName }) {
+function QueueDrawer({ open, room, items, localPeerId, callCommand, onClose, onRequestMove, displayName }) {
   const [queueForm, setQueueForm] = useState({ bvid: "", part: "" });
   const clipboardBvidRef = useRef("");
+  const [uploadLimit, setUploadLimit] = useState(() => localStorage.getItem("mediaUploadKiB") || "1024");
+
+  async function saveLimit() {
+    const kib = Math.min(102400, Math.max(1, Math.round(Number(uploadLimit) || 1024)));
+    if (await callCommand("set_media_upload_limit", { kib })) {
+      setUploadLimit(String(kib));
+      localStorage.setItem("mediaUploadKiB", String(kib));
+    }
+  }
 
   useEffect(() => {
     if (!open) return undefined;
@@ -1051,7 +1074,20 @@ function QueueDrawer({ open, items, localPeerId, callCommand, onClose, onRequest
               Add
             </button>
           </div>
+          <button className="btn" type="button" onClick={() => callCommand("enqueue_local_audio",{room:room.active,id:crypto.randomUUID()})}>Add local audio</button>
+          {Object.values(room.audioImports || {}).map(importing => <div key={importing.id}>
+            <label>{importing.title} <progress max="100" value={importing.percent}/></label>
+            <button className="btn" type="button" onClick={()=>callCommand("cancel_audio_import",{id:importing.id})}>Cancel import</button>
+          </div>)}
         </form>
+        <details className="queue-add-form"><summary>Media transfer</summary>
+          <label>Upload limit (KiB/s) <input type="number" min="1" max="102400" value={uploadLimit} onChange={e=>setUploadLimit(e.target.value)} onBlur={saveLimit}/></label>
+          {room.mediaMetrics && <div>
+            <p>Worst listener p95 {room.mediaMetrics.worst_receiver_p95_ms ?? "—"} ms · Retries {room.mediaMetrics.retries}</p>
+            {Object.entries(room.mediaMetrics.neighbors).map(([peer,[sent,received,relay]])=>
+              <p key={peer}>{displayName(peer)} · Sent {Math.round(sent/1024)} KiB · Received {Math.round(received/1024)} KiB · Relay {Math.round(relay/1024)} KiB</p>)}
+          </div>}
+        </details>
 
         <QueueList
           items={items}
@@ -1063,6 +1099,11 @@ function QueueDrawer({ open, items, localPeerId, callCommand, onClose, onRequest
       </aside>
     </>
   );
+}
+
+function trackSourceLabel(track) {
+  if (track.local_audio) return `Local ${track.local_audio.info.format.toUpperCase()}`;
+  return `${track.bvid} P${track.part || 1}`;
 }
 
 function QueueList({ items, localPeerId, onRemove, onRequestMove, displayName }) {
@@ -1105,7 +1146,7 @@ function QueueList({ items, localPeerId, onRemove, onRequestMove, displayName })
       itemId: item.item_id,
       targetId: items[toIndex].item_id,
       title: item.track.title,
-      meta: `${item.track.bvid} P${item.track.part || 1}`,
+      meta: trackSourceLabel(item.track),
     });
   }
 
@@ -1155,7 +1196,7 @@ function QueueList({ items, localPeerId, onRemove, onRequestMove, displayName })
           <div className="queue-track">
             <strong>{item.track.title}</strong>
             <span>
-              {item.track.bvid} P{item.track.part || 1} - {formatMs(item.track.duration_ms)}
+              {trackSourceLabel(item.track)} · {formatMs(item.track.duration_ms)}
             </span>
             <small>by {displayName(item.requested_by, item.requested_by_name)}</small>
           </div>
@@ -1597,11 +1638,18 @@ function StatusFeed({ statuses, compact = false, maxLines = 1, onOpenLog }) {
 function applyBackendEvent(current, event) {
   switch (event.type) {
     case "topology": return {...current, topology: event.payload};
+    case "audio_import": {
+      const audioImports={...current.audioImports};
+      if(event.payload.finished) delete audioImports[event.payload.id];
+      else if (event.payload.percent === 0 || audioImports[event.payload.id]) audioImports[event.payload.id] = event.payload;
+      return {...current,audioImports};
+    }
+    case "media_metrics":return {...current,mediaMetrics:event.payload};
     case "network_metrics": return {...current, networkMetrics:event.payload};
     case "room_directory": {
       const {active, rooms} = event.payload;
       if (active === current.active) return {...current, rooms};
-      return {...current, active, rooms, networkMetrics: null, messages: [], peerNames: [], playback: null, playbackCache: null, playbackBuffer: null, queue: null, vote: null, peerCount: 0, hadPeers: false, peerDropAlert: false};
+      return {...current, active, rooms, networkMetrics: null, audioImports:{}, mediaMetrics:null, messages: [], peerNames: [], playback: null, playbackCache: null, playbackBuffer: null, queue: null, vote: null, peerCount: 0, hadPeers: false, peerDropAlert: false};
     }
     case "status":
       return appendStatus(current, event.payload);

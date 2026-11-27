@@ -1,7 +1,7 @@
 mod prefetch;
 
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     io::{Cursor, Read, Seek, SeekFrom},
     num::{NonZeroU16, NonZeroU32},
     sync::{
@@ -13,6 +13,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use cpal::traits::{DeviceTrait, HostTrait};
+use futures::{StreamExt, stream::FuturesUnordered};
 use rodio::{DeviceSinkBuilder, DeviceSinkError, MixerDeviceSink, Player, Source};
 #[cfg(not(feature = "fdk-aac-decoder"))]
 use symphonia::default::get_codecs;
@@ -43,6 +44,7 @@ const STREAM_PCM_RETAIN_BEHIND_MS: u64 = media_cache::LOW_WATERMARK_MS;
 const STREAM_PCM_TRIM_GRANULARITY_MS: u64 = 1_000;
 const STREAM_BYTE_RETAIN_BEHIND_BYTES: u64 = media_cache::STREAM_CHUNK_BYTES * 4;
 const STREAM_MAX_PENDING_OFFSETS: usize = 6;
+const LOCAL_PIECES_IN_FLIGHT: usize = 4;
 const STREAM_SMALL_FULL_FETCH_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
 const STREAM_DOWNLOAD_IDLE_SLEEP_MS: u64 = 250;
 const STREAM_RANGE_REQUEST_SPACING_MS: u64 = 750;
@@ -57,6 +59,7 @@ pub struct AudioPlayer {
     session_id: Option<String>,
     audio: Option<DecodedAudio>,
     streaming: Option<StreamingSession>,
+    pub(crate) pieces: Option<crate::local_audio::Client>,
     queue_prefetch: prefetch::QueuePrefetch,
     position_ms: u64,
     started_at_micros: i64,
@@ -106,12 +109,17 @@ struct StreamingMediaSource {
     shared: SharedBytes,
     decoder: DecodeToken,
     cursor: u64,
+    /// Virtual header length and original frame offset for indexed MP3/FLAC seeks.
+    splice: Option<(u64, u64)>,
+    /// Last indexed MP3 byte known to be needed for this decoder's readiness window.
+    ready_through: Option<u64>,
     seekable: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
 struct SharedBytes {
     inner: Arc<(Mutex<StreamingBytesState>, Condvar)>,
+    demand_changed: Arc<tokio::sync::Notify>,
 }
 
 struct StreamingBytesState {
@@ -124,6 +132,8 @@ struct StreamingBytesState {
     requested_offsets: VecDeque<u64>,
     decoder_offset: Option<u64>,
     prepared_once: bool,
+    local: bool,
+    generation: u64,
 }
 
 #[derive(Clone)]
@@ -238,6 +248,7 @@ impl AudioPlayer {
             session_id: None,
             audio: None,
             streaming: None,
+            pieces: None,
             queue_prefetch: prefetch::QueuePrefetch::default(),
             position_ms: 0,
             started_at_micros: 0,
@@ -337,7 +348,19 @@ impl AudioPlayer {
         self.queue_prefetch.update(queue, allowed, |track| {
             let media = resolve(track);
             let client = client.clone();
-            async move { prefetch::Opening::fetch(client, media.await?).await }
+            let pieces = self.pieces.clone();
+            async move {
+                let track = media.await?;
+                if let Some(d) = &track.local_audio {
+                    let client = pieces.ok_or_else(|| anyhow!("room closed"))?;
+                    let mut opening = Vec::new();
+                    for i in 0..d.count().min(32) {
+                        opening.extend(client.fetch(d, i, true).await?.bytes);
+                    }
+                    return Ok(prefetch::Opening::local(track, opening));
+                }
+                prefetch::Opening::fetch(client, track).await
+            }
         });
     }
 
@@ -416,6 +439,9 @@ impl AudioPlayer {
         if let Some(session) = self.streaming.as_mut().filter(|session| {
             session.session_id == session_id && session.track_id == track.track_id
         }) {
+            if let Some(sink) = self.sink.take() {
+                sink.stop();
+            }
             self.track_id = Some(track.track_id.clone());
             self.session_id = Some(session_id.clone());
             self.position_ms = position_ms;
@@ -499,8 +525,14 @@ impl AudioPlayer {
             None
         };
         let bytes = SharedBytes::new();
+        if let Some(d) = &track.local_audio {
+            bytes.inner.0.lock().unwrap().local = true;
+            bytes.set_total(Some(d.info.length));
+        }
+        let pieces = self.pieces.clone();
         let warmed_media = opening.map(|opening| opening.install(&bytes));
         let pcm = SharedPcm::new();
+        pcm.set_base_position(position_ms);
         let decoder = DecodeToken::new();
         let position = Arc::new(AtomicU64::new(self.position_ms));
         let session = StreamingSession {
@@ -535,6 +567,14 @@ impl AudioPlayer {
                 };
                 if download_bytes.is_canceled() {
                     return Ok(());
+                }
+                if let Some(d) = playable.local_audio {
+                    return download_local_bytes(
+                        pieces.ok_or_else(|| anyhow!("no room media service"))?,
+                        d,
+                        download_bytes,
+                    )
+                    .await;
                 }
                 download_streaming_bytes(
                     download_client,
@@ -610,18 +650,29 @@ impl AudioPlayer {
                     .map(|streaming| streaming.duration_ms)
                     .unwrap_or(position_ms),
             );
-            let ready = self.streaming.as_ref().is_some_and(|streaming| {
-                streaming.position_ms.store(position_ms, Ordering::Relaxed);
-                stream_pcm_ready_for_position(&streaming.pcm, position_ms, streaming.duration_ms)
-            });
+            let streaming = self.streaming.as_ref().unwrap();
+            let previous_target = streaming.position_ms.swap(position_ms, Ordering::Relaxed);
+            let ready =
+                stream_pcm_ready_for_position(&streaming.pcm, position_ms, streaming.duration_ms);
+            // A follower catching up after quorum commit receives a moving clock target
+            // every tick. Let the same decoder reach it while its timeline advances.
+            let catching_up = !self.playing
+                && streaming.track.local_audio.is_some()
+                && (previous_target..=previous_target.saturating_add(media_cache::READY_WINDOW_MS))
+                    .contains(&position_ms);
             self.position_ms = position_ms;
             if ready {
                 return self.restart_streaming(position_ms, playing);
             }
+            if let Some(sink) = self.sink.take() {
+                sink.stop();
+            }
 
             let cache_view = self.streaming.as_mut().map(|streaming| {
-                if position_ms < streaming.pcm.base_position_ms()
-                    || position_ms > streaming.pcm.buffered_until_ms().min(streaming.duration_ms)
+                if !catching_up
+                    && (position_ms < streaming.pcm.base_position_ms()
+                        || position_ms
+                            > streaming.pcm.buffered_until_ms().min(streaming.duration_ms))
                 {
                     streaming.restart_decoder(
                         None,
@@ -1253,6 +1304,10 @@ fn codec_registry() -> &'static CodecRegistry {
     static REGISTRY: OnceLock<CodecRegistry> = OnceLock::new();
     REGISTRY.get_or_init(|| {
         let mut registry = CodecRegistry::new();
+        use symphonia::default::codecs::{FlacDecoder, MpaDecoder, PcmDecoder};
+        registry.register_all::<MpaDecoder>();
+        registry.register_all::<FlacDecoder>();
+        registry.register_all::<PcmDecoder>();
         registry.register_all::<symphonia_adapter_fdk_aac::AacDecoder>();
         registry
     })
@@ -1515,6 +1570,8 @@ impl StreamingMediaSource {
             shared,
             decoder,
             cursor: 0,
+            splice: None,
+            ready_through: None,
             seekable: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -1522,7 +1579,19 @@ impl StreamingMediaSource {
 
 impl Read for StreamingMediaSource {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let bytes = self.shared.read_at(self.cursor, buf, &self.decoder)?;
+        let (offset, max) = match self.splice {
+            Some((header, frame)) if self.cursor >= header => {
+                (frame + self.cursor - header, buf.len())
+            }
+            Some((header, _)) => (self.cursor, buf.len().min((header - self.cursor) as usize)),
+            None => (self.cursor, buf.len()),
+        };
+        let bytes = self.shared.read_for_decoder(
+            offset,
+            &mut buf[..max],
+            &self.decoder,
+            self.ready_through,
+        )?;
         self.cursor = self.cursor.saturating_add(bytes as u64);
         Ok(bytes)
     }
@@ -1536,7 +1605,7 @@ impl Seek for StreamingMediaSource {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid seek")
             })?,
             SeekFrom::End(delta) => {
-                let len = self.shared.total_bytes().ok_or_else(|| {
+                let len = self.byte_len().ok_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::Unsupported, "unknown stream length")
                 })?;
                 len.checked_add_signed(delta).ok_or_else(|| {
@@ -1555,7 +1624,10 @@ impl MediaSource for StreamingMediaSource {
     }
 
     fn byte_len(&self) -> Option<u64> {
-        self.shared.total_bytes()
+        self.shared.total_bytes().map(|len| {
+            self.splice
+                .map_or(len, |(header, start)| len - start + header)
+        })
     }
 }
 
@@ -1634,9 +1706,76 @@ async fn sleep_streaming_download(shared: &SharedBytes, duration: Duration) -> b
     }
 }
 
+impl StreamingBytesState {
+    fn request_start(&self, offset: u64) -> u64 {
+        if self.local {
+            offset / (crate::local_audio::PIECE as u64) * (crate::local_audio::PIECE as u64)
+        } else {
+            normalized_stream_request_offset(offset, self.total_bytes)
+        }
+    }
+}
+
+async fn download_local_bytes(
+    client: crate::local_audio::Client,
+    d: crate::local_audio::Descriptor,
+    bytes: SharedBytes,
+) -> Result<()> {
+    let piece = crate::local_audio::PIECE as u64;
+    let mut requests = FuturesUnordered::new();
+    let mut in_flight = HashSet::new();
+    let mut generation = 0;
+    let fetch = |start| {
+        let request = client.fetch(&d, start / piece, false);
+        async move { (start, request.await) }
+    };
+    loop {
+        {
+            let mut state = bytes.inner.0.lock().unwrap();
+            if state.canceled {
+                return Ok(());
+            }
+            if generation != state.generation {
+                requests.clear();
+                in_flight.clear();
+                generation = state.generation;
+            }
+            while requests.len() < LOCAL_PIECES_IN_FLIGHT {
+                let Some(start) = state.requested_offsets.pop_front() else {
+                    break;
+                };
+                if !state.ranges.ranges().iter().any(|r| r.contains(start))
+                    && in_flight.insert(start)
+                {
+                    requests.push(fetch(start));
+                }
+            }
+        }
+        let (start, result) = tokio::select! {
+            Some(response) = requests.next(), if !requests.is_empty() => response,
+            _ = bytes.demand_changed.notified() => continue,
+        };
+        in_flight.remove(&start);
+        if bytes.inner.0.lock().unwrap().generation != generation {
+            continue;
+        }
+        let data = result?.bytes;
+        let end = start + data.len() as u64 - 1;
+        bytes.append_chunk(StreamingByteChunk {
+            range: media_cache::ByteRange {
+                start,
+                end_inclusive: end,
+            },
+            bytes: data.into(),
+        });
+        bytes.retain_window(start.saturating_sub(32 * piece), end + 32 * piece);
+    }
+}
+
 impl SharedBytes {
     fn new() -> Self {
         Self {
+            demand_changed: Default::default(),
             inner: Arc::new((
                 Mutex::new(StreamingBytesState {
                     chunks: Vec::new(),
@@ -1648,6 +1787,8 @@ impl SharedBytes {
                     requested_offsets: VecDeque::new(),
                     decoder_offset: None,
                     prepared_once: false,
+                    local: false,
+                    generation: 0,
                 }),
                 Condvar::new(),
             )),
@@ -1735,6 +1876,7 @@ impl SharedBytes {
         let mut state = lock.lock().expect("streaming bytes lock poisoned");
         state.canceled = true;
         condvar.notify_all();
+        self.demand_changed.notify_one();
     }
 
     fn is_canceled(&self) -> bool {
@@ -1784,7 +1926,7 @@ impl SharedBytes {
     fn request_offset(&self, offset: u64) {
         let (lock, condvar) = &*self.inner;
         let mut state = lock.lock().expect("streaming bytes lock poisoned");
-        let offset = normalized_stream_request_offset(offset, state.total_bytes);
+        let offset = state.request_start(offset);
         if !state
             .ranges
             .ranges()
@@ -1799,7 +1941,7 @@ impl SharedBytes {
     fn prioritize_offset(&self, offset: u64) {
         let (lock, condvar) = &*self.inner;
         let mut state = lock.lock().expect("streaming bytes lock poisoned");
-        let offset = normalized_stream_request_offset(offset, state.total_bytes);
+        let offset = state.request_start(offset);
         if !state
             .ranges
             .ranges()
@@ -1815,7 +1957,7 @@ impl SharedBytes {
         let (lock, _) = &*self.inner;
         let mut state = lock.lock().expect("streaming bytes lock poisoned");
         while let Some(offset) = state.requested_offsets.pop_front() {
-            let offset = normalized_stream_request_offset(offset, Some(total));
+            let offset = state.request_start(offset.min(total.saturating_sub(1)));
             if !state
                 .ranges
                 .ranges()
@@ -1858,11 +2000,22 @@ impl SharedBytes {
             .sum()
     }
 
+    #[cfg(test)]
     fn read_at(
         &self,
         offset: u64,
         buf: &mut [u8],
         decoder: &DecodeToken,
+    ) -> std::io::Result<usize> {
+        self.read_for_decoder(offset, buf, decoder, None)
+    }
+
+    fn read_for_decoder(
+        &self,
+        offset: u64,
+        buf: &mut [u8],
+        decoder: &DecodeToken,
+        ready_through: Option<u64>,
     ) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -1898,8 +2051,20 @@ impl SharedBytes {
                 return Ok(len);
             }
             if !decoder.is_canceled() {
-                let offset = normalized_stream_request_offset(offset, state.total_bytes);
+                let offset = state.request_start(offset);
                 queue_requested_offset(&mut state.requested_offsets, offset, false);
+                if state.local {
+                    if let Some(end) = ready_through {
+                        for n in 1..LOCAL_PIECES_IN_FLIGHT {
+                            let next = offset + (n * crate::local_audio::PIECE) as u64;
+                            if next > end {
+                                break;
+                            }
+                            queue_requested_offset(&mut state.requested_offsets, next, false);
+                        }
+                    }
+                    self.demand_changed.notify_one();
+                }
             }
             condvar.notify_all();
             let (next, _) = condvar
@@ -2119,8 +2284,15 @@ impl StreamingSession {
     ) {
         self.decoder.cancel();
         self.pcm.cancel();
+        if track.local_audio.is_some() {
+            let mut s = self.bytes.inner.0.lock().unwrap();
+            s.generation += 1;
+            s.requested_offsets.clear();
+            self.bytes.demand_changed.notify_one();
+        }
 
         let pcm = SharedPcm::new();
+        pcm.set_base_position(position_ms);
         let decoder = DecodeToken::new();
         self.track_id = track.track_id.clone();
         self.track = track.clone();
@@ -2128,8 +2300,15 @@ impl StreamingSession {
         self.pcm = pcm.clone();
         self.decoder = decoder.clone();
         self.decoder_operation = operation_id.clone();
-        self.position_ms.store(position_ms, Ordering::Relaxed);
-        if let Some(total) = self.bytes.total_bytes() {
+        if track.local_audio.is_some() {
+            // An audio callback finishing on the retired sink still owns its old clock.
+            self.position_ms = Arc::new(AtomicU64::new(position_ms));
+        } else {
+            self.position_ms.store(position_ms, Ordering::Relaxed);
+        }
+        if let Some(total) = self.bytes.total_bytes()
+            && track.local_audio.is_none()
+        {
             let seek_window = media_cache::range_for_window(position_ms, track.duration_ms, total);
             self.bytes.prioritize_offset(seek_window.start);
         }
@@ -2661,6 +2840,44 @@ fn has_front_loaded_mp4_index(mut prefix: &[u8]) -> bool {
     false
 }
 
+#[derive(Clone, Copy)]
+struct IndexedSeek {
+    header_bytes: u64,
+    frame_offset: u64,
+    timestamp_base: u64,
+    ready_through: Option<u64>,
+}
+
+fn indexed_seek(track: &PlaybackTrack, position_ms: u64, ready_until: u64) -> Option<IndexedSeek> {
+    let info = &track.local_audio.as_ref()?.info;
+    let sample_at = |ms: u64| (ms as u128 * info.sample_rate as u128 / 1000) as u64;
+    let preroll = sample_at(position_ms).saturating_sub(u64::from(info.sample_rate));
+    let &[timestamp, frame_offset] = info.seek_points.iter().rev().find(|p| p[0] <= preroll)?;
+    match info.format.as_str() {
+        // The first indexed frame also skips any leading ID3 artwork.
+        "mp3" => Some(IndexedSeek {
+            header_bytes: 0,
+            frame_offset,
+            timestamp_base: timestamp,
+            // Only overlap requests through an audio frame required for readiness.
+            ready_through: info
+                .seek_points
+                .iter()
+                .rev()
+                .find(|p| p[0] < sample_at(ready_until))
+                .map(|p| p[1]),
+        }),
+        // FLAC needs its original stream header and carries absolute timestamps.
+        "flac" if timestamp > 0 => Some(IndexedSeek {
+            header_bytes: info.seek_points.first()?[1],
+            frame_offset,
+            timestamp_base: 0,
+            ready_through: None,
+        }),
+        _ => None,
+    }
+}
+
 fn decode_streaming_audio_inner(
     bytes: SharedBytes,
     pcm: SharedPcm,
@@ -2673,16 +2890,20 @@ fn decode_streaming_audio_inner(
     playback_position: Arc<AtomicU64>,
 ) -> Result<()> {
     let mut hint = Hint::new();
-    hint.with_extension("m4a");
+    hint.with_extension(track.local_audio.as_ref().map_or("m4a", |d| &d.info.format));
 
     let format_opts = FormatOptions::default();
     let metadata_opts = MetadataOptions::default();
-    // Symphonia's seekable MP4 probe scans fragments to the end of the file.
-    // Stream through the opening index when it is already available locally.
+    let ready_until = position_ms
+        .saturating_add(media_cache::READY_WINDOW_MS)
+        .min(track.duration_ms);
+    let indexed = indexed_seek(&track, position_ms, ready_until);
     let open = |incremental: bool| {
-        let source = StreamingMediaSource::new(bytes.clone(), decoder_token.clone());
+        let mut source = StreamingMediaSource::new(bytes.clone(), decoder_token.clone());
+        source.splice = indexed.map(|s| (s.header_bytes, s.frame_offset));
+        source.ready_through = indexed.and_then(|s| s.ready_through);
         let seekable = source.seekable.clone();
-        seekable.store(!incremental, Ordering::Relaxed);
+        seekable.store(!incremental && indexed.is_none(), Ordering::Relaxed);
         let mss = MediaSourceStream::new(Box::new(source), Default::default());
         let result = get_probe().format(&hint, mss, &format_opts, &metadata_opts);
         // Once open, packet reads still have full access to HTTP Range seeks.
@@ -2707,13 +2928,23 @@ fn decode_streaming_audio_inner(
     let decoder_opts = DecoderOptions::default();
     let mut decoder = make_audio_decoder(&codec_params, &decoder_opts)
         .context("failed to create streaming audio decoder")?;
-    let decode_base_position_ms = seek_streaming_format(&mut *format, track_id, position_ms)
-        .with_context(|| format!("failed to seek streaming audio to {position_ms}ms"))?;
+    let preroll = track
+        .local_audio
+        .as_ref()
+        .is_some_and(|d| d.info.format == "m4a");
+    let seek_ms = if preroll {
+        position_ms.saturating_sub(1000)
+    } else {
+        position_ms
+    };
+    let decode_base_position_ms = if indexed.is_some() {
+        Some(position_ms)
+    } else {
+        seek_streaming_format(&mut *format, track_id, seek_ms).map(|_| position_ms)
+    }
+    .with_context(|| format!("failed to seek streaming audio to {position_ms}ms"))?;
     pcm.set_base_position(decode_base_position_ms);
 
-    let ready_until = position_ms
-        .saturating_add(media_cache::READY_WINDOW_MS)
-        .min(track.duration_ms);
     let mut ready_sent = false;
     let mut last_cache_event_ms: u64 = 0;
     let mut decode_errors = 0usize;
@@ -2756,7 +2987,23 @@ fn decode_streaming_audio_inner(
                 pcm.set_spec(channels, sample_rate)?;
 
                 let packet_samples = decoded_to_interleaved_f32(decoded);
-                pcm.push_samples(&packet_samples);
+                // Demux seeks may land before the requested sample (including MP3 reservoir preroll).
+                let skip = if track.local_audio.is_some() && position_ms > 0 {
+                    let rate = sample_rate.get() as u64;
+                    let timestamp = codec_params.time_base.map_or(packet.ts(), |tb| {
+                        (packet.ts() as u128 * tb.numer as u128 * rate as u128 / tb.denom as u128)
+                            as u64
+                    });
+                    let base = indexed.map_or(0, |s| s.timestamp_base);
+                    let target = (position_ms as u128 * rate as u128 / 1000) as u64;
+                    target
+                        .saturating_sub(timestamp.saturating_add(base))
+                        .saturating_mul(channels.get() as u64)
+                        .min(packet_samples.len() as u64) as usize
+                } else {
+                    0
+                };
+                pcm.push_samples(&packet_samples[skip..]);
                 pcm.trim_before(
                     playback_position
                         .load(Ordering::Relaxed)
@@ -2905,8 +3152,205 @@ fn time_from_millis(position_ms: u64) -> Time {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Run the production piece downloader and decoder through readiness without an audio device.
+    pub(crate) async fn measure_local_seek(
+        client: crate::local_audio::Client,
+        descriptor: &crate::local_audio::Descriptor,
+        position: u64,
+    ) -> Result<(Vec<u64>, Duration)> {
+        let bytes = SharedBytes::new();
+        bytes.inner.0.lock().unwrap().local = true;
+        bytes.set_total(Some(descriptor.info.length));
+        let download = tokio::spawn(download_local_bytes(
+            client,
+            descriptor.clone(),
+            bytes.clone(),
+        ));
+        let started = Instant::now();
+        let token = DecodeToken::new();
+        let (tx, mut events) = mpsc::unbounded_channel();
+        let track = descriptor.track();
+        let input = bytes.clone();
+        let decoder = token.clone();
+        let decode = tokio::task::spawn_blocking(move || {
+            decode_streaming_audio(
+                input,
+                SharedPcm::new(),
+                decoder,
+                tx,
+                Some("seek".into()),
+                "session".into(),
+                track,
+                position,
+                Arc::new(AtomicU64::new(position)),
+            );
+        });
+        let ready = tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(event) = events.recv().await {
+                match event {
+                    AudioPlayerEvent::Prepared {
+                        buffered_until_ms, ..
+                    } => {
+                        anyhow::ensure!(
+                            buffered_until_ms
+                                >= (position + media_cache::READY_WINDOW_MS)
+                                    .min(descriptor.info.duration_ms)
+                        );
+                        return Ok(());
+                    }
+                    AudioPlayerEvent::Failed { error, .. } => bail!("{error}"),
+                    _ => (),
+                }
+            }
+            bail!("decoder stopped before readiness")
+        })
+        .await;
+        let elapsed = started.elapsed();
+        token.cancel();
+        bytes.cancel();
+        decode.await?;
+        download.await??;
+        ready??;
+        let pieces = bytes
+            .inner
+            .0
+            .lock()
+            .unwrap()
+            .chunks
+            .iter()
+            .map(|chunk| chunk.range.start / crate::local_audio::PIECE as u64)
+            .collect();
+        Ok((pieces, elapsed))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn mp3_requests_overlap_only_inside_the_indexed_window() {
+        use crate::local_audio::{self, Client, Need, PIECE};
+        let file = local_audio::tests::long_mp3();
+        let (d, source) = local_audio::tests::scan(&file);
+        let mut store = local_audio::Store::default();
+        store.source(&d, source);
+        for position in [0u64, 503_123] {
+            let (tx, mut rx) = mpsc::channel::<Need>(8);
+            let first = d
+                .info
+                .seek_points
+                .iter()
+                .rev()
+                .find(|p| {
+                    p[0] <= position.saturating_sub(1000) * u64::from(d.info.sample_rate) / 1000
+                })
+                .unwrap()[1]
+                / PIECE as u64;
+            let client = Client {
+                tx,
+                wake: Default::default(),
+            };
+            let mut requested = Vec::new();
+            let serve = async {
+                // Withhold the first response until four distinct demands arrive. A
+                // stop-and-wait downloader cannot prepare this window.
+                let mut batch = Vec::new();
+                for _ in 0..LOCAL_PIECES_IN_FLIGHT {
+                    batch.push(rx.recv().await.unwrap());
+                }
+                batch.sort_by_key(|n| n.index);
+                assert_eq!(
+                    batch.iter().map(|n| n.index).collect::<Vec<_>>(),
+                    (first..first + LOCAL_PIECES_IN_FLIGHT as u64).collect::<Vec<_>>()
+                );
+                // Complete in reverse order, then service subsequent decoder reads normally.
+                while let Some(n) = batch.pop() {
+                    requested.push(n.index);
+                    let _ = n.reply.send(store.read(&d, n.index));
+                }
+                while let Some(n) = rx.recv().await {
+                    requested.push(n.index);
+                    let _ = n.reply.send(store.read(&d, n.index));
+                }
+            };
+            let (result, ()) = tokio::join!(measure_local_seek(client, &d, position), serve);
+            result.unwrap();
+            requested.sort_unstable();
+            assert_eq!(
+                requested,
+                (first..first + requested.len() as u64).collect::<Vec<_>>()
+            );
+            assert!(requested.len() <= 12, "{requested:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mp3_seek_preempts_unanswered_opening_requests() {
+        use crate::local_audio::{self, Client, Need, PIECE};
+        let file = local_audio::tests::long_mp3();
+        let (descriptor, _) = local_audio::tests::scan(&file);
+        let track = descriptor.track();
+        let (tx, mut needs) = mpsc::channel::<Need>(8);
+        let bytes = SharedBytes::new();
+        bytes.inner.0.lock().unwrap().local = true;
+        bytes.set_total(Some(descriptor.info.length));
+        let download = tokio::spawn(download_local_bytes(
+            Client {
+                tx,
+                wake: Default::default(),
+            },
+            descriptor,
+            bytes.clone(),
+        ));
+        let mut session = StreamingSession {
+            decoder_operation: None,
+            session_id: "session".into(),
+            track_id: track.track_id.clone(),
+            track: track.clone(),
+            duration_ms: track.duration_ms,
+            pcm: SharedPcm::new(),
+            bytes,
+            decoder: DecodeToken::new(),
+            position_ms: Arc::new(AtomicU64::new(0)),
+        };
+        let (events, _rx) = mpsc::unbounded_channel();
+        session.restart_decoder(
+            Some("opening".into()),
+            "session".into(),
+            track.clone(),
+            0,
+            events.clone(),
+        );
+        let observed = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut opening = Vec::new();
+            for _ in 0..LOCAL_PIECES_IN_FLIGHT {
+                opening.push(needs.recv().await.unwrap());
+            }
+            let position = 503_123;
+            let first = indexed_seek(&track, position, position + media_cache::READY_WINDOW_MS)
+                .unwrap()
+                .frame_offset
+                / PIECE as u64;
+            session.restart_decoder(
+                Some("seek".into()),
+                "session".into(),
+                track,
+                position,
+                events,
+            );
+            let new = needs.recv().await.unwrap();
+            (
+                opening.iter().all(|n| n.reply.is_closed()),
+                new.index,
+                first,
+            )
+        })
+        .await;
+        session.cancel();
+        download.await.unwrap().unwrap();
+        let (old_demands_canceled, next, first) = observed.unwrap();
+        assert!(old_demands_canceled);
+        assert!((first..first + LOCAL_PIECES_IN_FLIGHT as u64).contains(&next));
+    }
 
     #[tokio::test]
     #[ignore = "reads a public Bilibili audio stream"]
@@ -3173,6 +3617,161 @@ mod tests {
         assert!(stream_ready_for_position(30_000, 120_000, 45_000, false));
         assert!(!stream_ready_for_position(30_000, 120_000, 39_000, false));
         assert!(stream_ready_for_position(118_000, 120_000, 120_000, true));
+    }
+
+    // Original FFmpeg sine fixtures: 317 Hz, 16 kHz mono, ten seconds.
+    // The MP3 has no Xing header, and the M4A has a trailing movie header.
+    #[test]
+    fn original_codec_pieces_decode_like_the_file_at_start_and_seek() {
+        use crate::local_audio::{PIECE, Source as AudioSource};
+        for ext in ["mp3", "flac", "m4a"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("src/local_audio/fixtures/tone.{ext}"));
+            let (d, s) = AudioSource::import(
+                &path,
+                "test".into(),
+                &libp2p::identity::Keypair::generate_ed25519(),
+                Arc::new(AtomicBool::new(false)),
+                |_| {},
+            )
+            .unwrap();
+            let mut store = crate::local_audio::Store::default();
+            store.source(&d, s);
+            let reference = decode_audio(std::fs::read(&path).unwrap().into()).unwrap();
+            let bytes = SharedBytes::new();
+            bytes.set_total(Some(d.info.length));
+            for i in 0..d.count() {
+                let p = store.read(&d, i).unwrap();
+                let start = i * PIECE as u64;
+                bytes.append_chunk(StreamingByteChunk {
+                    range: media_cache::ByteRange {
+                        start,
+                        end_inclusive: start + p.bytes.len() as u64 - 1,
+                    },
+                    bytes: p.bytes.into(),
+                });
+            }
+            for ms in [0, 6323] {
+                let pcm = SharedPcm::new();
+                let (tx, _rx) = mpsc::unbounded_channel();
+                decode_streaming_audio_inner(
+                    bytes.clone(),
+                    pcm.clone(),
+                    DecodeToken::new(),
+                    tx,
+                    None,
+                    "session".into(),
+                    d.track(),
+                    ms,
+                    Arc::new(AtomicU64::new(ms)),
+                )
+                .unwrap();
+                let expected = (ms * d.info.sample_rate as u64 / 1000) as usize;
+                let state = pcm.inner.0.lock().unwrap();
+                assert!(state.samples.len() > 8192);
+                let original = &reference.samples[expected..expected + 8192];
+                let difference = original
+                    .iter()
+                    .zip(&state.samples)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    difference <= 1. / 32768.,
+                    "{ext} {ms} ms max sample difference {difference}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn long_local_wav_starts_and_seeks_with_sample_accurate_partial_download() {
+        use crate::local_audio::{self, Client};
+        let f = local_audio::tests::wav(600);
+        let (d, s) = local_audio::tests::scan(&f);
+        let (tx, mut rx) = mpsc::channel::<local_audio::Need>(8);
+        let store = Arc::new(Mutex::new(local_audio::Store::default()));
+        store.lock().unwrap().source(&d, s);
+        let client = Client {
+            tx,
+            wake: Default::default(),
+        };
+        let fetched = Arc::new(Mutex::new(Vec::new()));
+        let observed = fetched.clone();
+        tokio::spawn(async move {
+            while let Some(n) = rx.recv().await {
+                observed.lock().unwrap().push(n.index);
+                let _ = n
+                    .reply
+                    .send(store.lock().unwrap().read(&n.descriptor, n.index));
+            }
+        });
+        for pos in [0u64, 503_123] {
+            fetched.lock().unwrap().clear();
+            let bytes = SharedBytes::new();
+            bytes.inner.0.lock().unwrap().local = true;
+            bytes.set_total(Some(d.info.length));
+            let download = tokio::spawn(download_local_bytes(
+                client.clone(),
+                d.clone(),
+                bytes.clone(),
+            ));
+            let token = DecodeToken::new();
+            let stop = token.clone();
+            let pcm = SharedPcm::new();
+            let decoded = pcm.clone();
+            let track = d.track();
+            let input = bytes.clone();
+            let (tx, mut events) = mpsc::unbounded_channel();
+            let decode = tokio::task::spawn_blocking(move || {
+                decode_streaming_audio(
+                    input,
+                    decoded,
+                    token,
+                    tx,
+                    None,
+                    "session".into(),
+                    track,
+                    pos,
+                    Arc::new(AtomicU64::new(pos)),
+                )
+            });
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while let Some(e) = events.recv().await {
+                    match e {
+                        AudioPlayerEvent::Prepared {
+                            buffered_until_ms, ..
+                        } => {
+                            assert!(buffered_until_ms >= pos + 12_000);
+                            return;
+                        }
+                        AudioPlayerEvent::Failed { error, .. } => panic!("{error}"),
+                        _ => (),
+                    }
+                }
+                panic!("decoder stopped before prepare")
+            })
+            .await
+            .unwrap();
+            {
+                let p = pcm.inner.0.lock().unwrap();
+                assert_eq!(p.base_position_ms, pos);
+                let frame = pos * 8;
+                for (i, sample) in p.samples.iter().take(512).enumerate() {
+                    let expected = ((((frame + i as u64) % 8000) * 17) as i16) as f32 / 32768.;
+                    assert_eq!(*sample, expected, "sample {i} at {pos}ms");
+                }
+            }
+            stop.cancel();
+            bytes.cancel();
+            decode.await.unwrap();
+            download.await.unwrap().unwrap();
+            let pieces = fetched.lock().unwrap();
+            assert!(pieces.len() < d.count() as usize / 4, "{pieces:?}");
+            if pos > 0 {
+                assert!(pieces.iter().any(|i| *i > 110));
+                assert!(!pieces.iter().any(|i| (5..100).contains(i)));
+            }
+        }
     }
 
     #[test]

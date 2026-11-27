@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const ROUTE_PROBE: &str = "\0path";
-pub const NAMESPACE: &str = "light-ear.network.v2";
+pub const NAMESPACE: &str = "light-ear.network.v3";
 pub const MAX_PEERS: usize = 512;
 const TTL: u64 = 90;
 const PAGE: usize = 8;
@@ -19,6 +19,8 @@ pub struct Link {
     pub lanes: u8,
     pub payload_bytes: [u64; 2],
     pub circuit_bytes: u64,
+    pub media_rx: u64,
+    pub media_relay_rx: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Presence {
@@ -30,6 +32,7 @@ pub struct Presence {
     pub links: Vec<Link>,
     pub transit_rooms: usize,
     pub upload_utilization: u8,
+    pub media_p95_ms: Option<u64>,
     pub leases: [Vec<String>; 2],
     pub repairs: Vec<String>,
 }
@@ -40,7 +43,7 @@ pub struct Signed {
     signature: Vec<u8>,
 }
 fn signing_bytes(record: &Presence) -> Vec<u8> {
-    let mut bytes = b"light-ear.presence.v2\0".to_vec();
+    let mut bytes = b"light-ear.presence.v3\0".to_vec();
     serde_json::to_writer(&mut bytes, record).expect("serializable presence");
     bytes
 }
@@ -82,7 +85,7 @@ pub fn valid_room(room: &str) -> bool {
         && !room.chars().any(char::is_control)
 }
 pub fn room_topic(room: &str) -> libp2p::gossipsub::IdentTopic {
-    libp2p::gossipsub::IdentTopic::new(format!("light-ear.room.v2/{room}"))
+    libp2p::gossipsub::IdentTopic::new(format!("light-ear.room.v3/{room}"))
 }
 pub fn presence_addresses<'a>(addrs: impl Iterator<Item = &'a Multiaddr>) -> Vec<String> {
     let (circuits, direct): (BTreeSet<_>, BTreeSet<_>) = addrs
@@ -230,6 +233,7 @@ mod tests {
                 links: vec![],
                 transit_rooms: 8,
                 upload_utilization: 0,
+                media_p95_ms: None,
                 leases: Default::default(),
                 repairs: vec![],
             },

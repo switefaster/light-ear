@@ -65,7 +65,10 @@ Keep their real libp2p transports and run the full suite with both decoder confi
 - Packaged desktop clients check for an update before starting the swarm. A confirmed
   update survives a failed install and offline restarts of that version. Keep offline
   LAN startup available when the updater is unreachable and no update is known.
-- The v2 directory is network-wide. Keep memberships and vote electorates independent of transport neighbors and transient forwarding subscriptions. Directory request-response carries discovery records only. Room data and probes use the two gossipsub trees. Keep browse, join and leave on the same swarm identity.
+- Local audio uses `src/local_audio.rs` for signed manifests, import, proofs, and temporary storage. `src/media_transfer.rs` serves verified 64 KiB pieces over reciprocal room-tree links. Keep native file paths local. Share the helper transit allowance with gossipsub and charge actual payload on the connection that carried it.
+- For MP3 preparation, start at the signed audio-frame cue and overlap at most four required pieces in the decoded readiness window. A delayed pre-seek playback snapshot must preserve the follower's active decoder and its operation ID.
+- Run `cargo test --lib --locked` with loopback TCP, then repeat with `--features fdk-aac-decoder`. The local audio fixtures cover codec output, distant seek, shared-bridge reuse, congestion, and source loss.
+- The v3 directory is network-wide. Keep memberships and vote electorates independent of transport neighbors and transient forwarding subscriptions. Directory request-response carries discovery records only. Room data and probes use the two gossipsub trees. Keep browse, join and leave on the same swarm identity.
 - Keep relay reservations independent of measured room payload. Require delivery evidence and the handoff grace before releasing a live fallback circuit.
 - A peer using an outbound circuit should also reserve an inbound route on that relay. Retry closed reservation listeners. After bridge loss, try the remaining signed room members through their advertised circuits or a locally known relay. Keep circuit-repair retries independent of direct-introduction backoff and local relay addresses out of the public directory.
 

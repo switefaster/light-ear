@@ -10,7 +10,7 @@ function routeName(link) {
 function linkTitle(link) {
   const trees = ["Tree 1", "Tree 2"].filter((_, i) => link.lanes & (1 << i));
   return [routeName(link), ...trees, link.rtt_ms != null && link.rtt_ms + " ms RTT",
-    link.degraded && "Degraded"].filter(Boolean).join(" · ");
+    link.media_bytes > 0 && `Local audio ${link.media_bytes.toLocaleString()} B · Relay ${link.media_relay_bytes.toLocaleString()} B`, link.degraded && "Degraded"].filter(Boolean).join(" · ");
 }
 
 export default function TopologyDialog({ room, displayName, onClose }) {
@@ -149,6 +149,7 @@ export default function TopologyDialog({ room, displayName, onClose }) {
         {received && <p>Room payload via this peer · {received.map(bytes => bytes.toLocaleString() + " B").join(" / ")}</p>}
       </section>
       {metrics && <div className="topology-delivery">
+        {room.mediaMetrics && <span>Worst audio piece p95 <b>{room.mediaMetrics.worst_receiver_p95_ms ?? '—'} ms</b></span>}
         <span>Worst receiver p95 <b>{metrics.worst_receiver_p95_ms.map(v => v == null ? "pending" : v + " ms").join(" / ")}</b></span>
         <span>Circuit payload <b>{metrics.circuit_payload_bytes.toLocaleString()} B</b></span>
         <span>Directory received <b>{metrics.directory_bytes.toLocaleString()} B</b></span>

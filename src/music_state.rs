@@ -938,6 +938,7 @@ mod tests {
             media_init_range: None,
             media_index_range: None,
             media_is_progressive: false,
+            local_audio: None,
         }
     }
 

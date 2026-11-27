@@ -1,3 +1,5 @@
+#[path = "media_transfer.rs"]
+pub(super) mod transfer;
 use super::*;
 use crate::{
     directory::{self, Directory, Link, Page, Presence, Signed, Summary},
@@ -33,6 +35,7 @@ impl RelayReservation {
 
 pub(super) type Exchange = rr::json::Behaviour<Summary, Page>;
 pub(super) struct Network {
+    pub(super) media: transfer::Media,
     inner: libp2p::Swarm<Behaviour>,
     key: identity::Keypair,
     received: BTreeMap<String, [u64; 2]>,
@@ -124,6 +127,7 @@ impl Network {
     ) -> Self {
         let now = Instant::now();
         Self {
+            media: Default::default(),
             inner,
             key,
             room,
@@ -535,6 +539,8 @@ impl Network {
                             .get(&id.to_string())
                             .copied()
                             .unwrap_or_default(),
+                        media_rx: self.media.received(id).0,
+                        media_relay_rx: self.media.received(id).1,
                         circuit_bytes: *self.circuit_received.get(id).unwrap_or(&0),
                         degraded: self.degraded(id),
                         rtt_ms: links
@@ -556,10 +562,11 @@ impl Network {
                 addresses,
                 links,
                 transit_rooms: HELPER_ROOMS,
+                media_p95_ms: self.media.p95,
                 upload_utilization: if self.reported_exhausted {
                     100
                 } else {
-                    self.utilization
+                    self.utilization.max(self.media.upload_utilization)
                 },
                 repairs: self.repairs.iter().cloned().collect(),
                 leases: std::array::from_fn(|i| self.plan.rooms[i].iter().cloned().collect()),
@@ -1014,6 +1021,12 @@ impl Network {
             }
         }
     }
+    pub fn elected_after_loss(&self, prior: &str) -> bool {
+        let local = self.local_peer_id().to_string();
+        prior != local
+            && self.lost_member(prior)
+            && self.members().iter().find(|id| !self.lost_member(id)) == Some(&local)
+    }
     pub fn lost_member(&self, p: &str) -> bool {
         self.room.as_ref().is_none_or(|r| {
             self.directory
@@ -1133,7 +1146,7 @@ impl Network {
         msg: gossipsub::Message,
     ) -> Option<(PeerId, WireMessage)> {
         use gossipsub::MessageAcceptance::*;
-        let room = msg.topic.as_str().strip_prefix("light-ear.room.v2/")?;
+        let room = msg.topic.as_str().strip_prefix("light-ear.room.v3/")?;
         let joined = self.room.as_deref() == Some(room);
         let packet = serde_json::from_slice::<Packet>(&msg.data).ok();
         let now = Instant::now();
@@ -1208,6 +1221,13 @@ impl Network {
             if direct == Some(false) {
                 *self.circuit_received.entry(via).or_default() += msg.data.len() as u64;
             }
+        }
+        if !joined
+            && matches!(accept, Accept)
+            && let Some(Payload::Room(wire)) = packet.as_ref().map(|p| &p.body)
+            && validate_wire_source(wire, source).is_ok()
+        {
+            self.observe_transit_audio(room, wire);
         }
         self.lane(i)
             .report_message_validation_result(&id, &via, accept);
